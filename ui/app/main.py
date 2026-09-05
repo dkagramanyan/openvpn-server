@@ -352,6 +352,10 @@ def overview(range: str = "today", tz: int = 0, user: dict[str, Any] = Authed):
     warnings: list[str] = []
     if not live["connected"]:
         warnings.append(f"OpenVPN management interface unreachable: {live.get('error') or 'not connected'}")
+    remote_host = pki.get_remote()["host"]
+    if remote_host in ("", "127.0.0.1", "localhost", "::1"):
+        warnings.append("Client profiles point at " + (remote_host or "no address")
+                        + " - set this server's public address under Settings, then hand out the profiles again")
     crl = status["crl"]
     if crl["exists"] and crl["next_update"] and crl["next_update"] - now < EXPIRING_DAYS * 86400:
         warnings.append("The certificate revocation list expires soon - regenerate it on the Server page")

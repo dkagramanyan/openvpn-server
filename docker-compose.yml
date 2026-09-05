@@ -30,7 +30,11 @@ services:
   openvpn-ui:
     container_name: openvpn-ui
     image: openvpn-ui:local
-    build: ./ui
+    # The UI image copies bin/ and ui/ from the repository root, so the build
+    # context is the root and the Dockerfile is addressed inside it.
+    build:
+      context: .
+      dockerfile: ui/Dockerfile
     # Share the OpenVPN container's network namespace so the management
     # interface stays bound to 127.0.0.1.
     network_mode: "service:openvpn"
