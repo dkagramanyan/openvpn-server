@@ -1,28 +1,36 @@
-#!/bin/sh
-# v.0.1 by @d3vilh@github.com aka Mr. Philipp
-# d3vilh/openvpn-server drafted 2FA support
+#!/bin/bash
+# Enrol a client in two-factor authentication (TOTP).
+#
+#   oath-sec-gen.sh <name> [issuer]
+#
+# Generates a new secret, stores it in clients/oath.secrets (replacing any
+# previous entry for the same name), prints the otpauth:// URI and, when
+# qrencode is available, writes clients/<name>-2fa.png.
+set -euo pipefail
 
-# Client name in format: alice@wonderland.ua
-TFA_NAME=$1
-OPENVPN_DIR=/etc/openvpn
+OPENVPN_DIR=${OPENVPN_DIR:-/etc/openvpn}
 OATH_SECRETS=$OPENVPN_DIR/clients/oath.secrets
+NAME=${1:-}
+ISSUER=${2:-OpenVPN}
 
-# Issuer string
-ISSUER='MFA%20OpenVPN'
+die() { echo "oath-sec-gen: $*" >&2; exit 1; }
+[[ $NAME =~ ^[A-Za-z0-9][A-Za-z0-9_.@-]{0,63}$ ]] || die "invalid client name '$NAME'"
 
-# Userhash. Random 30 chars
-USERHASH=$(head -c 10 /dev/urandom | openssl sha256 | cut -d ' ' -f2 | cut -b 1-30)
+# 160-bit secret, stored as hex (the format oathtool reads by default).
+SECRET=$(head -c 20 /dev/urandom | od -An -tx1 | tr -d ' \n')
+BASE32=$(oathtool --totp -v "$SECRET" | sed -n 's/^Base32 secret: //p')
 
-# Base32 secret from oathtool output
-BASE32=$(/usr/bin/oathtool --totp -v "$USERHASH" | grep Base32 | awk '{print $3}')
+mkdir -p "$OPENVPN_DIR/clients"
+touch "$OATH_SECRETS"
+{ grep -v "^$NAME:" "$OATH_SECRETS" || true; echo "$NAME:$SECRET"; } > "$OATH_SECRETS.tmp"
+mv -f "$OATH_SECRETS.tmp" "$OATH_SECRETS"
+chmod 644 "$OATH_SECRETS"   # must stay readable by the unprivileged OpenVPN user
 
-QRSTRING="otpauth://totp/$ISSUER:$TFA_NAME?secret=$BASE32"
-# QR code for user to pass to Google Authenticator or OpenVPN-UI
-echo "User String for QR:"
-echo $QRSTRING
+label=$(printf '%s' "$ISSUER:$NAME" | sed 's/ /%20/g')
+issuer=$(printf '%s' "$ISSUER" | sed 's/ /%20/g')
+URI="otpauth://totp/$label?secret=$BASE32&issuer=$issuer&algorithm=SHA1&digits=6&period=30"
+echo "$URI"
 
-qrencode $QRSTRING -o $OPENVPN_DIR/clients/$TFA_NAME.png
-
-# New string for secrets file
-echo "oath.secrets entry for BackEnd:"
-echo "$TFA_NAME:$USERHASH" | tee -a $OATH_SECRETS
+if command -v qrencode >/dev/null 2>&1; then
+    qrencode -o "$OPENVPN_DIR/clients/$NAME-2fa.png" "$URI"
+fi

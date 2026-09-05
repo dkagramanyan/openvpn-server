@@ -1,1 +1,0 @@
-# this is your default check password script

@@ -1,2 +1,7 @@
 .DS_Store
+.env
+config/management.pw
 bin/oath-orig.sh
+ui/__pycache__/
+ui/**/__pycache__/
+ui/.pytest_cache/

@@ -1,97 +1,217 @@
 #!/bin/bash
-#VERSION 0.2.3 by @d3vilh@github.com aka Mr. Philipp
-set -e
+# OpenVPN server container entrypoint.
+#
+#  1. Initialises the PKI on first start (CA, server cert, CRL, tls-crypt key).
+#  2. Enables IPv4 forwarding and installs idempotent iptables rules.
+#  3. Runs OpenVPN under a small supervisor loop so that the web UI can
+#     restart the daemon through the management interface (signal SIGTERM)
+#     without needing access to the Docker socket.
+set -euo pipefail
 
-#Variables
-EASY_RSA=/usr/share/easy-rsa
-OPENVPN_DIR=/etc/openvpn
-echo "EasyRSA path: $EASY_RSA OVPN path: $OPENVPN_DIR"
+OPENVPN_DIR=${OPENVPN_DIR:-/etc/openvpn}
+EASYRSA_DIR=${EASYRSA_DIR:-/usr/share/easy-rsa}
+PKI_DIR=$OPENVPN_DIR/pki
+LOG_DIR=/var/log/openvpn
+SERVER_CONF=$OPENVPN_DIR/server.conf
+MGMT_PW_FILE=$OPENVPN_DIR/config/management.pw
 
-if [[ ! -f $OPENVPN_DIR/pki/ca.crt ]]; then
-    export EASYRSA_BATCH=1 # see https://superuser.com/questions/1331293/easy-rsa-v3-execute-build-ca-and-gen-req-silently
-    cd $EASY_RSA
+TRUST_SUB=${TRUST_SUB:-10.0.70.0/24}
+GUEST_SUB=${GUEST_SUB:-10.0.71.0/24}
+HOME_SUB=${HOME_SUB:-192.168.88.0/24}
+OVPN_STRICT_FORWARD=${OVPN_STRICT_FORWARD:-1}
+OVPN_LOG_STDOUT=${OVPN_LOG_STDOUT:-1}
+OVPN_LOG_MAX_BYTES=${OVPN_LOG_MAX_BYTES:-10485760}
+OVPN_CRL_RENEW_DAYS=${OVPN_CRL_RENEW_DAYS:-30}
 
-    # Building the CA
-    echo 'Setting up public key infrastructure...'
-    $EASY_RSA/easyrsa init-pki
+log()  { printf '%s [entrypoint] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
+warn() { printf '%s [entrypoint] WARNING: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >&2; }
+die()  { printf '%s [entrypoint] ERROR: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >&2; exit 1; }
 
-    # Copy easy-rsa variables
-    cp $OPENVPN_DIR/config/easy-rsa.vars $EASY_RSA/pki/vars
+export EASYRSA_BATCH=1
+export EASYRSA_PKI=$PKI_DIR
+easyrsa() { "$EASYRSA_DIR/easyrsa" "$@"; }
 
-    # Listing env parameters:
-    echo "Following EASYRSA variables will be used:"
-    cat $EASY_RSA/pki/vars | awk '{$1=""; print $0}';
+log "OpenVPN $(openvpn --version | head -1 | awk '{print $2}'), easy-rsa $(grep -m1 -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' "$EASYRSA_DIR/ChangeLog" 2>/dev/null || echo '?')"
+log "OpenVPN dir: $OPENVPN_DIR  PKI: $PKI_DIR"
 
-    echo 'Generating ertificate authority...'
-    $EASY_RSA/easyrsa build-ca nopass
+[[ -f $SERVER_CONF ]] || die "$SERVER_CONF not found. Mount the repository at $OPENVPN_DIR."
+mkdir -p "$PKI_DIR" "$LOG_DIR" "$OPENVPN_DIR"/{clients,config,staticclients,db}
 
-    # Creating the Server Certificate, Key, and Encryption Files
-    echo 'Creating the Server Certificate...'
-    $EASY_RSA/easyrsa gen-req server nopass
-
-    echo 'Sign request...'
-    $EASY_RSA/easyrsa sign-req server server
-
-    echo 'Generate Diffie-Hellman key...'
-    $EASY_RSA/easyrsa gen-dh
-
-    echo 'Generate HMAC signature...'
-    openvpn --genkey --secret $EASY_RSA/pki/ta.key
-
-    echo 'Create certificate revocation list (CRL)...'
-    $EASY_RSA/easyrsa gen-crl
-    chmod +r $EASY_RSA/pki/crl.pem
-
-    # Copy to mounted volume
-    cp -r $EASY_RSA/pki/. $OPENVPN_DIR/pki
+# --------------------------------------------------------------------------
+# 1. PKI
+# --------------------------------------------------------------------------
+if [[ ! -f $PKI_DIR/ca.crt ]]; then
+    log "No CA found - initialising a new PKI"
+    if [[ -n $(find "$PKI_DIR" -mindepth 1 -not -name '.*' 2>/dev/null | head -1) ]]; then
+        warn "$PKI_DIR is not empty but has no ca.crt; leaving existing files in place"
+    fi
+    if [[ ! -f $PKI_DIR/openssl-easyrsa.cnf ]]; then
+        # init-pki wipes its target, so build the skeleton in a scratch dir
+        # and copy it into the (mounted) PKI directory.
+        rm -rf /tmp/pki-init
+        EASYRSA_PKI=/tmp/pki-init easyrsa init-pki >/dev/null
+        cp -a /tmp/pki-init/. "$PKI_DIR/"
+        rm -rf /tmp/pki-init
+    fi
+    if [[ -f $OPENVPN_DIR/config/easy-rsa.vars ]]; then
+        cp "$OPENVPN_DIR/config/easy-rsa.vars" "$PKI_DIR/vars"
+    fi
+    log "easy-rsa variables:"
+    sed -n 's/^set_var //p' "$PKI_DIR/vars" 2>/dev/null | sed 's/^/    /' || true
+    log "Building the certificate authority"
+    easyrsa build-ca nopass
+    log "Building the server certificate"
+    easyrsa --req-cn=server build-server-full server nopass
 else
-
-    echo 'PKI already set up.'
+    log "PKI already initialised"
 fi
 
-# Listing env parameters:
-echo "Following EASYRSA variables were set during CA init:"
-cat $OPENVPN_DIR/pki/vars | awk '{$1=""; print $0}';
-
-# Configure network
-mkdir -p /dev/net
-if [ ! -c /dev/net/tun ]; then
-    mknod /dev/net/tun c 10 200
+if [[ ! -f $PKI_DIR/ta.key ]]; then
+    log "Generating tls-crypt key"
+    openvpn --genkey secret "$PKI_DIR/ta.key"
 fi
 
-echo 'Configuring networking rules...'
-if ! grep -q 'net.ipv4.ip_forward=1' /etc/sysctl.conf; then
-  echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf; 
-  echo 'IP forwarding configuration now applied:'
+if [[ ! -f $PKI_DIR/crl.pem ]]; then
+    log "Generating certificate revocation list"
+    easyrsa gen-crl
 else
-  echo 'IP forwarding configuration already applied:'
-fi
-sysctl -p /etc/sysctl.conf
-
-echo 'Configuring iptables...'
-echo 'NAT for OpenVPN clients'
-iptables -t nat -A POSTROUTING -s $TRUST_SUB -o eth0 -j MASQUERADE
-iptables -t nat -A POSTROUTING -s $GUEST_SUB -o eth0 -j MASQUERADE
-
-echo 'Blocking ICMP for external clients'
-iptables -A FORWARD -p icmp -j DROP --icmp-type echo-request -s $GUEST_SUB 
-iptables -A FORWARD -p icmp -j DROP --icmp-type echo-reply -s $GUEST_SUB 
-
-echo 'Blocking internal home subnet to access from external openvpn clients (Internet still available)'
-iptables -A FORWARD -s $GUEST_SUB -d $HOME_SUB -j DROP
-
-if [[ ! -s fw-rules.sh ]]; then
-    echo "No additional firewall rules to apply."
-else
-    echo "Applying firewall rules"
-    ./fw-rules.sh
-    echo 'Additional firewall rules applied.'
+    # An expired CRL makes OpenVPN reject *every* client. Renew it early.
+    next=$(openssl crl -in "$PKI_DIR/crl.pem" -noout -nextupdate 2>/dev/null | cut -d= -f2 || true)
+    if [[ -n $next ]]; then
+        next_epoch=$(date -d "$next" +%s 2>/dev/null || echo 0)
+        if (( next_epoch - $(date +%s) < OVPN_CRL_RENEW_DAYS * 86400 )); then
+            log "CRL expires on $next - regenerating"
+            easyrsa gen-crl
+        fi
+    fi
 fi
 
-echo 'IPT MASQ Chains:'
-iptables -t nat -L | grep MASQ
-echo 'IPT FWD Chains:'
-iptables -v -x -n -L | grep DROP 
+# Only generate DH parameters if the configuration still references a DH
+# file (OpenVPN 2.7 defaults to "dh none" and uses ECDH instead).
+dh_file=$(sed -n 's/^[[:space:]]*dh[[:space:]]\+\([^[:space:]#]\+\).*/\1/p' "$SERVER_CONF" | head -1)
+if [[ -n $dh_file && $dh_file != none ]]; then
+    dh_path=$dh_file; [[ $dh_path = /* ]] || dh_path=$OPENVPN_DIR/$dh_file
+    if [[ ! -f $dh_path ]]; then
+        log "server.conf references '$dh_file' - generating DH parameters (slow; consider 'dh none')"
+        easyrsa gen-dh
+        [[ $dh_path = "$PKI_DIR/dh.pem" ]] || cp "$PKI_DIR/dh.pem" "$dh_path"
+    fi
+fi
 
-echo 'Start openvpn process...'
-/usr/sbin/openvpn --cd $OPENVPN_DIR --script-security 2 --config $OPENVPN_DIR/server.conf
+# Management interface password (used by the web UI).
+if [[ ! -s $MGMT_PW_FILE ]]; then
+    log "Generating management interface password"
+    (umask 077; head -c 32 /dev/urandom | base64 | tr -d '/+=\n' | head -c 32 > "$MGMT_PW_FILE"; echo >> "$MGMT_PW_FILE")
+fi
+chmod 600 "$MGMT_PW_FILE"
+
+# Files OpenVPN reads *after* dropping privileges to nobody must be readable.
+chmod 644 "$PKI_DIR/crl.pem" "$PKI_DIR/ca.crt" 2>/dev/null || true
+chmod 600 "$PKI_DIR/private/"*.key 2>/dev/null || true
+chmod 755 "$PKI_DIR" "$OPENVPN_DIR/staticclients"
+chmod 644 "$OPENVPN_DIR/staticclients/"* 2>/dev/null || true
+[[ -f $OPENVPN_DIR/clients/oath.secrets ]] && chmod 644 "$OPENVPN_DIR/clients/oath.secrets"
+# The 2FA verify script runs as nobody and appends to this log.
+touch "$LOG_DIR/oath.log" && chown nobody "$LOG_DIR/oath.log" && chmod 644 "$LOG_DIR/oath.log"
+
+# --------------------------------------------------------------------------
+# 2. Networking
+# --------------------------------------------------------------------------
+if [[ ! -c /dev/net/tun ]]; then
+    mknod /dev/net/tun c 10 200 2>/dev/null || die "/dev/net/tun is missing. Add 'devices: [/dev/net/tun]' to the container."
+fi
+
+sysctl -q -w net.ipv4.ip_forward=1 2>/dev/null || true
+if [[ $(cat /proc/sys/net/ipv4/ip_forward) != 1 ]]; then
+    die "IPv4 forwarding is disabled and could not be enabled. Add 'sysctls: [net.ipv4.ip_forward=1]' to the container."
+fi
+
+egress=${OVPN_EGRESS_IFACE:-$(ip -4 route show default 2>/dev/null | awk '{print $5; exit}')}
+egress=${egress:-eth0}
+log "Egress interface: $egress  trusted: $TRUST_SUB  guest: $GUEST_SUB  home: $HOME_SUB"
+
+# ipt TABLE RULE... : append RULE to TABLE only if it is not already present.
+ipt() {
+    local table=$1; shift
+    iptables -t "$table" -C "$@" 2>/dev/null || iptables -t "$table" -A "$@"
+}
+
+log "Configuring iptables"
+ipt nat POSTROUTING -s "$TRUST_SUB" -o "$egress" -j MASQUERADE
+ipt nat POSTROUTING -s "$GUEST_SUB"  -o "$egress" -j MASQUERADE
+
+# Guest subnet: no ICMP echo, no access to the home network.
+ipt filter FORWARD -s "$GUEST_SUB" -p icmp --icmp-type echo-request -j DROP
+ipt filter FORWARD -s "$GUEST_SUB" -p icmp --icmp-type echo-reply   -j DROP
+ipt filter FORWARD -s "$GUEST_SUB" -d "$HOME_SUB" -j DROP
+
+# Custom rules supplied by the user (appended after the guest rules so DROPs
+# still take effect before the accept rules below).
+for f in "$OPENVPN_DIR/fw-rules.sh" /opt/app/fw-rules.sh; do
+    if [[ -s $f ]] && grep -qvE '^\s*(#|$)' "$f"; then
+        log "Applying additional firewall rules from $f"
+        bash "$f"
+        break
+    fi
+done
+
+if [[ $OVPN_STRICT_FORWARD = 1 ]]; then
+    # Only VPN-originated traffic and replies to it are forwarded.
+    ipt filter FORWARD -i 'tun+' -j ACCEPT
+    ipt filter FORWARD -o 'tun+' -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+    iptables -P FORWARD DROP
+fi
+
+log "NAT rules:";     iptables -t nat -S POSTROUTING | sed 's/^/    /'
+log "Forward rules:"; iptables -S FORWARD | sed 's/^/    /'
+
+# --------------------------------------------------------------------------
+# 3. Run OpenVPN under a supervisor loop
+# --------------------------------------------------------------------------
+rotate_log() {
+    local f=$LOG_DIR/openvpn.log
+    if [[ -f $f ]] && (( $(stat -c %s "$f") > OVPN_LOG_MAX_BYTES )); then
+        mv -f "$f" "$f.1"
+    fi
+}
+
+if [[ $OVPN_LOG_STDOUT = 1 ]]; then
+    touch "$LOG_DIR/openvpn.log"
+    tail -n 0 -F "$LOG_DIR/openvpn.log" 2>/dev/null &
+    TAIL_PID=$!
+fi
+
+STOP=0
+OVPN_PID=
+on_term() {
+    STOP=1
+    log "Received stop signal - shutting down OpenVPN"
+    [[ -n $OVPN_PID ]] && kill -TERM "$OVPN_PID" 2>/dev/null || true
+}
+trap on_term TERM INT
+
+while :; do
+    rotate_log
+    log "Starting OpenVPN"
+    /usr/sbin/openvpn --cd "$OPENVPN_DIR" --script-security 2 --config "$SERVER_CONF" &
+    OVPN_PID=$!
+    rc=0
+    while kill -0 "$OVPN_PID" 2>/dev/null; do
+        wait "$OVPN_PID" && rc=0 || rc=$?
+    done
+    OVPN_PID=
+    if (( STOP )); then
+        log "OpenVPN stopped (exit code $rc)"
+        break
+    fi
+    if (( rc == 0 )); then
+        log "OpenVPN exited (restart requested) - restarting in 2s"
+        sleep 2
+    else
+        warn "OpenVPN exited with code $rc - restarting in 5s (check $LOG_DIR/openvpn.log)"
+        sleep 5
+    fi
+done
+
+[[ -n ${TAIL_PID:-} ]] && kill "$TAIL_PID" 2>/dev/null || true
+exit 0

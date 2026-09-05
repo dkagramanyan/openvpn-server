@@ -1,48 +1,60 @@
----
-version: "3.5"
-
 services:
-    openvpn:
-       container_name: openvpn
-       # If you want to build your own image with docker-compose, uncomment the next line, comment the "image:" line and run "docker-compose build" following by "docker-compose up -d"
-       # build: .
-       image: d3vilh/openvpn-server:latest
-       privileged: true
-       ports: 
-          - "1194:1194/udp"   # openvpn UDP port
-         # - "1194:1194/tcp"   # openvpn TCP port
-         # - "2080:2080/tcp"  # management port. uncomment if you would like to share it with the host
-       environment:
-           TRUST_SUB: "10.0.70.0/24"
-           GUEST_SUB: "10.0.71.0/24"  
-           HOME_SUB: "192.168.88.0/24"
-       volumes:
-           - ./pki:/etc/openvpn/pki
-           - ./clients:/etc/openvpn/clients
-           - ./config:/etc/openvpn/config
-           - ./staticclients:/etc/openvpn/staticclients
-           - ./log:/var/log/openvpn
-           - ./fw-rules.sh:/opt/app/fw-rules.sh
-           - ./checkpsw.sh:/opt/app/checkpsw.sh
-           - ./server.conf:/etc/openvpn/server.conf
-       cap_add:
-           - NET_ADMIN
-       restart: always
-       depends_on:
-           - "openvpn-ui"
+  openvpn:
+    container_name: openvpn
+    image: openvpn-server:local
+    build: .
+    # NET_ADMIN (tun device, routes, iptables), the tun device and IPv4
+    # forwarding are all the container needs - it does not run privileged.
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.ip_forward: 1
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - "1195:1195/tcp"   # OpenVPN
+      - "8080:8080/tcp"   # Web UI (the UI container shares this network namespace)
+    environment:
+      TRUST_SUB: "10.0.70.0/24"     # subnet for trusted clients (server directive)
+      GUEST_SUB: "10.0.71.0/24"     # subnet for guest clients (internet only)
+      HOME_SUB: "192.168.88.0/24"   # your LAN - guests are blocked from it
+      # OVPN_EGRESS_IFACE: eth0     # auto-detected from the default route
+      # OVPN_STRICT_FORWARD: "1"    # set to 0 to allow unsolicited inbound to VPN clients
+    volumes:
+      - ./:/etc/openvpn
+      - ./log:/var/log/openvpn
+    restart: unless-stopped
 
-    openvpn-ui:
-       container_name: openvpn-ui
-       image: d3vilh/openvpn-ui:latest
-       environment:
-           - OPENVPN_ADMIN_USERNAME=admin
-           - OPENVPN_ADMIN_PASSWORD=gagaZush
-       privileged: true
-       ports:
-           - "8080:8080/tcp"
-       volumes:
-           - ./:/etc/openvpn
-           - ./db:/opt/openvpn-ui/db
-           - ./pki:/usr/share/easy-rsa/pki
-           - /var/run/docker.sock:/var/run/docker.sock:ro
-       restart: always
+  openvpn-ui:
+    container_name: openvpn-ui
+    image: openvpn-ui:local
+    build: ./ui
+    # Share the OpenVPN container's network namespace so the management
+    # interface stays bound to 127.0.0.1.
+    network_mode: "service:openvpn"
+    depends_on:
+      - openvpn
+    environment:
+      OPENVPN_ADMIN_USERNAME: ${OPENVPN_ADMIN_USERNAME:-admin}
+      OPENVPN_ADMIN_PASSWORD: ${OPENVPN_ADMIN_PASSWORD:-}   # empty = random, printed once in the logs
+      OVPN_PUBLIC_HOST: ${OVPN_PUBLIC_HOST:-}               # public address written into client profiles
+      OVPN_PUBLIC_PORT: ${OVPN_PUBLIC_PORT:-1195}
+      OVPN_PUBLIC_PROTO: ${OVPN_PUBLIC_PROTO:-tcp}
+      OVPN_UI_SECURE_COOKIES: ${OVPN_UI_SECURE_COOKIES:-auto} # "true" when served behind an HTTPS reverse proxy
+    volumes:
+      - ./:/etc/openvpn
+      - ./log:/var/log/openvpn:ro
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+    restart: unless-stopped

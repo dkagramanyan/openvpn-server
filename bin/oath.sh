@@ -1,37 +1,51 @@
-#!/bin/sh
-# v.0.1 by @d3vilh@github.com aka Mr. Philipp
-# d3vilh/openvpn-server drafted 2FA support
+#!/bin/bash
+# Two-factor (TOTP) verification for OpenVPN.
 #
-# MFA verification by OpenVPN server using oath-tool
+# Used with:  auth-user-pass-verify /opt/app/bin/oath.sh via-file
+#
+# OpenVPN passes a temporary file containing the username on line 1 and the
+# password (here: the 6-digit TOTP code) on line 2. The script exits 0 to
+# accept the connection and 1 to reject it. It runs as the unprivileged
+# OpenVPN user, so it must not need write access to anything but /tmp and
+# the log file prepared by the entrypoint.
+#
+# Rules enforced:
+#   * the username must equal the certificate common name (no borrowing
+#     another user's token);
+#   * users without an enrolled secret are rejected (never fail open);
+#   * the code is checked with a +/-1 step window for clock drift;
+#   * a code that was already accepted cannot be replayed.
 
-# VARIABLES
-PASSFILE=$1    # Password file passed by openvpn-server with "auth-user-pass-verify /opt/app/bin/oath.sh via-file" in server.conf
-OPENVPN_DIR=/etc/openvpn
-OATH_SECRETS=$OPENVPN_DIR/clients/oath.secrets
-LOG_FILE=/var/log/openvpn/oath.log
+PASSFILE=$1
+OPENVPN_DIR=${OPENVPN_DIR:-/etc/openvpn}
+OATH_SECRETS=${OATH_SECRETS:-$OPENVPN_DIR/clients/oath.secrets}
+LOG_FILE=${OATH_LOG:-/var/log/openvpn/oath.log}
+USED_DIR=/tmp/openvpn-oath
 
-#echo -e "$(date) Openvpn dir: $OPENVPN_DIR\nOath secrets: $OATH_SECRETS\nLog file: $LOG_FILE\nPassfile: $PASSFILE\n" | tee -a $LOG_FILE
+user=$(sed -n '1p' "$PASSFILE" 2>/dev/null)
+code=$(sed -n '2p' "$PASSFILE" 2>/dev/null)
+cn=${common_name:-}
 
-# Geting user and password passed by external user to OpenVPN server tmp file
-user=$(head -1 $PASSFILE)
-pass=$(tail -1 $PASSFILE) 
+log()  { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG_FILE" 2>/dev/null || true; }
+fail() { log "2FA FAIL user='$user' cn='$cn' from='${untrusted_ip:-?}' reason=$1"; exit 1; }
 
-echo "$(date) - 2FA authentication attempt for user $user" | tee -a $LOG_FILE # echo "$(date) - Password: $pass" | tee -a $LOG_FILE
+[[ -n $user ]]        || fail empty-username
+[[ $user = "$cn" ]]   || fail username-does-not-match-certificate
+[[ $code =~ ^[0-9]{6,8}$ ]] || fail malformed-code
+[[ -r $OATH_SECRETS ]] || fail secrets-file-unreadable
 
-# Parsing oath.secrets to getting secret entry, ignore case
-secret=$(grep -i -m 1 "$user:" $OATH_SECRETS | cut -d: -f2) # echo "$(date) - Secret: $secret" | tee -a $LOG_FILE
+secret=$(awk -F: -v u="$user" '$1 == u { print $2; exit }' "$OATH_SECRETS")
+[[ -n $secret ]] || fail no-secret-enrolled
 
-# Getting 2FA code with oathtool based on our secret, exiting with 0 if match:
-code=$(oathtool --totp $secret) # echo "$(date) - Code: $code" | tee -a $LOG_FILE
+oathtool --totp -w 1 "$secret" "$code" >/dev/null 2>&1 || fail wrong-code
 
-if [ "$code" = "$pass" ];
-then
-    echo "OK"
-        exit 0
-else 
-echo "FAIL"
+# Replay protection: the same code may not be used twice.
+mkdir -p "$USED_DIR" 2>/dev/null
+used_file=$USED_DIR/$(printf '%s' "$user" | sha256sum | cut -c1-32)
+if [[ -f $used_file ]] && [[ $(cat "$used_file" 2>/dev/null) = "$code" ]]; then
+    fail code-already-used
 fi
+printf '%s' "$code" > "$used_file" 2>/dev/null || true
 
-# If we make it here, auth hasn't succeeded, don't grant access
-echo "$(date) - 2FA authentication failed for user $user" | tee -a $LOG_FILE
-exit 1
+log "2FA OK user='$user' from='${untrusted_ip:-?}'"
+exit 0
