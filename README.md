@@ -39,6 +39,10 @@ certificate, the tls-crypt key and the CRL under `pki/`. Then:
 Sign in as `admin` with the password from `.env`. If you left that empty, a
 random one is printed once in `docker compose logs openvpn-ui`.
 
+Reachable on the server but not from another machine? The containers use host
+networking, so the host firewall applies to both ports - see
+[Host networking](#host-networking).
+
 Open **Settings** and confirm the public address (host, port, protocol) that
 is written into client profiles, then create clients under **Clients**.
 
@@ -104,9 +108,24 @@ Consequences worth knowing:
   per-container network sysctls in this mode, so the container cannot set it:
   `sudo sysctl -w net.ipv4.ip_forward=1` (the Docker daemon normally enables it
   already). The entrypoint refuses to start otherwise and says so.
-* **The firewall rules are the host's rules.** MASQUERADE, the guest-subnet
-  `DROP`s and, with `OVPN_STRICT_FORWARD=1`, the `FORWARD` policy `DROP` are
-  applied to the host (that policy is Docker's own default). Set
+* **The host firewall now applies to incoming connections.** This is the one
+  thing that catches people out. A published Docker port is reached through
+  DNAT and the `FORWARD` chain, which is why it is famously unaffected by
+  `firewalld` or `ufw`. A host-networked service is reached through `INPUT`,
+  where those rules do apply, so the VPN port and the UI port have to be
+  opened explicitly. With firewalld:
+
+  ```shell
+  sudo firewall-cmd --permanent --add-port=1195/tcp   # the "port" from server.conf
+  sudo firewall-cmd --permanent --add-port=8080/tcp   # web UI
+  sudo firewall-cmd --permanent --zone=trusted --add-interface=tun0
+  sudo firewall-cmd --reload
+  ```
+
+  With ufw: `sudo ufw allow 1195/tcp` and `sudo ufw allow 8080/tcp`.
+* **The other firewall rules are the host's rules.** MASQUERADE, the
+  guest-subnet `DROP`s and, with `OVPN_STRICT_FORWARD=1`, the `FORWARD` policy
+  `DROP` are applied to the host (that policy is Docker's own default). Set
   `OVPN_STRICT_FORWARD=0` to leave the policy alone.
 * `tun0` and the routes appear on the host, and OpenVPN sees real client
   addresses instead of the Docker bridge.
