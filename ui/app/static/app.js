@@ -113,7 +113,7 @@ async function api(path, opts = {}) {
   if (opts.body !== undefined) { init.headers['Content-Type'] = 'application/json'; init.body = JSON.stringify(opts.body); }
   let res;
   try { res = await fetch(path, init); } catch (e) { throw new Error('Network error: ' + e.message); }
-  if (res.status === 401 && !opts.allow401) { state.user = null; render(); throw new Error('Session expired'); }
+  if (res.status === 401 && !opts.allow401) { signOut(); throw new Error('Session expired'); }
   const ct = res.headers.get('content-type') || '';
   const data = ct.includes('application/json') ? await res.json() : await res.text();
   if (!res.ok) {
@@ -181,10 +181,15 @@ function connectStream() {
   const es = new EventSource('/api/stream');
   es.onmessage = e => { try { state.live = JSON.parse(e.data); onLive(); } catch (_) { /* ignore */ } };
   es.onerror = async () => {
-    try { await api('/api/me', { allow401: true }); } catch (_) { /* handled in api */ }
+    if (es.readyState !== EventSource.CLOSED) return;   // still retrying by itself
+    if (state.stream === es) state.stream = null;
+    try { await api('/api/me'); } catch (_) { return; }  // a 401 signs out
+    setTimeout(() => { if (state.user && !state.stream) connectStream(); }, 5000);
   };
   state.stream = es;
 }
+function closeStream() { if (state.stream) { state.stream.close(); state.stream = null; } }
+function signOut() { state.user = null; closeStream(); render(); }
 function onLive() {
   const live = state.live;
   const pill = $('#online-pill');
@@ -222,7 +227,7 @@ function sidebar() {
       h('span', { class: 'status-dot' + (live && live.connected ? ' on' : ''), id: 'mgmt-dot' }),
       h('span', { class: 'grow', id: 'mgmt-text' }, live ? (live.connected ? (shortVer(live.version) || 'OpenVPN') : 'OpenVPN unreachable') : 'connecting…'),
       h('button', { class: 'btn ghost sm', title: 'Toggle theme', onClick: () => { const cur = localStorage.getItem('theme') || 'system'; const next = cur === 'dark' ? 'light' : cur === 'light' ? 'system' : 'dark'; localStorage.setItem('theme', next); applyTheme(); toast('Theme: ' + next); } }, icon('sun')),
-      h('button', { class: 'btn ghost sm', title: 'Sign out', onClick: async () => { await api('/api/logout', { method: 'POST' }); state.user = null; if (state.stream) { state.stream.close(); state.stream = null; } render(); } }, icon('logout'))));
+      h('button', { class: 'btn ghost sm', title: 'Sign out', onClick: async () => { try { await api('/api/logout', { method: 'POST' }); } finally { signOut(); } } }, icon('logout'))));
 }
 function renderView() {
   const el = $('#view');
@@ -263,7 +268,7 @@ function niceTicks(max, count) {
   if (max <= 0) return [0, 1];
   const raw = max / count, mag = Math.pow(10, Math.floor(Math.log10(raw)));
   const norm = raw / mag;
-  const step = (norm <= 1 ? 1 : norm <= 2 ? 2 : norm <= 5 ? 5 : 10) * mag;
+  const step = Math.max(1, (norm <= 1 ? 1 : norm <= 2 ? 2 : norm <= 5 ? 5 : 10) * mag);   // whole bytes / bits
   const ticks = [];
   for (let v = 0; v <= max + step * 0.999; v += step) ticks.push(v);
   return ticks;
@@ -372,7 +377,7 @@ function loginView() {
   const btn = h('button', { class: 'btn primary', type: 'submit', style: 'width:100%;justify-content:center;padding:9px' }, 'Sign in');
   const form = h('form', { class: 'form', onSubmit: async e => {
     e.preventDefault(); err.textContent = ''; btn.disabled = true;
-    try { state.user = await api('/api/login', { method: 'POST', body: { username: user.value.trim(), password: pass.value }, allow401: true }); state.user = await api('/api/me'); render(); }
+    try { state.user = await api('/api/login', { method: 'POST', body: { username: user.value.trim(), password: pass.value }, allow401: true }); render(); }
     catch (ex) { err.textContent = ex.message; } finally { btn.disabled = false; }
   } }, field('Username', user), field('Password', pass), err, btn);
   return h('div', { class: 'login' }, h('div', { class: 'card' },
@@ -558,7 +563,7 @@ function clientDetailView(el) {
       c.state === 'valid' && !c.previous ? act('Renew', async () => { if (await confirmDialog('Renew certificate', 'A new certificate is issued for the same key. The previous certificate stays valid until you revoke it, so the client keeps working while you deliver the new profile.', 'Renew')) { await withToast(api(`/api/clients/${enc}/renew`, { method: 'POST', body: {} }), 'Certificate renewed'); load(); } }) : null,
       c.previous ? act('Revoke previous cert', async () => { if (await confirmDialog('Revoke previous certificate', 'The old certificate will be added to the CRL. Make sure the client already uses the new profile.', 'Revoke', true)) { await withToast(api(`/api/clients/${enc}/revoke-previous`, { method: 'POST' }), 'Previous certificate revoked'); load(); } }, 'danger') : null,
       c.state !== 'revoked' ? act('Revoke', async () => { if (await confirmDialog('Revoke certificate', `${name} will be disconnected and can no longer connect. This cannot be undone.`, 'Revoke', true)) { await withToast(api(`/api/clients/${enc}/revoke`, { method: 'POST', body: {} }), 'Certificate revoked'); load(); } }, 'danger') : null,
-      c.state !== 'valid' ? act('Delete', async () => { if (await confirmDialog('Delete client', `Remove the profile, static IP and 2FA data of ${name}? Traffic history is kept.`, 'Delete', true)) { await withToast(api(`/api/clients/${enc}`, { method: 'DELETE' }), 'Client deleted'); go('#/clients'); } }, 'danger') : null);
+      c.state === 'revoked' ? act('Delete', async () => { if (await confirmDialog('Delete client', `Remove the profile, static IP and 2FA data of ${name}? Traffic history is kept.`, 'Delete', true)) { await withToast(api(`/api/clients/${enc}`, { method: 'DELETE' }), 'Client deleted'); go('#/clients'); } }, 'danger') : null);
 
     const cert = c.cert, t = c.total;
     const kv = (pairs) => h('dl', { class: 'kv' }, pairs.map(([k, v]) => [h('dt', null, k), h('dd', null, v)]));
@@ -642,6 +647,9 @@ function serverView(el) {
   const sub = h('span');
   el.append(topbar('Server', sub, h('button', { class: 'btn danger', onClick: async () => { if (await confirmDialog('Restart OpenVPN', 'All connected clients will be disconnected and reconnect automatically. Configuration changes are applied on restart.', 'Restart', true)) await withToast(api('/api/server/restart', { method: 'POST' }), 'OpenVPN is restarting'); } }, icon('power'), 'Restart OpenVPN')), body);
   let info = null;
+  const status = h('div', { class: 'grid two' });
+  const tfaCard = h('div');
+  body.append(status, tfaCard, configEditor(), logsCard(), eventsCard());
   const kv = pairs => h('dl', { class: 'kv' }, pairs.filter(Boolean).map(([k, v]) => [h('dt', null, k), h('dd', null, v)]));
   const expiry = (c, warnDays) => { if (!c || !c.not_after) return '—'; const d = Math.floor((c.not_after - Date.now() / 1000) / 86400); return h('span', { class: d < warnDays ? 'badge expiring' : '' }, `${fmtDate(c.not_after)} (${fmtDays(d)})`); };
 
@@ -654,8 +662,7 @@ function serverView(el) {
       if (!await confirmDialog(on ? 'Enforce two-factor authentication' : 'Stop enforcing 2FA', on ? 'Every client must then send its name and a TOTP code. Clients without an enrolled secret will be rejected. OpenVPN must be restarted to apply.' : 'Clients will connect with certificates only. OpenVPN must be restarted to apply.', on ? 'Enforce' : 'Disable', !on)) { e.target.checked = !on; return; }
       await withToast(api('/api/server/tfa', { method: 'PUT', body: { enforced: on } }), 'Saved - restart OpenVPN to apply'); load();
     } });
-    body.replaceChildren(
-      h('div', { class: 'grid two' },
+    status.replaceChildren(
         card('Status', kv([
           ['OpenVPN', live.version || '—'],
           ['Management', h('span', null, h('span', { class: 'status-dot' + (live.connected ? ' on' : ''), style: 'display:inline-block;margin-right:6px' }), live.connected ? `${info.management.host}:${info.management.port}${info.management.password ? ' (password protected)' : ''}` : (live.error || 'disconnected'))],
@@ -672,15 +679,14 @@ function serverView(el) {
           ['Default client validity', `${p.cert_days} days`],
           ['tls-crypt key', p.tls_key ? 'present' : h('span', { class: 'badge revoked' }, 'missing')],
           ['Revocation list', crl.exists ? h('span', null, `${crl.revoked} revoked · next update `, expiry({ not_after: crl.next_update }, 30)) : h('span', { class: 'badge revoked' }, 'missing')],
-        ]), h('button', { class: 'btn sm', onClick: () => withToast(api('/api/server/crl', { method: 'POST' }), 'CRL regenerated').then(load) }, 'Regenerate CRL'))),
-      card('Two-factor authentication', h('div', { class: 'stack', style: 'gap:8px' },
+        ]), h('button', { class: 'btn sm', onClick: () => withToast(api('/api/server/crl', { method: 'POST' }), 'CRL regenerated').then(load) }, 'Regenerate CRL')));
+    tfaCard.replaceChildren(card('Two-factor authentication', h('div', { class: 'stack', style: 'gap:8px' },
         h('label', { class: 'check' }, tfaToggle, h('b', null, 'Require a TOTP code from every client')),
-        h('p', { class: 'small muted', style: 'margin:0' }, 'Adds "auth-user-pass-verify" to server.conf. Enrol clients first (Clients → client → Enable 2FA), then enforce and restart. Clients without a secret cannot connect while enforced.'))),
-      configEditor(), logsCard(), eventsCard());
+        h('p', { class: 'small muted', style: 'margin:0' }, 'Adds "auth-user-pass-verify" to server.conf. Enrol clients first (Clients → client → Enable 2FA), then enforce and restart. Clients without a secret cannot connect while enforced.'))));
   }
   function configEditor() {
     const tabs = h('div', { class: 'tabs' });
-    const ta = h('textarea', { class: 'input code', spellcheck: false });
+    const ta = h('textarea', { class: 'input code', spellcheck: 'false' });
     const hint = h('div', { class: 'small muted' });
     let which = 'server';
     const files = { server: 'server.conf', client: 'client.conf (profile template)', vars: 'easy-rsa vars' };

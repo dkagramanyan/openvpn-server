@@ -205,7 +205,7 @@ def range_bounds(name: str, tz: int) -> tuple[int, int]:
     if name == "today":
         start = ((now + tz) // 86400) * 86400 - tz
     elif name == "all":
-        start = 0
+        start = db.first_traffic_ts() or now - 86400
     else:
         start = now - int(RANGES[name] or 0)
     return start, now + 1
@@ -366,7 +366,8 @@ def overview(range: str = "today", tz: int = 0, user: dict[str, Any] = Authed):
     if counts["expiring"]:
         warnings.append(f"{counts['expiring']} client certificate(s) expire within {EXPIRING_DAYS} days")
     if pki.tfa_enforced():
-        missing = [n for n, c in certs.items() if c["cert"]["state"] == "valid" and n not in pki.tfa_secrets()]
+        enrolled = pki.tfa_secrets()
+        missing = [n for n, c in certs.items() if c["cert"]["state"] == "valid" and n not in enrolled]
         if missing:
             warnings.append(f"2FA is enforced but {len(missing)} client(s) have no TOTP secret: "
                             + ", ".join(sorted(missing)[:5]) + ("..." if len(missing) > 5 else ""))
@@ -415,7 +416,8 @@ def list_clients(range: str = "today", tz: int = 0, user: dict[str, Any] = Authe
 @app.post("/api/clients", status_code=201, dependencies=[Csrf])
 def create_client(body: NewClientBody, user: dict[str, Any] = Authed):
     name = pki.validate_name(body.name.strip())
-    if name in pki.list_clients(set()) and pki.list_clients(set())[name]["cert"]["state"] == "valid":
+    existing = pki.list_clients(set()).get(name)
+    if existing and existing["cert"]["state"] == "valid":
         raise HTTPException(409, "A client with this name already exists")
     pki.create_client(name, body.days, body.passphrase or None, (body.static_ip or "").strip() or None)
     db.execute("INSERT INTO clients (name, note, created_at) VALUES (?, ?, ?) "
@@ -512,7 +514,7 @@ def revoke_previous(name: str, user: dict[str, Any] = Authed):
 @app.delete("/api/clients/{name}", dependencies=[Csrf])
 def delete_client(name: str, user: dict[str, Any] = Authed):
     row = find_client(name)
-    if row["state"] == "valid":
+    if row["state"] != "revoked":
         raise HTTPException(400, "Revoke the certificate before deleting the client")
     pki.remove_client(name)
     serials = [row["cert"]["serial"]] + [h["serial"] for h in row["history"]]

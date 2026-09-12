@@ -112,18 +112,33 @@ class Collector(threading.Thread):
                 seen.add(key)
                 entry = self._active.get(key)
                 if entry is None:
-                    cur = conn.execute(
-                        """INSERT INTO vpn_sessions (client_name, cid, real_address, vpn_ip, username, cipher,
-                                                     connected_at, last_seen, bytes_in, bytes_out)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                        (cl["cn"], cl["cid"], cl["real_address"], cl["vpn_ip"], cl["username"], cl["cipher"],
-                         cl["connected_since"] or now, now, cl["bytes_in"], cl["bytes_out"]),
-                    )
-                    entry = {"session_id": cur.lastrowid, "bytes_in": cl["bytes_in"], "bytes_out": cl["bytes_out"],
+                    connected_at = cl["connected_since"] or now
+                    # A connection that predates this collector (UI restart, management outage) already
+                    # has a row: reopen it and count only the bytes since it was last seen.
+                    prev = self.db.find_session(conn, cl["cn"], cl["cid"], connected_at)
+                    if prev is not None:
+                        session_id = prev["id"]
+                        d_in = max(cl["bytes_in"] - prev["bytes_in"], 0)
+                        d_out = max(cl["bytes_out"] - prev["bytes_out"], 0)
+                        conn.execute(
+                            "UPDATE vpn_sessions SET disconnected_at = NULL, last_seen = ?, bytes_in = ?, bytes_out = ? "
+                            "WHERE id = ?", (now, cl["bytes_in"], cl["bytes_out"], session_id),
+                        )
+                    else:
+                        cur = conn.execute(
+                            """INSERT INTO vpn_sessions (client_name, cid, real_address, vpn_ip, username, cipher,
+                                                         connected_at, last_seen, bytes_in, bytes_out)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (cl["cn"], cl["cid"], cl["real_address"], cl["vpn_ip"], cl["username"], cl["cipher"],
+                             connected_at, now, cl["bytes_in"], cl["bytes_out"]),
+                        )
+                        session_id = cur.lastrowid
+                        d_in, d_out = cl["bytes_in"], cl["bytes_out"]
+                        self.db.add_event("vpn_connect", cl["cn"], None, cl["real_address"], conn=conn)
+                    entry = {"session_id": session_id, "bytes_in": cl["bytes_in"], "bytes_out": cl["bytes_out"],
                              "ts": now, "rate_in": 0.0, "rate_out": 0.0}
                     self._active[key] = entry
-                    self.db.add_traffic(conn, minute, cl["cn"], cl["bytes_in"], cl["bytes_out"])
-                    self.db.add_event("vpn_connect", cl["cn"], None, cl["real_address"], conn=conn)
+                    self.db.add_traffic(conn, minute, cl["cn"], d_in, d_out)
                 else:
                     d_in = cl["bytes_in"] - entry["bytes_in"]
                     d_out = cl["bytes_out"] - entry["bytes_out"]
@@ -172,8 +187,8 @@ class Collector(threading.Thread):
                                  (now, entry["session_id"]))
                     self.db.add_event("vpn_disconnect", key[2], None, "server unreachable", conn=conn)
             self._active.clear()
-        changed = self.live.get("connected") or self.live.get("error") != error
         with self._lock:
+            changed = self.live["connected"] or self.live["error"] != error
             self.live.update(connected=False, error=error, clients=[], load={}, rate_in=0.0, rate_out=0.0,
                              updated_at=int(time.time()), connected_since=None)
         if changed:

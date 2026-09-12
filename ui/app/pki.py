@@ -425,7 +425,11 @@ def set_remote(host: str, port: int | str, proto: str) -> None:
     proto = proto.strip().lower()
     if not HOST_RE.match(host):
         raise PkiError("Invalid host name or IP address")
-    if not (1 <= int(port) <= 65535):
+    try:
+        port = int(port)
+    except ValueError:
+        raise PkiError("Invalid port") from None
+    if not (1 <= port <= 65535):
         raise PkiError("Invalid port")
     if proto not in ("udp", "tcp"):
         raise PkiError("Protocol must be udp or tcp")

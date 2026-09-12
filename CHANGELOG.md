@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.0.1 - 2026-09-12
+
+### Fixed
+* Traffic statistics were counted twice for clients that were already
+  connected when the UI (re)started: the collector now reopens the existing
+  session row and only adds the bytes transferred since it was last seen.
+* Deleting an *expired* client removed its profile but left the certificate
+  in `pki/issued`, so the client stayed in the list forever. Delete is now
+  only offered for revoked clients (revoke the expired certificate first).
+* The "All" range built its time series from 1970, sending tens of thousands
+  of empty points to the browser; it now starts at the first recorded traffic.
+* The live status stream was not reopened after a session expiry and a new
+  login, so the dashboard stopped updating until the page was reloaded.
+* The Server page rebuilt the configuration editor, log viewer and audit log
+  whenever the management connection changed state, discarding unsaved edits
+  and accumulating refresh timers.
+* Sign-out is completed even when the logout request fails; a non-numeric
+  `OVPN_PUBLIC_PORT` no longer crashes the UI at startup.
+* `mkovpn.sh`, `oath-sec-gen.sh` and `oath-sec-rm.sh` used the client name as
+  an unescaped regular expression, so a name containing a dot could match
+  another client's 2FA secret.
+* Chart axes no longer repeat the same label on all-zero data.
+
+### Internal
+* Traffic queries are fully parameterised; unused helper removed.
+* New tests: API end-to-end against a throwaway openssl PKI, collector
+  restart behaviour (`cd ui && python -m pytest tests`).
+
 ## 1.0.0 - 2026-09-05
 
 ### Server image

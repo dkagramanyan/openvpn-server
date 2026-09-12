@@ -203,12 +203,18 @@ class Database:
         if client_name:
             params.append(client_name)
         rows = self.query(
-            f"""SELECT ((ts + {tz_offset}) / {bucket}) * {bucket} - {tz_offset} AS b,
-                       SUM(bytes_in) AS bi, SUM(bytes_out) AS bo
+            f"""SELECT ((ts + ?) / ?) * ? - ? AS b, SUM(bytes_in) AS bi, SUM(bytes_out) AS bo
                 FROM ({_TRAFFIC_UNION}){where} GROUP BY b ORDER BY b""",
-            params,
+            [tz_offset, bucket, bucket, tz_offset] + params,
         )
         return [{"ts": int(r["b"]), "bytes_in": int(r["bi"] or 0), "bytes_out": int(r["bo"] or 0)} for r in rows]
+
+    def first_traffic_ts(self) -> int | None:
+        row = self.one(
+            "SELECT MIN(ts) AS t FROM (SELECT MIN(ts) AS ts FROM traffic_minute UNION ALL "
+            "SELECT MIN(ts) FROM traffic_hour UNION ALL SELECT MIN(ts) FROM traffic_day)"
+        )
+        return int(row["t"]) if row and row["t"] is not None else None
 
     def rollup(self, now: int | None = None) -> None:
         """Fold old minute buckets into hourly ones and old hourly buckets into daily ones."""
@@ -248,6 +254,15 @@ class Database:
             )
             return cur.rowcount
 
+    @staticmethod
+    def find_session(conn: sqlite3.Connection, client_name: str, cid: int, connected_at: int) -> sqlite3.Row | None:
+        """The most recent row of a connection, matched by name, client id and start time."""
+        return conn.execute(
+            "SELECT id, bytes_in, bytes_out FROM vpn_sessions WHERE client_name = ? AND cid = ? AND connected_at = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (client_name, cid, connected_at),
+        ).fetchone()
+
     def session_stats_by_client(self) -> dict[str, dict[str, int]]:
         rows = self.query(
             """SELECT client_name, COUNT(*) AS n, MAX(last_seen) AS last_seen, MIN(connected_at) AS first_seen,
@@ -267,6 +282,3 @@ class Database:
             for r in rows
         }
 
-
-def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
-    return dict(row) if row is not None else None

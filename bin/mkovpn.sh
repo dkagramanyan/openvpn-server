@@ -41,7 +41,7 @@ SERVER_CN=$(openssl x509 -in "$PKI_DIR/issued/server.crt" -noout -subject -nameo
     cat "$OPENVPN_DIR/config/client.conf"
     echo
     [[ -n $SERVER_CN ]] && echo "verify-x509-name $SERVER_CN name"
-    if grep -qs "^$NAME:" "$OPENVPN_DIR/clients/oath.secrets"; then
+    if grep -qs "^${NAME//./\\.}:" "$OPENVPN_DIR/clients/oath.secrets"; then
         echo "# Two-factor authentication: username is the client name, password is the TOTP code"
         echo "auth-user-pass"
     fi

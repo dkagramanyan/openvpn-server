@@ -22,7 +22,7 @@ BASE32=$(oathtool --totp -v "$SECRET" | sed -n 's/^Base32 secret: //p')
 
 mkdir -p "$OPENVPN_DIR/clients"
 touch "$OATH_SECRETS"
-{ grep -v "^$NAME:" "$OATH_SECRETS" || true; echo "$NAME:$SECRET"; } > "$OATH_SECRETS.tmp"
+{ grep -v "^${NAME//./\\.}:" "$OATH_SECRETS" || true; echo "$NAME:$SECRET"; } > "$OATH_SECRETS.tmp"
 mv -f "$OATH_SECRETS.tmp" "$OATH_SECRETS"
 chmod 644 "$OATH_SECRETS"   # must stay readable by the unprivileged OpenVPN user
 
