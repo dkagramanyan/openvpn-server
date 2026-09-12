@@ -28,9 +28,16 @@ docker compose up -d --build
 ```
 
 First start takes a few seconds: the entrypoint creates the CA, the server
-certificate, the tls-crypt key and the CRL under `pki/`. The UI is then
-available on `http://<host>:8080` (user `admin`, password from `.env`; if you
-left it empty a random one is printed in `docker compose logs openvpn-ui`).
+certificate, the tls-crypt key and the CRL under `pki/`. Then:
+
+| | Address |
+|---|---|
+| Web UI, on the server itself | **http://localhost:8080** |
+| Web UI, from another machine | `http://<server-ip>:8080` |
+| VPN endpoint for clients | `<server-ip>:1195/tcp`, i.e. the `port` and `proto` set in `server.conf` |
+
+Sign in as `admin` with the password from `.env`. If you left that empty, a
+random one is printed once in `docker compose logs openvpn-ui`.
 
 Open **Settings** and confirm the public address (host, port, protocol) that
 is written into client profiles, then create clients under **Clients**.
