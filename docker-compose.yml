@@ -3,19 +3,21 @@ services:
     container_name: openvpn
     image: openvpn-server:local
     build: .
-    # NET_ADMIN (tun device, routes, iptables), the tun device and IPv4
-    # forwarding are all the container needs - it does not run privileged.
+    # Host networking: OpenVPN binds the "port" from server.conf directly on the
+    # host, sees the real client addresses, and creates tun0 plus its iptables
+    # rules in the host's network namespace. Nothing is published, so the VPN
+    # port is whatever server.conf says and the web UI is on host port 8080.
+    network_mode: host
+    # NET_ADMIN (tun device, routes, iptables) and the tun device are all the
+    # container needs - it does not run privileged. IPv4 forwarding cannot be
+    # set per container in host network mode, so it has to be on for the host
+    # (the Docker daemon normally enables it): sysctl -w net.ipv4.ip_forward=1
     cap_add:
       - NET_ADMIN
     devices:
       - /dev/net/tun:/dev/net/tun
-    sysctls:
-      net.ipv4.ip_forward: 1
     security_opt:
       - no-new-privileges:true
-    ports:
-      - "1195:1195/tcp"   # OpenVPN
-      - "8080:8080/tcp"   # Web UI (the UI container shares this network namespace)
     environment:
       TRUST_SUB: "10.0.70.0/24"     # subnet for trusted clients (server directive)
       GUEST_SUB: "10.0.71.0/24"     # subnet for guest clients (internet only)
@@ -35,9 +37,9 @@ services:
     build:
       context: .
       dockerfile: ui/Dockerfile
-    # Share the OpenVPN container's network namespace so the management
-    # interface stays bound to 127.0.0.1.
-    network_mode: "service:openvpn"
+    # Also on the host network: OpenVPN's management interface listens on
+    # 127.0.0.1:2080 there, and the UI itself is served on host port 8080.
+    network_mode: host
     depends_on:
       - openvpn
     environment:

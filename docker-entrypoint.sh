@@ -2,7 +2,7 @@
 # OpenVPN server container entrypoint.
 #
 #  1. Initialises the PKI on first start (CA, server cert, CRL, tls-crypt key).
-#  2. Enables IPv4 forwarding and installs idempotent iptables rules.
+#  2. Checks IPv4 forwarding and installs idempotent iptables rules.
 #  3. Runs OpenVPN under a small supervisor loop so that the web UI can
 #     restart the daemon through the management interface (signal SIGTERM)
 #     without needing access to the Docker socket.
@@ -121,9 +121,12 @@ if [[ ! -c /dev/net/tun ]]; then
     mknod /dev/net/tun c 10 200 2>/dev/null || die "/dev/net/tun is missing. Add 'devices: [/dev/net/tun]' to the container."
 fi
 
+# The kernel refuses per-container network sysctls in host network mode, so
+# forwarding has to be on for the host (the Docker daemon usually enables it).
 sysctl -q -w net.ipv4.ip_forward=1 2>/dev/null || true
 if [[ $(cat /proc/sys/net/ipv4/ip_forward) != 1 ]]; then
-    die "IPv4 forwarding is disabled and could not be enabled. Add 'sysctls: [net.ipv4.ip_forward=1]' to the container."
+    die "IPv4 forwarding is disabled. Enable it on the host and start again:
+      sudo sysctl -w net.ipv4.ip_forward=1   (persist it in /etc/sysctl.d/99-openvpn.conf)"
 fi
 
 egress=${OVPN_EGRESS_IFACE:-$(ip -4 route show default 2>/dev/null | awk '{print $5; exit}')}
@@ -136,7 +139,7 @@ ipt() {
     iptables -t "$table" -C "$@" 2>/dev/null || iptables -t "$table" -A "$@"
 }
 
-log "Configuring iptables"
+log "Configuring iptables in the current network namespace (the host's under network_mode: host)"
 ipt nat POSTROUTING -s "$TRUST_SUB" -o "$egress" -j MASQUERADE
 ipt nat POSTROUTING -s "$GUEST_SUB"  -o "$egress" -j MASQUERADE
 
@@ -156,7 +159,9 @@ for f in "$OPENVPN_DIR/fw-rules.sh" /opt/app/fw-rules.sh; do
 done
 
 if [[ $OVPN_STRICT_FORWARD = 1 ]]; then
-    # Only VPN-originated traffic and replies to it are forwarded.
+    # Only VPN-originated traffic and replies to it are forwarded. Under
+    # network_mode: host this sets the *host* FORWARD policy (the same value
+    # Docker itself defaults to); set OVPN_STRICT_FORWARD=0 to leave it alone.
     ipt filter FORWARD -i 'tun+' -j ACCEPT
     ipt filter FORWARD -o 'tun+' -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
     iptables -P FORWARD DROP

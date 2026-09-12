@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.0.2 - 2026-09-12
+
+### Changed
+* Both containers now run with `network_mode: host`. OpenVPN binds the `port`
+  from `server.conf` directly on the host and sees the real client addresses;
+  the web UI is served on host port 8080 and reaches the management interface
+  on the host's `127.0.0.1:2080`. Nothing is published any more, so a changed
+  `port` no longer has to be mirrored in a port mapping - a mismatch there
+  silently swallowed every connection attempt before OpenVPN ever saw it.
+* `sysctls: {net.ipv4.ip_forward: 1}` removed: the kernel rejects per-container
+  network sysctls in host network mode ("sysctl ... not allowed in host network
+  namespace"). IPv4 forwarding now has to be enabled on the host, which the
+  Docker daemon normally does; the entrypoint says exactly that when it is off.
+* The entrypoint documents that its iptables rules - MASQUERADE, the guest
+  `DROP`s and the `FORWARD` policy under `OVPN_STRICT_FORWARD=1` - apply to the
+  host firewall in this mode. `OVPN_STRICT_FORWARD=0` leaves the policy alone.
+* `docker-compose-no-ui.yml` switched the same way.
+
 ## 1.0.1 - 2026-09-12
 
 ### Fixed

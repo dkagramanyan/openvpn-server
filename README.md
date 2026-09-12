@@ -11,7 +11,7 @@ per-client traffic statistics.
   TOTP two-factor authentication with QR enrolment, config editors, log viewer,
   audit log. No JavaScript dependencies, works offline, light and dark theme.
 * **Security**: containers run unprivileged (`NET_ADMIN` only), the management
-  interface stays on `127.0.0.1` behind a generated password, `tls-crypt`,
+  interface stays on the host's `127.0.0.1` behind a generated password, `tls-crypt`,
   TLS 1.2+ with a pinned cipher list, EC (secp384r1) certificates, CRL
   auto-renewal, strict forwarding rules, no Docker socket in any container.
 
@@ -62,10 +62,9 @@ backup.sh            backup / restore helper
 services:
   openvpn:
     build: .
+    network_mode: host            # VPN port comes from server.conf
     cap_add: [NET_ADMIN]
     devices: [/dev/net/tun:/dev/net/tun]
-    sysctls: {net.ipv4.ip_forward: 1}
-    ports: ["1195:1195/tcp", "8080:8080/tcp"]   # VPN and web UI
     environment:
       TRUST_SUB: "10.0.70.0/24"    # dynamic pool ("server" directive)
       GUEST_SUB: "10.0.71.0/24"    # static IPs from here get internet only
@@ -74,16 +73,45 @@ services:
 
   openvpn-ui:
     build: {context: ., dockerfile: ui/Dockerfile}
-    network_mode: "service:openvpn"   # shares the network namespace
+    network_mode: host            # reaches the management interface on 127.0.0.1
     volumes: ["./:/etc/openvpn", "./log:/var/log/openvpn:ro"]
     cap_drop: [ALL]
     cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
     read_only: true
 ```
 
-The UI shares the OpenVPN container's network namespace, which is why the
-management interface can stay bound to `127.0.0.1:2080` and why the UI port is
-published on the `openvpn` service. Restart both with `docker compose restart`.
+## Host networking
+
+Both containers run in the host's network namespace. Nothing is published, so
+there is no port mapping to keep in sync:
+
+| | Where it comes from |
+|---|---|
+| VPN port | `port` (and `proto`) in `server.conf`, bound directly on the host |
+| Web UI | host port `8080` |
+| Management interface | `127.0.0.1:2080` on the host, behind a generated password |
+
+Consequences worth knowing:
+
+* **IPv4 forwarding must be enabled on the host.** The kernel rejects
+  per-container network sysctls in this mode, so the container cannot set it:
+  `sudo sysctl -w net.ipv4.ip_forward=1` (the Docker daemon normally enables it
+  already). The entrypoint refuses to start otherwise and says so.
+* **The firewall rules are the host's rules.** MASQUERADE, the guest-subnet
+  `DROP`s and, with `OVPN_STRICT_FORWARD=1`, the `FORWARD` policy `DROP` are
+  applied to the host (that policy is Docker's own default). Set
+  `OVPN_STRICT_FORWARD=0` to leave the policy alone.
+* `tun0` and the routes appear on the host, and OpenVPN sees real client
+  addresses instead of the Docker bridge.
+* Ports `8080` and the VPN port must be free on the host, and
+  `127.0.0.1:2080` is reachable by anything running there, not only by these
+  two containers. The management password file is `config/management.pw`
+  (mode 600).
+
+The port in a client profile (`remote <host> <port>`) is set in **Settings**
+or through `OVPN_PUBLIC_PORT`; it has to match `port` in `server.conf`.
+Changing `port` in `server.conf` now takes effect on a plain restart, since no
+port mapping is involved. Restart both services with `docker compose restart`.
 
 Environment variables of the `openvpn` service:
 
@@ -193,7 +221,10 @@ older setups worth knowing:
 * `push "block-outside-dns"` protects Windows clients from DNS leaks; other
   platforms log a harmless "Unrecognized option" line and continue.
 * `management 127.0.0.1 2080 /etc/openvpn/config/management.pw` - keep the
-  address and port, the UI depends on them.
+  address and port, the UI depends on them. With host networking this is the
+  host's loopback.
+* `port` and `proto` are bound directly on the host; a client profile's
+  `remote` line has to name the same port and protocol.
 * Data-channel offload (DCO) is compiled in and used automatically when the
   host kernel provides the `ovpn` module (Linux 6.16+).
 
