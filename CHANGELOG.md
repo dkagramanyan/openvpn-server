@@ -2,6 +2,12 @@
 
 ## 1.0.2 - 2026-09-12
 
+### Fixed
+* The sign-in screen sat against the left edge of the window instead of being
+  centred: the login view is the only child of the flex app shell, so it
+  shrank to the width of its card. It now fills the shell, and the card fits
+  viewports narrower than 400 px instead of overflowing them.
+
 ### Changed
 * Both containers now run with `network_mode: host`. OpenVPN binds the `port`
   from `server.conf` directly on the host and sees the real client addresses;

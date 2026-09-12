@@ -265,8 +265,10 @@ dialog.modal .m-h { padding: 16px 18px 0; display: flex; align-items: center; }
 dialog.modal .m-h h2 { font-size: 16px; flex: 1; }
 dialog.modal .m-b { padding: 14px 18px; }
 dialog.modal .m-f { padding: 0 18px 16px; display: flex; gap: 8px; justify-content: flex-end; }
-.login { min-height: 100vh; display: grid; place-items: center; padding: 20px; }
-.login .card { width: 360px; padding: 26px; }
+/* The login view is the only child of the flex .app shell, so it has to grow
+   to the full width - otherwise it shrinks to the card and sits on the left. */
+.login { flex: 1; min-height: 100vh; display: grid; place-items: center; padding: 20px; }
+.login .card { width: min(360px, 100%); padding: 26px; }
 .login .brand { padding: 0 0 18px; }
 .login .err { color: var(--critical); font-size: 13px; min-height: 18px; }
 .subnet { font-size: 11px; padding: 1px 6px; border-radius: 4px; background: var(--surface-2); color: var(--ink-2); }
