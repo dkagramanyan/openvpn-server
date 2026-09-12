@@ -53,10 +53,12 @@ def bootstrap() -> None:
             log.warning("created admin user '%s' with generated password: %s  (change it in Settings)",
                         settings.admin_username, password)
     if settings.public_host:
-        wanted = f"{settings.public_host}:{settings.public_port}:{settings.public_proto}"
+        # The public port defaults to the port OpenVPN listens on; the protocol always follows it.
+        port = settings.public_port or pki.server_listen()["port"]
+        wanted = f"{settings.public_host}:{port}"
         if db.get_setting("remote_from_env") != wanted:
             try:
-                pki.set_remote(settings.public_host, settings.public_port, settings.public_proto)
+                pki.set_remote(settings.public_host, port)
                 db.set_setting("remote_from_env", wanted)
                 log.info("client profiles now point at %s", wanted)
             except PkiError as exc:
@@ -194,7 +196,6 @@ class TfaEnforceBody(BaseModel):
 class RemoteBody(BaseModel):
     host: str = Field(min_length=1, max_length=253)
     port: int = Field(ge=1, le=65535)
-    proto: str = Field(pattern="^(udp|tcp)$")
 
 
 # -- helpers --------------------------------------------------------------------
@@ -352,10 +353,16 @@ def overview(range: str = "today", tz: int = 0, user: dict[str, Any] = Authed):
     warnings: list[str] = []
     if not live["connected"]:
         warnings.append(f"OpenVPN management interface unreachable: {live.get('error') or 'not connected'}")
-    remote_host = pki.get_remote()["host"]
-    if remote_host in ("", "127.0.0.1", "localhost", "::1"):
-        warnings.append("Client profiles point at " + (remote_host or "no address")
+    remote, listen = pki.get_remote(), pki.server_listen()
+    if remote["host"] in ("", "127.0.0.1", "localhost", "::1"):
+        warnings.append("Client profiles point at " + (remote["host"] or "no address")
                         + " - set this server's public address under Settings, then hand out the profiles again")
+    if remote["port"] != listen["port"]:
+        warnings.append(f"Client profiles dial port {remote['port']} but OpenVPN listens on {listen['port']}"
+                        " - correct it under Settings, unless a router forwards one port to the other")
+    if remote["proto"] != listen["proto"]:
+        warnings.append(f"Client profiles use {remote['proto'].upper()} but OpenVPN listens on "
+                        f"{listen['proto'].upper()} - save the public address again under Settings to fix it")
     crl = status["crl"]
     if crl["exists"] and crl["next_update"] and crl["next_update"] - now < EXPIRING_DAYS * 86400:
         warnings.append("The certificate revocation list expires soon - regenerate it on the Server page")
@@ -596,6 +603,7 @@ def server_info(user: dict[str, Any] = Authed):
         "pki": pki.pki_status(),
         "tfa_enforced": pki.tfa_enforced(),
         "remote": pki.get_remote(),
+        "listen": pki.server_listen(),
         "config_mtime": mtime,
         "dco": (live.get("stats") or {}).get("dco_enabled"),
         "management": {"host": _mgmt_host, "port": _mgmt_port, "password": bool(mgmt.password)},
@@ -614,6 +622,9 @@ def put_config(which: str, body: ConfigBody, user: dict[str, Any] = Authed):
     event("config_saved", user, None, which)
     if which == "client":
         pki.regenerate_profiles()
+    elif which == "server" and pki.sync_remote_proto():
+        # server.conf changed the protocol, so the profiles have to follow it.
+        event("remote_changed", user, None, f"protocol now {pki.server_listen()['proto']} (from server.conf)")
     return {"ok": True, "restart_required": which == "server"}
 
 
@@ -656,15 +667,16 @@ def events(limit: int = 100, user: dict[str, Any] = Authed):
 
 @app.get("/api/settings")
 def get_settings(user: dict[str, Any] = Authed):
-    return {"remote": pki.get_remote(), "tfa_issuer": settings.tfa_issuer,
+    return {"remote": pki.get_remote(), "listen": pki.server_listen(), "tfa_issuer": settings.tfa_issuer,
             "poll_interval": settings.poll_interval, "version": __version__}
 
 
 @app.put("/api/settings", dependencies=[Csrf])
 def put_settings(body: RemoteBody, user: dict[str, Any] = Authed):
-    pki.set_remote(body.host, body.port, body.proto)
-    event("remote_changed", user, None, f"{body.host}:{body.port}/{body.proto}")
-    return {"remote": pki.get_remote()}
+    pki.set_remote(body.host, body.port)
+    remote = pki.get_remote()
+    event("remote_changed", user, None, f"{remote['host']}:{remote['port']}/{remote['proto']}")
+    return {"remote": remote, "listen": pki.server_listen()}
 
 
 # -- misc -----------------------------------------------------------------------

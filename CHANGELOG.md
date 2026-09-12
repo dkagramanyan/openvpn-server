@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.1.0 - 2026-09-12
+
+### Changed
+* **The protocol of client profiles is no longer configured separately.** It
+  follows `proto` in `server.conf`, because a port forward can remap a port but
+  can never turn UDP into TCP, so there was nothing to gain from setting it in
+  two places and a connection to lose from setting it in one. `OVPN_PUBLIC_PROTO`
+  is gone, the Settings page shows the protocol rather than offering a choice,
+  and saving `server.conf` with a different `proto` rewrites every profile.
+* `OVPN_PUBLIC_PORT` defaults to the port from `server.conf` instead of 1195.
+  Set it only when a router or relay forwards a different public port, which is
+  the one case where the two may legitimately differ.
+* The dashboard warns when the profile's port or protocol disagrees with the
+  listening one, and the Server page shows both addresses side by side.
+* `server.conf` listens on 1197/udp, which is the forwarded port here, with
+  `explicit-exit-notify` enabled and the TCP-only `tcp-nodelay` commented out.
+
+### Fixed
+* The guest-isolation rules guarded a network that does not exist here:
+  `HOME_SUB` still named `192.168.88.0/24` and `server.conf` pushed a route for
+  `171.134.51.0/24`, one digit away from the server's own LAN. Both now name
+  `170.134.51.0/24`.
+
 ## 1.0.2 - 2026-09-12
 
 ### Fixed

@@ -669,7 +669,9 @@ function serverView(el) {
           ['Data channel offload', live.stats && live.stats.dco_enabled !== undefined ? (live.stats.dco_enabled === '1' ? 'enabled (kernel)' : 'not available on this kernel') : '—'],
           ['Connected clients', live.connected ? String(live.clients.length) : '—'],
           ['Since process start', live.load && live.load.bytesin !== undefined ? `↓ ${fmtBytes(live.load.bytesout)} · ↑ ${fmtBytes(live.load.bytesin)}` : '—'],
-          ['Client profiles point to', `${info.remote.host || '(not set)'}:${info.remote.port} ${info.remote.proto}`],
+          ['Listening on', h('span', null, `${info.listen.port}/${info.listen.proto}`, h('span', { class: 'muted small' }, ' · "port" and "proto" in server.conf'))],
+          ['Client profiles point to', h('span', { class: info.remote.port !== info.listen.port || info.remote.proto !== info.listen.proto ? 'badge expiring' : '' },
+            `${info.remote.host || '(not set)'}:${info.remote.port}/${info.remote.proto}`)],
           ['UI version', info.ui_version],
         ])),
         card('PKI', kv([
@@ -739,8 +741,16 @@ function settingsView(el) {
     let s;
     try { s = await api('/api/settings'); } catch (e) { toast(e.message, 'err'); return; }
     const host = h('input', { class: 'input', value: s.remote.host, placeholder: 'vpn.example.com or public IP' });
-    const port = h('input', { class: 'input', type: 'number', min: 1, max: 65535, value: s.remote.port });
-    const proto = h('select', { class: 'input' }, h('option', { value: 'tcp', selected: s.remote.proto === 'tcp' }, 'tcp'), h('option', { value: 'udp', selected: s.remote.proto === 'udp' }, 'udp'));
+    const port = h('input', { class: 'input', type: 'number', min: 1, max: 65535, value: s.remote.port, onInput: () => checkPort() });
+    const proto = h('div', { class: 'row', style: 'gap:8px;align-items:center;min-height:36px' },
+      h('span', { class: 'badge plain' }, (s.listen.proto || '').toUpperCase()), h('span', { class: 'small muted' }, 'from server.conf'));
+    const mismatch = h('div');
+    const checkPort = () => {
+      const p = String(port.value || '');
+      if (p && p !== String(s.listen.port)) mismatch.replaceChildren(warnings([`OpenVPN listens on port ${s.listen.port}. Use ${p} only if a router or relay forwards ${p} to it.`]));
+      else mismatch.replaceChildren();
+    };
+    checkPort();
     const cur = h('input', { class: 'input', type: 'password', autocomplete: 'current-password' });
     const nw = h('input', { class: 'input', type: 'password', autocomplete: 'new-password', minlength: 8 });
     const nw2 = h('input', { class: 'input', type: 'password', autocomplete: 'new-password' });
@@ -750,8 +760,9 @@ function settingsView(el) {
     body.append(
       h('div', { class: 'grid two' },
         card('Public address for client profiles', h('div', { class: 'form' }, h('div', { class: 'form cols' }, h('div', { class: 'full' }, field('Host', host)), field('Port', port), field('Protocol', proto)),
-          h('p', { class: 'small muted', style: 'margin:0' }, 'Written as the "remote" line of config/client.conf. Existing profiles are regenerated; clients need the new file only if the address changed. The protocol must match "proto" in server.conf.'),
-          h('div', null, h('button', { class: 'btn primary', onClick: async () => { await withToast(api('/api/settings', { method: 'PUT', body: { host: host.value.trim(), port: Number(port.value), proto: proto.value } }), 'Saved and profiles regenerated'); } }, 'Save')))),
+          mismatch,
+          h('p', { class: 'small muted', style: 'margin:0' }, 'The address clients dial, written as the "remote" line of config/client.conf. It is the public one, which differs from the listening address whenever a router or relay forwards the port. The protocol is not set here: a forward can remap a port but never change UDP into TCP, so it always follows "proto" in server.conf. Saving regenerates every profile; hand them out again if the address changed.'),
+          h('div', null, h('button', { class: 'btn primary', onClick: async () => { const r = await withToast(api('/api/settings', { method: 'PUT', body: { host: host.value.trim(), port: Number(port.value) } }), 'Saved and profiles regenerated'); s = r; checkPort(); } }, 'Save')))),
         card('Change password', h('div', { class: 'form' }, field('Current password', cur), field('New password', nw, 'At least 8 characters'), field('Repeat new password', nw2),
           h('div', null, h('button', { class: 'btn primary', onClick: async () => { if (nw.value !== nw2.value) { toast('Passwords do not match', 'err'); return; } await withToast(api('/api/me/password', { method: 'POST', body: { current: cur.value, new: nw.value } }), 'Password changed'); cur.value = nw.value = nw2.value = ''; } }, 'Change password'))))),
       h('div', { class: 'grid two' },

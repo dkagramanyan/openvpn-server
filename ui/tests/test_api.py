@@ -1,5 +1,6 @@
 """End-to-end API tests against a throwaway PKI built with openssl (no easy-rsa needed)."""
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -80,7 +81,12 @@ def build_env():
     ossl("ca", "-batch", "-config", str(pki / "ca.cnf"), "-gencrl", "-crldays", "180", "-out", str(pki / "crl.pem"))
     (pki / "ta.key").write_text("#\n# 2048 bit OpenVPN static key\n#\n-----BEGIN OpenVPN Static key V1-----\n"
                                 "00\n-----END OpenVPN Static key V1-----\n")
-    shutil.copy(ROOT / "server.conf", TMP / "server.conf")
+    # Pin the listening port and protocol so the tests do not depend on the
+    # deployment-specific values in the repository's server.conf.
+    conf = (ROOT / "server.conf").read_text()
+    conf = re.sub(r"(?m)^\s*port\s+\d+", "port 1197", conf)
+    conf = re.sub(r"(?m)^\s*proto\s+\S+", "proto udp", conf)
+    (TMP / "server.conf").write_text(conf)
     shutil.copy(ROOT / "config" / "client.conf", TMP / "config" / "client.conf")
     (TMP / "clients" / "oath.secrets").write_text("alice:3132333435363738393031323334353637383930\n")
 
@@ -146,10 +152,39 @@ def test_profile_download_and_remote(client):
     assert "<cert>" in r.text and "verify-x509-name server name" in r.text and "auth-user-pass" in r.text
     assert client.get("/api/clients/old/ovpn").status_code == 200   # expired but still issued
     assert client.get("/api/clients/bob/ovpn").status_code == 404
+    r = client.put("/api/settings", json={"host": "vpn.example.org", "port": 443}, headers=H)
+    assert r.status_code == 200, r.text
+    # The protocol is never taken from the request; it follows server.conf.
+    assert r.json()["remote"] == {"host": "vpn.example.org", "port": "443", "proto": "udp"}
+    assert r.json()["listen"] == {"port": "1197", "proto": "udp"}
+    profile = client.get("/api/clients/alice/ovpn").text
+    assert "remote vpn.example.org 443" in profile and "proto udp" in profile
+    # A protocol sent anyway is ignored rather than honoured.
     r = client.put("/api/settings", json={"host": "vpn.example.org", "port": 443, "proto": "tcp"}, headers=H)
-    assert r.status_code == 200 and r.json()["remote"] == {"host": "vpn.example.org", "port": "443", "proto": "tcp"}
-    assert "remote vpn.example.org 443" in client.get("/api/clients/alice/ovpn").text
-    assert client.put("/api/settings", json={"host": "bad host", "port": 443, "proto": "tcp"}, headers=H).status_code == 400
+    assert r.json()["remote"]["proto"] == "udp"
+    assert client.put("/api/settings", json={"host": "bad host", "port": 443}, headers=H).status_code == 400
+
+
+def test_port_mismatch_warns_and_protocol_follows_server_conf(client):
+    # profiles dial 443 while OpenVPN listens on 1197
+    warns = client.get("/api/overview?range=today").json()["warnings"]
+    assert any("443" in w and "1197" in w for w in warns), warns
+
+    # switching the server to TCP rewrites the protocol of every profile
+    conf = client.get("/api/server/config/server").json()["content"]
+    r = client.put("/api/server/config/server", json={"content": conf.replace("proto udp", "proto tcp")}, headers=H)
+    assert r.status_code == 200 and r.json()["restart_required"] is True
+    s = client.get("/api/settings").json()
+    assert s["listen"]["proto"] == "tcp" and s["remote"]["proto"] == "tcp"
+    assert "proto tcp" in client.get("/api/clients/alice/ovpn").text
+    assert any(e["kind"] == "remote_changed" and "tcp" in (e["detail"] or "")
+               for e in client.get("/api/events").json()["events"])
+
+    # and back to UDP
+    conf = client.get("/api/server/config/server").json()["content"]
+    client.put("/api/server/config/server", json={"content": conf.replace("proto tcp", "proto udp")}, headers=H)
+    assert client.get("/api/settings").json()["remote"]["proto"] == "udp"
+    assert "proto udp" in client.get("/api/clients/alice/ovpn").text
 
 
 def test_delete_requires_revocation(client):

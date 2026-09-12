@@ -15,7 +15,7 @@ services:
     environment:
       TRUST_SUB: "10.0.70.0/24"
       GUEST_SUB: "10.0.71.0/24"
-      HOME_SUB: "192.168.88.0/24"
+      HOME_SUB: "170.134.51.0/24"
     volumes:
       - ./:/etc/openvpn
       - ./log:/var/log/openvpn

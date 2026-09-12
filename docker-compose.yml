@@ -21,7 +21,7 @@ services:
     environment:
       TRUST_SUB: "10.0.70.0/24"     # subnet for trusted clients (server directive)
       GUEST_SUB: "10.0.71.0/24"     # subnet for guest clients (internet only)
-      HOME_SUB: "192.168.88.0/24"   # your LAN - guests are blocked from it
+      HOME_SUB: "170.134.51.0/24"   # your LAN - guests are blocked from it
       # OVPN_EGRESS_IFACE: eth0     # auto-detected from the default route
       # OVPN_STRICT_FORWARD: "1"    # set to 0 to allow unsolicited inbound to VPN clients
     volumes:
@@ -46,8 +46,8 @@ services:
       OPENVPN_ADMIN_USERNAME: ${OPENVPN_ADMIN_USERNAME:-admin}
       OPENVPN_ADMIN_PASSWORD: ${OPENVPN_ADMIN_PASSWORD:-}   # empty = random, printed once in the logs
       OVPN_PUBLIC_HOST: ${OVPN_PUBLIC_HOST:-}               # public address written into client profiles
-      OVPN_PUBLIC_PORT: ${OVPN_PUBLIC_PORT:-1195}
-      OVPN_PUBLIC_PROTO: ${OVPN_PUBLIC_PROTO:-tcp}
+      OVPN_PUBLIC_PORT: ${OVPN_PUBLIC_PORT:-}               # empty = the "port" from server.conf
+      # There is no public protocol setting: it always follows "proto" in server.conf.
       OVPN_UI_SECURE_COOKIES: ${OVPN_UI_SECURE_COOKIES:-auto} # "true" when served behind an HTTPS reverse proxy
     volumes:
       - ./:/etc/openvpn

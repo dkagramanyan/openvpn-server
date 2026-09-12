@@ -420,9 +420,23 @@ def get_remote() -> dict[str, str]:
     return {"host": host, "port": port, "proto": proto}
 
 
-def set_remote(host: str, port: int | str, proto: str) -> None:
+def server_listen() -> dict[str, str]:
+    """What OpenVPN actually listens on, from server.conf."""
+    text = read_config("server")
+    port, proto = "1194", "udp"          # OpenVPN's own defaults
+    m = re.search(r"^\s*port\s+(\d+)", text, re.M)
+    if m:
+        port = m.group(1)
+    m = re.search(r"^\s*proto\s+(\S+)", text, re.M)
+    if m and m.group(1).lower().startswith(("udp", "tcp")):
+        proto = m.group(1).lower()[:3]
+    return {"port": port, "proto": proto}
+
+
+def set_remote(host: str, port: int | str) -> None:
+    """Point client profiles at <host>:<port>. The protocol always follows server.conf:
+    a port forward can remap the port, but it can never turn UDP into TCP."""
     host = host.strip()
-    proto = proto.strip().lower()
     if not HOST_RE.match(host):
         raise PkiError("Invalid host name or IP address")
     try:
@@ -431,8 +445,7 @@ def set_remote(host: str, port: int | str, proto: str) -> None:
         raise PkiError("Invalid port") from None
     if not (1 <= port <= 65535):
         raise PkiError("Invalid port")
-    if proto not in ("udp", "tcp"):
-        raise PkiError("Protocol must be udp or tcp")
+    proto = server_listen()["proto"]
     text = read_config("client")
     lines = [l for l in text.splitlines() if not re.match(r"^\s*(remote|proto)\s+", l)]
     # keep "client" first, then proto/remote
@@ -447,6 +460,15 @@ def set_remote(host: str, port: int | str, proto: str) -> None:
         out = [f"proto {proto}", f"remote {host} {port}"] + out
     write_config("client", "\n".join(out) + "\n")
     regenerate_profiles()
+
+
+def sync_remote_proto() -> bool:
+    """Rewrite the profiles' protocol when server.conf changed it. True when it did."""
+    remote = get_remote()
+    if not remote["host"] or remote["proto"] == server_listen()["proto"]:
+        return False
+    set_remote(remote["host"], remote["port"])
+    return True
 
 
 def regenerate_profiles() -> list[str]:

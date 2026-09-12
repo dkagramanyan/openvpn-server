@@ -34,7 +34,7 @@ certificate, the tls-crypt key and the CRL under `pki/`. Then:
 |---|---|
 | Web UI, on the server itself | **http://localhost:8080** |
 | Web UI, from another machine | `http://<server-ip>:8080` |
-| VPN endpoint for clients | `<server-ip>:1195/tcp`, i.e. the `port` and `proto` set in `server.conf` |
+| VPN endpoint for clients | `<server-ip>:1197/udp`, i.e. the `port` and `proto` set in `server.conf` |
 
 Sign in as `admin` with the password from `.env`. If you left that empty, a
 random one is printed once in `docker compose logs openvpn-ui`.
@@ -43,8 +43,8 @@ Reachable on the server but not from another machine? The containers use host
 networking, so the host firewall applies to both ports - see
 [Host networking](#host-networking).
 
-Open **Settings** and confirm the public address (host, port, protocol) that
-is written into client profiles, then create clients under **Clients**.
+Open **Settings** and confirm the public address (host and port) that is
+written into client profiles, then create clients under **Clients**.
 
 Put the UI behind an HTTPS reverse proxy for anything but a LAN; set
 `OVPN_UI_SECURE_COOKIES=true` in `.env` when you do.
@@ -79,7 +79,7 @@ services:
     environment:
       TRUST_SUB: "10.0.70.0/24"    # dynamic pool ("server" directive)
       GUEST_SUB: "10.0.71.0/24"    # static IPs from here get internet only
-      HOME_SUB: "192.168.88.0/24"  # your LAN, hidden from guests
+      HOME_SUB: "170.134.51.0/24"  # your LAN, hidden from guests
     volumes: ["./:/etc/openvpn", "./log:/var/log/openvpn"]
 
   openvpn-ui:
@@ -116,13 +116,13 @@ Consequences worth knowing:
   opened explicitly. With firewalld:
 
   ```shell
-  sudo firewall-cmd --permanent --add-port=1195/tcp   # the "port" from server.conf
+  sudo firewall-cmd --permanent --add-port=1197/udp   # the "port" from server.conf
   sudo firewall-cmd --permanent --add-port=8080/tcp   # web UI
   sudo firewall-cmd --permanent --zone=trusted --add-interface=tun0
   sudo firewall-cmd --reload
   ```
 
-  With ufw: `sudo ufw allow 1195/tcp` and `sudo ufw allow 8080/tcp`.
+  With ufw: `sudo ufw allow 1197/udp` and `sudo ufw allow 8080/tcp`.
 * **The other firewall rules are the host's rules.** MASQUERADE, the
   guest-subnet `DROP`s and, with `OVPN_STRICT_FORWARD=1`, the `FORWARD` policy
   `DROP` are applied to the host (that policy is Docker's own default). Set
@@ -134,10 +134,27 @@ Consequences worth knowing:
   two containers. The management password file is `config/management.pw`
   (mode 600).
 
-The port in a client profile (`remote <host> <port>`) is set in **Settings**
-or through `OVPN_PUBLIC_PORT`; it has to match `port` in `server.conf`.
-Changing `port` in `server.conf` now takes effect on a plain restart, since no
-port mapping is involved. Restart both services with `docker compose restart`.
+## The public address
+
+Three things look like "the port", and they are not the same thing:
+
+| | Set in | Meaning |
+|---|---|---|
+| `port`, `proto` | `server.conf` | what OpenVPN binds on the host |
+| `remote <host> <port>` | **Settings**, or `OVPN_PUBLIC_HOST` / `OVPN_PUBLIC_PORT` | what clients dial |
+| the profile's protocol | nowhere: it follows `server.conf` | a forward can remap a port, never the protocol |
+
+Host and port are deliberately separate from the listening address. Behind a
+router or a relay, clients dial a public address that differs from the one
+OpenVPN binds, and the forward may map one port onto another. The protocol
+cannot differ that way, so it is never asked for twice: editing `proto` in
+`server.conf` rewrites every profile to match.
+
+Leave `OVPN_PUBLIC_PORT` empty to use the listening port. When the two do
+differ, the dashboard says so, because it is legal but usually a mistake.
+
+Changing `port` in `server.conf` takes effect on a plain restart, since no
+port mapping is involved: `docker compose restart`.
 
 Environment variables of the `openvpn` service:
 
@@ -151,7 +168,7 @@ Environment variables of the `openvpn` service:
 | `OVPN_CRL_RENEW_DAYS` | `30` | regenerate the CRL when it expires within this many days |
 
 `.env` (see `.env.example`): `OPENVPN_ADMIN_USERNAME`, `OPENVPN_ADMIN_PASSWORD`,
-`OVPN_PUBLIC_HOST`, `OVPN_PUBLIC_PORT`, `OVPN_PUBLIC_PROTO`, `OVPN_UI_SECURE_COOKIES`.
+`OVPN_PUBLIC_HOST`, `OVPN_PUBLIC_PORT`, `OVPN_UI_SECURE_COOKIES`.
 
 `docker-compose-no-ui.yml` runs the server alone; use the scripts in `bin/`
 via `docker exec` in that case.
@@ -173,7 +190,8 @@ via `docker exec` in that case.
   regeneration, 2FA enforcement switch, editors for `server.conf`,
   `client.conf` and easy-rsa vars (a `.bak` is kept), restart button, log
   viewer (openvpn.log, 2FA log, status file) and audit log.
-* **Settings** - public address for profiles, admin password, theme.
+* **Settings** - public address for profiles (host and port; the protocol
+  follows `server.conf`), admin password, theme.
 
 Traffic is collected every 5 s from the management interface (`status 3`),
 stored per minute for two days, per hour for 90 days and per day forever.
@@ -249,8 +267,9 @@ older setups worth knowing:
 * `management 127.0.0.1 2080 /etc/openvpn/config/management.pw` - keep the
   address and port, the UI depends on them. With host networking this is the
   host's loopback.
-* `port` and `proto` are bound directly on the host; a client profile's
-  `remote` line has to name the same port and protocol.
+* `port` and `proto` are bound directly on the host. A profile's `remote` line
+  may name a different port when one is forwarded to the other, but never a
+  different protocol - see [The public address](#the-public-address).
 * Data-channel offload (DCO) is compiled in and used automatically when the
   host kernel provides the `ovpn` module (Linux 6.16+).
 
