@@ -1,3 +1,7 @@
+x-logging: &logging
+  driver: json-file
+  options: { max-size: "10m", max-file: "3" }
+
 services:
   openvpn:
     container_name: openvpn
@@ -5,62 +9,53 @@ services:
     build: .
     # Host networking: OpenVPN binds the "port" from server.conf directly on the
     # host, sees the real client addresses, and creates tun0 plus its iptables
-    # rules in the host's network namespace. Nothing is published, so the VPN
-    # port is whatever server.conf says and the web UI is on host port 8080.
+    # rules in the host's network namespace.
     network_mode: host
     # NET_ADMIN (tun device, routes, iptables) and the tun device are all the
     # container needs - it does not run privileged. IPv4 forwarding cannot be
     # set per container in host network mode, so it has to be on for the host
     # (the Docker daemon normally enables it): sysctl -w net.ipv4.ip_forward=1
-    cap_add:
-      - NET_ADMIN
-    devices:
-      - /dev/net/tun:/dev/net/tun
-    security_opt:
-      - no-new-privileges:true
+    cap_add: [NET_ADMIN]
+    devices: [/dev/net/tun:/dev/net/tun]
+    security_opt: [no-new-privileges:true]
     environment:
-      TRUST_SUB: "10.0.70.0/24"     # subnet for trusted clients (server directive)
-      GUEST_SUB: "10.0.71.0/24"     # subnet for guest clients (internet only)
-      HOME_SUB: "170.134.51.0/24"   # your LAN - guests are blocked from it
+      TRUST_SUB: "10.0.70.0/24"     # the "server" subnet in server.conf
+      GUEST_SUB: &guest_sub "10.0.70.128/25"   # static IPs from here get internet only
+      HOME_SUB: "171.134.51.0/24"   # your LAN - guests are blocked from it
+      # GUEST_BLOCK: "10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16"
       # OVPN_EGRESS_IFACE: eth0     # auto-detected from the default route
       # OVPN_STRICT_FORWARD: "1"    # set to 0 to allow unsolicited inbound to VPN clients
     volumes:
       - ./:/etc/openvpn
       - ./log:/var/log/openvpn
+    logging: *logging
     restart: unless-stopped
 
   openvpn-ui:
     container_name: openvpn-ui
     image: openvpn-ui:local
-    # The UI image copies bin/ and ui/ from the repository root, so the build
-    # context is the root and the Dockerfile is addressed inside it.
-    build:
-      context: .
-      dockerfile: ui/Dockerfile
+    # The UI image copies bin/ and ui/ from the repository root.
+    build: { context: ., dockerfile: ui/Dockerfile }
     # Also on the host network: OpenVPN's management interface listens on
-    # 127.0.0.1:2080 there, and the UI itself is served on host port 8080.
+    # 127.0.0.1:2080 there.
     network_mode: host
-    depends_on:
-      - openvpn
+    depends_on: [openvpn]
     environment:
       OPENVPN_ADMIN_USERNAME: ${OPENVPN_ADMIN_USERNAME:-admin}
       OPENVPN_ADMIN_PASSWORD: ${OPENVPN_ADMIN_PASSWORD:-}   # empty = random, printed once in the logs
       OVPN_PUBLIC_HOST: ${OVPN_PUBLIC_HOST:-}               # public address written into client profiles
       OVPN_PUBLIC_PORT: ${OVPN_PUBLIC_PORT:-}               # empty = the "port" from server.conf
-      # There is no public protocol setting: it always follows "proto" in server.conf.
       OVPN_UI_SECURE_COOKIES: ${OVPN_UI_SECURE_COOKIES:-auto} # "true" when served behind an HTTPS reverse proxy
+      UVICORN_HOST: ${OVPN_UI_BIND:-0.0.0.0}                # address the UI listens on (port 8080)
+      FORWARDED_ALLOW_IPS: ${OVPN_UI_TRUSTED_PROXIES:-127.0.0.1} # proxies whose X-Forwarded-For is believed
+      GUEST_SUB: *guest_sub
     volumes:
       - ./:/etc/openvpn
       - ./log:/var/log/openvpn:ro
-    cap_drop:
-      - ALL
-    cap_add:
-      - CHOWN
-      - DAC_OVERRIDE
-      - FOWNER
-    security_opt:
-      - no-new-privileges:true
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
+    security_opt: [no-new-privileges:true]
     read_only: true
-    tmpfs:
-      - /tmp
+    tmpfs: [/tmp]
+    logging: *logging
     restart: unless-stopped

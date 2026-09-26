@@ -5,6 +5,7 @@ import re
 import socket
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@-]{0,63}$")
@@ -105,27 +106,8 @@ class Management:
 
     # -- commands ----------------------------------------------------------------
     def status(self) -> dict[str, Any]:
-        lines = self.command("status 3")
-        headers: dict[str, list[str]] = {}
-        clients: list[dict[str, Any]] = []
-        server_time: int | None = None
-        stats: dict[str, str] = {}
-        for line in lines:
-            parts = line.split("\t")
-            tag = parts[0]
-            if tag == "HEADER" and len(parts) > 2:
-                headers[parts[1]] = parts[2:]
-            elif tag == "CLIENT_LIST":
-                rec = dict(zip(headers.get("CLIENT_LIST", []), parts[1:]))
-                clients.append(_normalise_client(rec))
-            elif tag == "TIME" and len(parts) > 2:
-                try:
-                    server_time = int(parts[2])
-                except ValueError:
-                    pass
-            elif tag == "GLOBAL_STATS" and len(parts) > 2:
-                stats[parts[1]] = parts[2]
-        return {"time": server_time or int(time.time()), "clients": clients, "stats": stats}
+        # OpenVPN logs every "status" command at verb 3; prefer read_status_file() for polling.
+        return parse_status(self.command("status 3"))
 
     def load_stats(self) -> dict[str, int]:
         line = self.command("load-stats")[0]
@@ -143,11 +125,6 @@ class Management:
             if line.startswith("OpenVPN Version:"):
                 return line.split(":", 1)[1].strip()
         return "unknown"
-
-    def pid(self) -> int | None:
-        line = self.command("pid")[0]
-        m = re.search(r"pid=(\d+)", line)
-        return int(m.group(1)) if m else None
 
     def kill(self, common_name: str) -> str:
         if not NAME_RE.match(common_name):
@@ -173,6 +150,49 @@ class Management:
         if not line.startswith("SUCCESS:"):
             raise ManagementError(line)
         return line
+
+
+def parse_status(lines: list[str]) -> dict[str, Any]:
+    """Status output, version 2 (comma separated) or 3 (tab separated)."""
+    headers: dict[str, list[str]] = {}
+    clients: list[dict[str, Any]] = []
+    server_time: int | None = None
+    stats: dict[str, str] = {}
+    for line in lines:
+        parts = line.split("\t" if "\t" in line else ",")
+        tag = parts[0]
+        if tag == "HEADER" and len(parts) > 2:
+            headers[parts[1]] = parts[2:]
+        elif tag == "CLIENT_LIST":
+            rec = dict(zip(headers.get("CLIENT_LIST", []), parts[1:]))
+            clients.append(_normalise_client(rec))
+        elif tag == "TIME" and len(parts) > 2:
+            try:
+                server_time = int(parts[2])
+            except ValueError:
+                pass
+        elif tag == "GLOBAL_STATS" and len(parts) > 2:
+            stats[parts[1]] = parts[2]
+    return {"time": server_time or int(time.time()), "clients": clients, "stats": stats}
+
+
+def read_status_file(path: Path, max_age: float) -> dict[str, Any] | None:
+    """The status file OpenVPN rewrites every few seconds, or None when it is missing, stale or
+    caught mid-write. OpenVPN overwrites it in place, so a read is only trusted when two
+    consecutive reads agree and the content ends with END."""
+    for _ in range(3):
+        try:
+            if time.time() - path.stat().st_mtime > max_age:
+                return None
+            first = path.read_text(errors="replace")
+            second = path.read_text(errors="replace")
+        except OSError:
+            return None
+        lines = first.splitlines()
+        if first == second and lines and lines[-1].strip() == "END" and lines[0].startswith("TITLE"):
+            return parse_status(lines)
+        time.sleep(0.05)
+    return None
 
 
 def _int(value: str | None) -> int:

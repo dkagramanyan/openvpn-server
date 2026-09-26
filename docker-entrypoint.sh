@@ -16,8 +16,9 @@ SERVER_CONF=$OPENVPN_DIR/server.conf
 MGMT_PW_FILE=$OPENVPN_DIR/config/management.pw
 
 TRUST_SUB=${TRUST_SUB:-10.0.70.0/24}
-GUEST_SUB=${GUEST_SUB:-10.0.71.0/24}
-HOME_SUB=${HOME_SUB:-192.168.88.0/24}
+GUEST_SUB=${GUEST_SUB:-10.0.70.128/25}
+HOME_SUB=${HOME_SUB:-171.134.51.0/24}
+GUEST_BLOCK=${GUEST_BLOCK:-10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16}
 OVPN_STRICT_FORWARD=${OVPN_STRICT_FORWARD:-1}
 OVPN_LOG_STDOUT=${OVPN_LOG_STDOUT:-1}
 OVPN_LOG_MAX_BYTES=${OVPN_LOG_MAX_BYTES:-10485760}
@@ -133,23 +134,34 @@ egress=${OVPN_EGRESS_IFACE:-$(ip -4 route show default 2>/dev/null | awk '{print
 egress=${egress:-eth0}
 log "Egress interface: $egress  trusted: $TRUST_SUB  guest: $GUEST_SUB  home: $HOME_SUB"
 
-# ipt TABLE RULE... : append RULE to TABLE only if it is not already present.
-ipt() {
-    local table=$1; shift
-    iptables -t "$table" -C "$@" 2>/dev/null || iptables -t "$table" -A "$@"
+# Our rules live in our own chains, flushed and rebuilt on every start, so a
+# changed subnet never leaves stale rules behind. OVPN-FORWARD (guest
+# isolation) runs first - from DOCKER-USER when Docker manages the host
+# firewall, so Docker's own accept rules cannot bypass it - and OVPN-ACCEPT last.
+chain() {   # chain TABLE NAME BUILTIN -I|-A
+    iptables -t "$1" -N "$2" 2>/dev/null || iptables -t "$1" -F "$2"
+    iptables -t "$1" -C "$3" -j "$2" 2>/dev/null || iptables -t "$1" "$4" "$3" -j "$2"
 }
-
 log "Configuring iptables in the current network namespace (the host's under network_mode: host)"
-ipt nat POSTROUTING -s "$TRUST_SUB" -o "$egress" -j MASQUERADE
-ipt nat POSTROUTING -s "$GUEST_SUB"  -o "$egress" -j MASQUERADE
+chain nat OVPN-NAT POSTROUTING -A
+chain filter OVPN-INPUT INPUT -I
+first=FORWARD; iptables -n -L DOCKER-USER >/dev/null 2>&1 && first=DOCKER-USER
+chain filter OVPN-FORWARD "$first" -I
+chain filter OVPN-ACCEPT FORWARD -A
+iptables -t nat -A OVPN-NAT -s "$TRUST_SUB" -o "$egress" -j MASQUERADE   # guests are inside TRUST_SUB
 
-# Guest subnet: no ICMP echo, no access to the home network.
-ipt filter FORWARD -s "$GUEST_SUB" -p icmp --icmp-type echo-request -j DROP
-ipt filter FORWARD -s "$GUEST_SUB" -p icmp --icmp-type echo-reply   -j DROP
-ipt filter FORWARD -s "$GUEST_SUB" -d "$HOME_SUB" -j DROP
+# Guests: the pushed DNS servers and the internet, nothing else - no LAN, no
+# private ranges, no other VPN clients, no ping, and nothing on this host.
+for dns in $(sed -n 's/^[[:space:]]*push[[:space:]]\+"dhcp-option DNS \([0-9.]\+\)".*/\1/p' "$SERVER_CONF"); do
+    for p in udp tcp; do iptables -A OVPN-FORWARD -s "$GUEST_SUB" -d "$dns" -p $p --dport 53 -j ACCEPT; done
+done
+iptables -A OVPN-FORWARD -s "$GUEST_SUB" -p icmp --icmp-type echo-request -j DROP
+for net in "$HOME_SUB" $GUEST_BLOCK; do
+    iptables -A OVPN-FORWARD -s "$GUEST_SUB" -d "$net" -j DROP
+done
+iptables -A OVPN-INPUT -i 'tun+' -s "$GUEST_SUB" -j DROP
 
-# Custom rules supplied by the user (appended after the guest rules so DROPs
-# still take effect before the accept rules below).
+# Custom rules supplied by the user (see fw-rules.sh).
 for f in "$OPENVPN_DIR/fw-rules.sh" /opt/app/fw-rules.sh; do
     if [[ -s $f ]] && grep -qvE '^\s*(#|$)' "$f"; then
         log "Applying additional firewall rules from $f"
@@ -162,23 +174,28 @@ if [[ $OVPN_STRICT_FORWARD = 1 ]]; then
     # Only VPN-originated traffic and replies to it are forwarded. Under
     # network_mode: host this sets the *host* FORWARD policy (the same value
     # Docker itself defaults to); set OVPN_STRICT_FORWARD=0 to leave it alone.
-    ipt filter FORWARD -i 'tun+' -j ACCEPT
-    ipt filter FORWARD -o 'tun+' -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+    iptables -A OVPN-ACCEPT -i 'tun+' -j ACCEPT
+    iptables -A OVPN-ACCEPT -o 'tun+' -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
     iptables -P FORWARD DROP
 fi
 
-log "NAT rules:";     iptables -t nat -S POSTROUTING | sed 's/^/    /'
-log "Forward rules:"; iptables -S FORWARD | sed 's/^/    /'
+for c in nat:OVPN-NAT filter:OVPN-INPUT filter:OVPN-FORWARD filter:OVPN-ACCEPT; do
+    iptables -t "${c%%:*}" -S "${c#*:}" | sed 's/^/    /'
+done
 
 # --------------------------------------------------------------------------
 # 3. Run OpenVPN under a supervisor loop
 # --------------------------------------------------------------------------
+# Copy-and-truncate: OpenVPN keeps the log open (O_APPEND), so this also works
+# while it runs.
 rotate_log() {
     local f=$LOG_DIR/openvpn.log
     if [[ -f $f ]] && (( $(stat -c %s "$f") > OVPN_LOG_MAX_BYTES )); then
-        mv -f "$f" "$f.1"
+        cp -f "$f" "$f.1" && : > "$f"
     fi
 }
+( while sleep 300; do rotate_log; done ) &
+ROTATE_PID=$!
 
 if [[ $OVPN_LOG_STDOUT = 1 ]]; then
     touch "$LOG_DIR/openvpn.log"
@@ -218,5 +235,5 @@ while :; do
     fi
 done
 
-[[ -n ${TAIL_PID:-} ]] && kill "$TAIL_PID" 2>/dev/null || true
+kill "$ROTATE_PID" ${TAIL_PID:-} 2>/dev/null || true
 exit 0

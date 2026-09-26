@@ -78,7 +78,7 @@ RUN chmod 755 /opt/app/bin/* /opt/app/docker-entrypoint.sh \
 ENV OPENVPN_DIR=/etc/openvpn \
     EASYRSA_DIR=/usr/share/easy-rsa
 
-EXPOSE 1195/tcp
+EXPOSE 1197/udp
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
     CMD ["/opt/app/bin/healthcheck.sh"]

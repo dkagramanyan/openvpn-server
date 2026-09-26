@@ -121,3 +121,26 @@ def test_tfa_uri_and_qr(monkeypatch):
     assert uri.startswith("otpauth://totp/OpenVPN:alice?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ")
     svg = pki.tfa_qr_svg(uri)
     assert "<svg" in svg and "path" in svg and "xmlns" in svg
+
+
+STATUS_V3 = (
+    "TITLE\tOpenVPN 2.7.7\nTIME\t2026-09-05 10:00:00\t1788602400\n"
+    "HEADER\tCLIENT_LIST\tCommon Name\tReal Address\tVirtual Address\tBytes Received\tBytes Sent\n"
+    "CLIENT_LIST\talice\t1.2.3.4:5555\t10.0.70.2\t1234\t5678\nEND\n"
+)
+
+
+def test_status_file(tmp_path):
+    f = tmp_path / "status.log"
+    f.write_text(STATUS_V3)
+    st = mgmt.read_status_file(f, max_age=30)
+    assert st["time"] == 1788602400 and st["clients"][0]["bytes_out"] == 5678
+    # version 2 is the same data with commas
+    f.write_text(STATUS_V3.replace("\t", ","))
+    assert mgmt.read_status_file(f, max_age=30)["clients"][0]["cn"] == "alice"
+    f.write_text(STATUS_V3[:-4])            # caught mid-write: no END yet
+    assert mgmt.read_status_file(f, max_age=30) is None
+    f.write_text(STATUS_V3)
+    os.utime(f, (time.time() - 100, time.time() - 100))
+    assert mgmt.read_status_file(f, max_age=30) is None     # OpenVPN stopped writing it
+    assert mgmt.read_status_file(tmp_path / "missing", max_age=30) is None

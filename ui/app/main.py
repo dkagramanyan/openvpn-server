@@ -34,7 +34,7 @@ RANGES = {"today": None, "24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400, "90d"
 db = Database(settings.db_path)
 _mgmt_host, _mgmt_port, _ = settings.management_endpoint()
 mgmt = Management(_mgmt_host, _mgmt_port, settings.management_password())
-collector = Collector(db, mgmt, settings.poll_interval)
+collector = Collector(db, mgmt, settings.poll_interval, settings.status_file)
 maintenance = Maintenance(db, [lambda: pki.ensure_crl_fresh()])
 limiter = auth.LoginLimiter()
 
@@ -259,6 +259,7 @@ def clients_payload(range_name: str, tz: int) -> list[dict[str, Any]]:
             "expires": cert["not_after"],
             "days_left": (cert["not_after"] - now) // 86400 if cert["not_after"] else None,
             "static_ip": statics.get(name),
+            "guest": pki.is_guest(statics.get(name)),
             "tfa": name in tfa,
             "online": bool(online.get(name)),
             "sessions_live": online.get(name, []),
@@ -304,7 +305,7 @@ def login(body: LoginBody, request: Request, response: Response):
     db.add_event("login", None, row["username"], client_ip(request))
     response.set_cookie(COOKIE, token, max_age=settings.session_ttl, httponly=True, samesite="strict",
                         secure=cookie_secure(request), path="/")
-    return {"username": row["username"]}
+    return {"username": row["username"], "guest_sub": settings.guest_sub}
 
 
 @app.post("/api/logout", dependencies=[Csrf])
@@ -316,7 +317,7 @@ def logout(request: Request, response: Response):
 
 @app.get("/api/me")
 def me(user: dict[str, Any] = Authed):
-    return {"username": user["username"], "version": __version__}
+    return {"username": user["username"], "version": __version__, "guest_sub": settings.guest_sub}
 
 
 @app.post("/api/me/password", dependencies=[Csrf])
@@ -372,6 +373,11 @@ def overview(range: str = "today", tz: int = 0, user: dict[str, Any] = Authed):
         warnings.append("The certificate authority expires within 90 days")
     if counts["expiring"]:
         warnings.append(f"{counts['expiring']} client certificate(s) expire within {EXPIRING_DAYS} days")
+    bad_ips = [f"{n} ({ip})" for n, ip in sorted(pki.static_ips().items())
+               if n in certs and certs[n]["cert"]["state"] == "valid" and pki.static_ip_problem(n, ip)]
+    if bad_ips:
+        warnings.append("OpenVPN cannot hand out these static IPs - set new ones on the client pages: "
+                        + ", ".join(bad_ips))
     if pki.tfa_enforced():
         enrolled = pki.tfa_secrets()
         missing = [n for n, c in certs.items() if c["cert"]["state"] == "valid" and n not in enrolled]
@@ -426,6 +432,8 @@ def create_client(body: NewClientBody, user: dict[str, Any] = Authed):
     existing = pki.list_clients(set()).get(name)
     if existing and existing["cert"]["state"] == "valid":
         raise HTTPException(409, "A client with this name already exists")
+    if existing and existing["cert"]["state"] == "expired":
+        raise HTTPException(409, "This client's certificate has expired - renew it on the client's page")
     pki.create_client(name, body.days, body.passphrase or None, (body.static_ip or "").strip() or None)
     db.execute("INSERT INTO clients (name, note, created_at) VALUES (?, ?, ?) "
                "ON CONFLICT(name) DO UPDATE SET note = excluded.note",

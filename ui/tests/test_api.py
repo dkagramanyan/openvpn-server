@@ -198,11 +198,21 @@ def test_delete_requires_revocation(client):
 
 def test_notes_static_ip_and_config(client):
     assert client.put("/api/clients/alice/note", json={"note": " laptop "}, headers=H).json() == {"note": "laptop"}
-    assert client.put("/api/clients/alice/static-ip", json={"ip": "10.0.71.9"}, headers=H).status_code == 200
-    assert (TMP / "staticclients" / "alice").read_text() == "ifconfig-push 10.0.71.9 255.255.255.0\n"
-    assert client.put("/api/clients/alice/static-ip", json={"ip": "300.1.1.1"}, headers=H).status_code == 400
+    assert client.put("/api/clients/alice/static-ip", json={"ip": "10.0.70.130"}, headers=H).status_code == 200
+    assert (TMP / "staticclients" / "alice").read_text() == "ifconfig-push 10.0.70.130 255.255.255.0\n"
+    # outside the server subnet, the server's own address, inside the dynamic pool, taken by alice
+    for ip in ("300.1.1.1", "10.0.71.9", "10.0.70.1", "10.0.70.50"):
+        assert client.put("/api/clients/old/static-ip", json={"ip": ip}, headers=H).status_code == 400, ip
+    r = client.put("/api/clients/old/static-ip", json={"ip": "10.0.70.130"}, headers=H)
+    assert r.status_code == 400 and "alice" in r.json()["detail"]
     row = client.get("/api/clients/alice").json()
-    assert row["note"] == "laptop" and row["static_ip"] == "10.0.71.9"
+    assert row["note"] == "laptop" and row["static_ip"] == "10.0.70.130" and row["guest"] is True
+    # a static IP left over from the old separate guest subnet is flagged on the dashboard
+    (TMP / "staticclients" / "alice").write_text("ifconfig-push 10.0.71.9 255.255.255.0\n")
+    assert any("alice (10.0.71.9)" in w for w in client.get("/api/overview").json()["warnings"])
+    (TMP / "staticclients" / "alice").unlink()
+    r = client.post("/api/clients", json={"name": "old"}, headers=H)
+    assert r.status_code == 409 and "renew" in r.json()["detail"]
     conf = client.get("/api/server/config/server").json()["content"]
     r = client.put("/api/server/config/server", json={"content": conf.replace("management ", "#management ")}, headers=H)
     assert r.status_code == 400

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import io
+import ipaddress
 import os
 import re
 import subprocess
@@ -188,18 +189,55 @@ def static_ips() -> dict[str, str]:
     return result
 
 
+def vpn_subnet() -> tuple[ipaddress.IPv4Network, tuple[int, int]] | None:
+    """The "server" network from server.conf and its dynamic pool (first, last address as ints)."""
+    text = read_config("server")
+    m = re.search(r"^\s*server\s+([\d.]+)\s+([\d.]+)(\s+nopool)?", text, re.M)
+    if not m:
+        return None
+    net = ipaddress.IPv4Network(f"{m.group(1)}/{m.group(2)}", strict=False)
+    pool = (int(net.network_address) + 2, int(net.broadcast_address) - 1)
+    if m.group(3):
+        p = re.search(r"^\s*ifconfig-pool\s+([\d.]+)\s+([\d.]+)", text, re.M)
+        pool = (int(ipaddress.IPv4Address(p.group(1))), int(ipaddress.IPv4Address(p.group(2)))) if p else (0, -1)
+    return net, pool
+
+
+def static_ip_problem(name: str, ip: str) -> str | None:
+    """Why OpenVPN could not hand out <ip> to <name> as a static address, or None."""
+    if not IP_RE.match(ip):
+        return "Invalid IPv4 address"
+    subnet = vpn_subnet()
+    if subnet:
+        net, (first, last) = subnet
+        addr = ipaddress.IPv4Address(ip)
+        # With "topology subnet" OpenVPN only accepts addresses inside the server network.
+        if addr not in net or addr in (net.network_address, net.network_address + 1, net.broadcast_address):
+            return f"{ip} is not a client address in the VPN subnet {net}"
+        if first <= int(addr) <= last:
+            return (f"{ip} is in the dynamic pool {ipaddress.IPv4Address(first)}-{ipaddress.IPv4Address(last)}; "
+                    f"use a free address outside it (guests: {settings.guest_sub})")
+    other = next((n for n, a in static_ips().items() if a == ip and n != name), None)
+    return f"{ip} is already assigned to {other}" if other else None
+
+
+def is_guest(ip: str | None) -> bool:
+    try:
+        return bool(ip) and ipaddress.IPv4Address(ip) in ipaddress.IPv4Network(settings.guest_sub, strict=False)
+    except ValueError:
+        return False
+
+
 def set_static_ip(name: str, ip: str | None) -> None:
     validate_name(name)
     path = settings.static_dir / name
     if not ip:
         path.unlink(missing_ok=True)
         return
-    if not IP_RE.match(ip):
-        raise PkiError("Invalid IPv4 address")
-    mask = "255.255.255.0"
-    m = re.search(r"^\s*server\s+[\d.]+\s+([\d.]+)", read_config("server"), re.M)
-    if m:
-        mask = m.group(1)
+    if problem := static_ip_problem(name, ip):
+        raise PkiError(problem)
+    subnet = vpn_subnet()
+    mask = str(subnet[0].netmask) if subnet else "255.255.255.0"
     settings.static_dir.mkdir(parents=True, exist_ok=True)
     path.write_text(f"ifconfig-push {ip} {mask}\n")
     path.chmod(0o644)
@@ -323,8 +361,8 @@ def create_client(name: str, days: int | None = None, passphrase: str | None = N
     validate_name(name)
     if days is not None and not (1 <= days <= 3650):
         raise PkiError("Validity must be between 1 and 3650 days")
-    if static_ip and not IP_RE.match(static_ip):
-        raise PkiError("Invalid static IPv4 address")
+    if static_ip and (problem := static_ip_problem(name, static_ip)):
+        raise PkiError(problem)
     if passphrase and len(passphrase) < 4:
         raise PkiError("Passphrase must be at least 4 characters")
     args = [name] + ([static_ip] if static_ip else [])

@@ -486,7 +486,7 @@ function clientsView(el) {
       h('thead', null, h('tr', null, th('Name', 'name'), th('Status'), th('Expires', 'expires'), th('Last seen', 'seen'), th('Download', 'dl', 'r'), th('Upload', 'ul', 'r'), th('Sessions', 'sessions', 'r'), h('th', null))),
       h('tbody', null, list.map(c => h('tr', { class: 'clickable', onClick: e => { if (!e.target.closest('button,a')) go('#/clients/' + encodeURIComponent(c.name)); } },
         h('td', { class: 'name-cell' }, c.name, c.note ? h('span', { class: 'sub' }, c.note) : null),
-        h('td', null, h('div', { class: 'row', style: 'gap:6px' }, stateBadge(c), c.tfa ? h('span', { class: 'badge plain', title: 'Two-factor authentication enabled' }, '2FA') : null, c.static_ip ? h('span', { class: 'subnet', title: 'Static IP' }, c.static_ip) : null, c.previous ? h('span', { class: 'badge plain expiring', title: 'Previous certificate still valid' }, 'renewed') : null)),
+        h('td', null, h('div', { class: 'row', style: 'gap:6px' }, stateBadge(c), c.tfa ? h('span', { class: 'badge plain', title: 'Two-factor authentication enabled' }, '2FA') : null, c.static_ip ? h('span', { class: 'subnet', title: c.guest ? 'Guest: internet only' : 'Static IP' }, (c.guest ? 'guest ' : '') + c.static_ip) : null, c.previous ? h('span', { class: 'badge plain expiring', title: 'Previous certificate still valid' }, 'renewed') : null)),
         h('td', { class: 'num' }, c.expires ? [fmtDate(c.expires), h('span', { class: 'muted small' }, ' · ' + fmtDays(c.days_left))] : '—'),
         h('td', null, c.online ? h('span', { class: 'ink2' }, 'now') : fmtAgo(c.total.last_seen)),
         h('td', { class: 'r num' }, fmtBytes(c.traffic.bytes_out)), h('td', { class: 'r num' }, fmtBytes(c.traffic.bytes_in)),
@@ -506,13 +506,13 @@ function clientsView(el) {
 function newClientDialog(after) {
   const name = h('input', { class: 'input', placeholder: 'e.g. alice-laptop', pattern: '[A-Za-z0-9][A-Za-z0-9_.@-]{0,63}', required: true, autofocus: true });
   const days = h('input', { class: 'input', type: 'number', min: 1, max: 3650, placeholder: 'default from easy-rsa vars' });
-  const ip = h('input', { class: 'input', placeholder: '10.0.71.10 for guest access' });
+  const ip = h('input', { class: 'input', placeholder: 'guests: ' + state.user.guest_sub });
   const pass = h('input', { class: 'input', type: 'password', autocomplete: 'new-password', placeholder: 'optional' });
   const note = h('input', { class: 'input', placeholder: 'optional' });
   const tfa = h('input', { type: 'checkbox' });
   const body = h('div', { class: 'form cols' },
     h('div', { class: 'full' }, field('Client name', name, 'Letters, digits, _ . @ - (becomes the certificate common name)')),
-    field('Validity (days)', days), field('Static IP', ip, 'Guest subnet = internet only'),
+    field('Validity (days)', days), field('Static IP', ip, 'Guest range = internet only'),
     field('Key passphrase', pass, 'Encrypts the private key inside the profile'), field('Note', note),
     h('label', { class: 'check full' }, tfa, 'Require a TOTP code (two-factor authentication)'));
   dialog({ title: 'New client', body, buttons: [{ label: 'Cancel', value: null }, { label: 'Create', cls: 'primary', onClick: async () => {
@@ -549,7 +549,7 @@ function clientDetailView(el) {
   async function load() {
     body.classList.add('loading');
     try { c = await api(`/api/clients/${enc}?tz=${TZ}`); } catch (e) { toast(e.message, 'err'); body.replaceChildren(h('div', { class: 'empty' }, e.message)); return; }
-    setChildren(badges, stateBadge(c), c.tfa ? h('span', { class: 'badge plain' }, '2FA') : null, c.static_ip ? h('span', { class: 'subnet' }, 'static ' + c.static_ip) : null, c.previous ? h('span', { class: 'badge plain expiring' }, 'renewed · previous cert still valid') : null);
+    setChildren(badges, stateBadge(c), c.tfa ? h('span', { class: 'badge plain' }, '2FA') : null, c.static_ip ? h('span', { class: 'subnet' }, (c.guest ? 'guest ' : 'static ') + c.static_ip) : null, c.previous ? h('span', { class: 'badge plain expiring' }, 'renewed · previous cert still valid') : null);
     setChildren(actions, 
       c.state === 'valid' ? h('a', { class: 'btn primary', href: `/api/clients/${enc}/ovpn`, download: name + '.ovpn' }, icon('download'), 'Download profile') : null,
       c.online ? act('Disconnect', async () => { if (await confirmDialog('Disconnect', `Disconnect all sessions of ${name}?`, 'Disconnect', true)) { await withToast(api(`/api/clients/${enc}/disconnect`, { method: 'POST', body: {} }), 'Disconnected'); } }) : null,
@@ -560,7 +560,7 @@ function clientDetailView(el) {
         } }) : null,
       c.state === 'valid' && c.tfa ? act('Disable 2FA', async () => { if (await confirmDialog('Disable 2FA', `Remove the TOTP secret of ${name}?`, 'Disable', true)) { await withToast(api(`/api/clients/${enc}/tfa`, { method: 'POST', body: { enabled: false } }), '2FA disabled'); load(); } }) : null,
       c.state === 'valid' ? act('Static IP', () => staticIpDialog(c, load)) : null,
-      c.state === 'valid' && !c.previous ? act('Renew', async () => { if (await confirmDialog('Renew certificate', 'A new certificate is issued for the same key. The previous certificate stays valid until you revoke it, so the client keeps working while you deliver the new profile.', 'Renew')) { await withToast(api(`/api/clients/${enc}/renew`, { method: 'POST', body: {} }), 'Certificate renewed'); load(); } }) : null,
+      c.state !== 'revoked' && !c.previous ? act('Renew', async () => { if (await confirmDialog('Renew certificate', 'A new certificate is issued for the same key. The previous certificate stays valid until you revoke it, so the client keeps working while you deliver the new profile.', 'Renew')) { await withToast(api(`/api/clients/${enc}/renew`, { method: 'POST', body: {} }), 'Certificate renewed'); load(); } }) : null,
       c.previous ? act('Revoke previous cert', async () => { if (await confirmDialog('Revoke previous certificate', 'The old certificate will be added to the CRL. Make sure the client already uses the new profile.', 'Revoke', true)) { await withToast(api(`/api/clients/${enc}/revoke-previous`, { method: 'POST' }), 'Previous certificate revoked'); load(); } }, 'danger') : null,
       c.state !== 'revoked' ? act('Revoke', async () => { if (await confirmDialog('Revoke certificate', `${name} will be disconnected and can no longer connect. This cannot be undone.`, 'Revoke', true)) { await withToast(api(`/api/clients/${enc}/revoke`, { method: 'POST', body: {} }), 'Certificate revoked'); load(); } }, 'danger') : null,
       c.state === 'revoked' ? act('Delete', async () => { if (await confirmDialog('Delete client', `Remove the profile, static IP and 2FA data of ${name}? Traffic history is kept.`, 'Delete', true)) { await withToast(api(`/api/clients/${enc}`, { method: 'DELETE' }), 'Client deleted'); go('#/clients'); } }, 'danger') : null);
@@ -586,7 +586,7 @@ function clientDetailView(el) {
             ['Fingerprint', h('span', { class: 'mono small' }, cert.fingerprint)],
             c.previous ? ['Previous cert', h('span', null, `serial ${c.previous.serial.slice(0, 16)}… valid until ${fmtDate(c.previous.not_after)} - revoke it once the new profile is deployed`)] : null,
             c.history.length ? ['History', `${c.history.length} revoked certificate${c.history.length > 1 ? 's' : ''}`] : null,
-            ['Static IP', c.static_ip || 'dynamic (trusted subnet)'],
+            ['Static IP', c.static_ip ? c.static_ip + (c.guest ? ' · guest, internet only' : '') : 'dynamic (trusted)'],
             ['2FA', c.tfa ? 'enabled' : 'off'],
           ].filter(Boolean))),
           card('Note', h('div', { class: 'stack', style: 'gap:8px' }, noteIn, h('div', null, h('button', { class: 'btn sm', onClick: () => withToast(api(`/api/clients/${enc}/note`, { method: 'PUT', body: { note: noteIn.value } }), 'Note saved') }, 'Save note')))))),
@@ -599,7 +599,7 @@ function clientDetailView(el) {
 }
 function staticIpDialog(c, after) {
   const ip = h('input', { class: 'input', value: c.static_ip || '', placeholder: 'leave empty for a dynamic address' });
-  dialog({ title: 'Static IP · ' + c.name, body: h('div', { class: 'form' }, field('IPv4 address', ip, 'Use an address from the guest subnet to restrict this client to internet access only. Applies on the next connection.')),
+  dialog({ title: 'Static IP · ' + c.name, body: h('div', { class: 'form' }, field('IPv4 address', ip, `An address from the guest range ${state.user.guest_sub} restricts this client to internet access only. Applies on the next connection.`)),
     buttons: [{ label: 'Cancel', value: null }, { label: 'Save', cls: 'primary', onClick: async () => { try { await api(`/api/clients/${encodeURIComponent(c.name)}/static-ip`, { method: 'PUT', body: { ip: ip.value.trim() || null } }); toast('Static IP saved', 'ok'); after(); return true; } catch (e) { toast(e.message, 'err'); return false; } } }] });
 }
 function sessionsTable(list, withName) {

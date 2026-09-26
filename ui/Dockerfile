@@ -32,8 +32,7 @@ COPY --from=easyrsa /out/usr/share/easy-rsa/ /usr/share/easy-rsa/
 
 WORKDIR /opt/openvpn-ui
 COPY ui/requirements.txt ./
-RUN pip install --no-cache-dir --require-hashes -r requirements.txt 2>/dev/null \
-    || pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
 COPY bin/ /opt/app/bin/
 COPY ui/app/ ./app/
@@ -48,7 +47,9 @@ ENV OPENVPN_DIR=/etc/openvpn \
 EXPOSE 8080
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-    CMD ["python", "-c", "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=4).status == 200 else 1)"]
+    CMD ["python", "-c", "import os,sys,urllib.request as u; h=os.environ['UVICORN_HOST']; h='127.0.0.1' if h=='0.0.0.0' else h; sys.exit(u.urlopen(f'http://{h}:8080/healthz', timeout=4).status != 200)"]
 
-CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080", \
-     "--proxy-headers", "--forwarded-allow-ips", "*", "--no-server-header", "--log-level", "info"]
+# UVICORN_HOST sets the listen address; X-Forwarded-For is only believed from
+# FORWARDED_ALLOW_IPS (a reverse proxy), never from arbitrary clients.
+ENV UVICORN_HOST=0.0.0.0 FORWARDED_ALLOW_IPS=127.0.0.1
+CMD ["python", "-m", "uvicorn", "app.main:app", "--port", "8080", "--proxy-headers", "--no-server-header"]

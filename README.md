@@ -47,7 +47,9 @@ Open **Settings** and confirm the public address (host and port) that is
 written into client profiles, then create clients under **Clients**.
 
 Put the UI behind an HTTPS reverse proxy for anything but a LAN; set
-`OVPN_UI_SECURE_COOKIES=true` in `.env` when you do.
+`OVPN_UI_SECURE_COOKIES=true` in `.env` when you do, and
+`OVPN_UI_TRUSTED_PROXIES` to the proxy's address if it is not on the server
+itself. `OVPN_UI_BIND` limits the UI to one address (e.g. the LAN one).
 
 ## Layout
 
@@ -65,30 +67,6 @@ bin/                 CLI scripts (also used by the UI)
 ui/                  web UI (Python/FastAPI)
 fw-rules.sh          your additional iptables rules, applied at start
 backup.sh            backup / restore helper
-```
-
-## docker-compose.yml
-
-```yaml
-services:
-  openvpn:
-    build: .
-    network_mode: host            # VPN port comes from server.conf
-    cap_add: [NET_ADMIN]
-    devices: [/dev/net/tun:/dev/net/tun]
-    environment:
-      TRUST_SUB: "10.0.70.0/24"    # dynamic pool ("server" directive)
-      GUEST_SUB: "10.0.71.0/24"    # static IPs from here get internet only
-      HOME_SUB: "170.134.51.0/24"  # your LAN, hidden from guests
-    volumes: ["./:/etc/openvpn", "./log:/var/log/openvpn"]
-
-  openvpn-ui:
-    build: {context: ., dockerfile: ui/Dockerfile}
-    network_mode: host            # reaches the management interface on 127.0.0.1
-    volumes: ["./:/etc/openvpn", "./log:/var/log/openvpn:ro"]
-    cap_drop: [ALL]
-    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
-    read_only: true
 ```
 
 ## Host networking
@@ -160,18 +138,19 @@ Environment variables of the `openvpn` service:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `TRUST_SUB` / `GUEST_SUB` / `HOME_SUB` | see above | NAT and guest firewall rules |
+| `TRUST_SUB` | `10.0.70.0/24` | the `server` subnet (NAT) |
+| `GUEST_SUB` | `10.0.70.128/25` | static IPs here get internet only (also given to the UI) |
+| `HOME_SUB` | `171.134.51.0/24` | your LAN, hidden from guests |
+| `GUEST_BLOCK` | RFC 1918, CGNAT, link-local | further ranges hidden from guests |
 | `OVPN_EGRESS_IFACE` | default-route interface | interface used for MASQUERADE |
 | `OVPN_STRICT_FORWARD` | `1` | only VPN-originated traffic and replies are forwarded |
 | `OVPN_LOG_STDOUT` | `1` | mirror openvpn.log to `docker logs` |
-| `OVPN_LOG_MAX_BYTES` | 10 MiB | rotate openvpn.log at restart above this size |
+| `OVPN_LOG_MAX_BYTES` | 10 MiB | rotate openvpn.log (checked every 5 min) above this size |
 | `OVPN_CRL_RENEW_DAYS` | `30` | regenerate the CRL when it expires within this many days |
 
 `.env` (see `.env.example`): `OPENVPN_ADMIN_USERNAME`, `OPENVPN_ADMIN_PASSWORD`,
-`OVPN_PUBLIC_HOST`, `OVPN_PUBLIC_PORT`, `OVPN_UI_SECURE_COOKIES`.
-
-`docker-compose-no-ui.yml` runs the server alone; use the scripts in `bin/`
-via `docker exec` in that case.
+`OVPN_PUBLIC_HOST`, `OVPN_PUBLIC_PORT`, `OVPN_UI_SECURE_COOKIES`, `OVPN_UI_BIND`,
+`OVPN_UI_TRUSTED_PROXIES`.
 
 ## Web UI
 
@@ -193,8 +172,9 @@ via `docker exec` in that case.
 * **Settings** - public address for profiles (host and port; the protocol
   follows `server.conf`), admin password, theme.
 
-Traffic is collected every 5 s from the management interface (`status 3`),
-stored per minute for two days, per hour for 90 days and per day forever.
+Traffic is read every 5 s from the status file OpenVPN writes (`status ... 5`,
+`status-version 3`; a management `status` command would be logged on every
+poll), falling back to the management interface when there is none. It is stored per minute for two days, per hour for 90 days and per day forever.
 Bytes are counted from the client's point of view: *download* is what the
 server sent to the client.
 
@@ -224,16 +204,20 @@ from it, and dropping a revoked entry would make that certificate valid again.
 
 ## Subnets, static IPs and the firewall
 
-Clients get an address from `TRUST_SUB` (`server 10.0.70.0 255.255.255.0`)
-and full access. Give a client a static IP from `GUEST_SUB`
-(`route 10.0.71.0 255.255.255.0`) - in the UI or with
-`staticclients/<name>` containing `ifconfig-push 10.0.71.x 255.255.255.0` -
-and it only gets internet access: the entrypoint drops ICMP echo from the
-guest subnet and everything from it to `HOME_SUB`.
+`server 10.0.70.0 255.255.255.0 nopool` is one tunnel subnet: with
+`topology subnet` OpenVPN only accepts static IPs inside it. Clients without a
+static IP get an address from the pool `10.0.70.2-127` and full access. Give a
+client a static IP from `GUEST_SUB` (`10.0.70.128-254`) in the UI and it only
+gets the internet and the pushed DNS servers: the entrypoint drops its traffic
+to `HOME_SUB`, the `GUEST_BLOCK` ranges (which include the other VPN clients),
+its pings, and everything addressed to the server host itself. The UI refuses
+static IPs outside the subnet, inside the pool or already taken.
 
-Additional rules go into `fw-rules.sh`; they are applied after the guest
-rules and before the accept rules, so `DROP`s work as expected. All rules are
-added with a `-C` check first and are therefore idempotent across restarts.
+The rules live in the chains `OVPN-NAT`, `OVPN-INPUT`, `OVPN-FORWARD` (hooked
+into `DOCKER-USER` when Docker manages the firewall, else the top of
+`FORWARD`) and `OVPN-ACCEPT` (end of `FORWARD`). They are flushed and rebuilt
+on every start. `fw-rules.sh` runs in between; append your own rules to
+`OVPN-FORWARD` there.
 
 Note that `duplicate-cn` (in `server.conf`) lets several devices share one
 profile, but a static IP can then only be used by one of them at a time, and
@@ -275,17 +259,6 @@ older setups worth knowing:
 
 New PKIs use EC secp384r1 keys (`config/easy-rsa.vars`). An existing RSA PKI
 keeps working; `pki/vars` inside the PKI is what easy-rsa reads.
-
-## Upgrading from the d3vilh layout
-
-The directory layout is the same, so an existing `pki/`, `clients/`,
-`staticclients/` and `clients/oath.secrets` keep working. Extra fields that
-the old scripts appended to `pki/index.txt` are tolerated. Replace
-`server.conf`/`config/client.conf` with the new ones (or merge your changes),
-create `.env`, remove the old `openvpn-ui` container and run
-`docker compose up -d --build`. Re-download client profiles if you switched
-from `tls-auth` to `tls-crypt`. The old UI database (`db/data.db`) is not
-used; the new UI creates `db/openvpn-ui.db`.
 
 ## Backup
 

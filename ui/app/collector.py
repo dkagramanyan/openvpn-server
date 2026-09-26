@@ -6,18 +6,22 @@ import logging
 import queue
 import threading
 import time
+from pathlib import Path
 from typing import Any, Callable
 
 from .db import Database
-from .mgmt import Management, ManagementError
+from .mgmt import Management, ManagementError, read_status_file
 
 log = logging.getLogger("openvpn-ui.collector")
 
 
 class Collector(threading.Thread):
-    def __init__(self, db: Database, mgmt: Management, interval: float) -> None:
+    def __init__(self, db: Database, mgmt: Management, interval: float,
+                 status_file: Callable[[], tuple[Path | None, int]] = lambda: (None, 0)) -> None:
         super().__init__(name="collector", daemon=True)
         self.db, self.mgmt, self.interval = db, mgmt, interval
+        self.status_file = status_file
+        self._status_time: int | None = None
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._subscribers: list[queue.Queue] = []
@@ -85,9 +89,21 @@ class Collector(threading.Thread):
                 log.exception("collector error")
                 self._stop.wait(self.interval)
 
+    def _status(self) -> dict[str, Any]:
+        """Client list from the status file when server.conf writes a fresh one, else from the
+        management interface. OpenVPN logs every management "status" command at verb 3, so
+        polling it every few seconds would flood the log."""
+        path, every = self.status_file()
+        if path is not None:
+            status = read_status_file(path, max_age=3 * every + 5)
+            if status is not None:
+                return {**status, "from_file": True}
+        return self.mgmt.status()
+
     def poll(self) -> None:
         was_connected = self.mgmt.connected
-        status = self.mgmt.status()
+        # load-stats doubles as the liveness check: it is the one command OpenVPN does not log.
+        load = self.mgmt.load_stats()
         if not was_connected or not self.live.get("version"):
             try:
                 version = self.mgmt.version()
@@ -95,12 +111,16 @@ class Collector(threading.Thread):
                 version = None
         else:
             version = self.live.get("version")
-        try:
-            load = self.mgmt.load_stats()
-        except ManagementError:
-            load = {}
+        status = self._status()
+        if status.get("from_file") and status["time"] == self._status_time and self.live["connected"]:
+            # The status file has not been rewritten since the last poll: nothing new to count.
+            with self._lock:
+                self.live.update(load=load, updated_at=int(time.time()))
+            return
+        self._status_time = status["time"]
 
         now = int(time.time())
+        server_now = status["time"]
         minute = now - now % 60
         seen: set[tuple[int, int, str]] = set()
         live_clients: list[dict[str, Any]] = []
@@ -136,7 +156,7 @@ class Collector(threading.Thread):
                         d_in, d_out = cl["bytes_in"], cl["bytes_out"]
                         self.db.add_event("vpn_connect", cl["cn"], None, cl["real_address"], conn=conn)
                     entry = {"session_id": session_id, "bytes_in": cl["bytes_in"], "bytes_out": cl["bytes_out"],
-                             "ts": now, "rate_in": 0.0, "rate_out": 0.0}
+                             "ts": server_now, "rate_in": 0.0, "rate_out": 0.0}
                     self._active[key] = entry
                     self.db.add_traffic(conn, minute, cl["cn"], d_in, d_out)
                 else:
@@ -146,8 +166,8 @@ class Collector(threading.Thread):
                         d_in = cl["bytes_in"]
                     if d_out < 0:
                         d_out = cl["bytes_out"]
-                    dt = max(now - entry["ts"], 1)
-                    entry.update(bytes_in=cl["bytes_in"], bytes_out=cl["bytes_out"], ts=now,
+                    dt = max(server_now - entry["ts"], 1)
+                    entry.update(bytes_in=cl["bytes_in"], bytes_out=cl["bytes_out"], ts=server_now,
                                  rate_in=d_in / dt, rate_out=d_out / dt)
                     conn.execute(
                         """UPDATE vpn_sessions SET last_seen = ?, bytes_in = ?, bytes_out = ?,
@@ -163,11 +183,7 @@ class Collector(threading.Thread):
                 live_clients.append({**cl, "session_id": entry["session_id"],
                                      "rate_in": entry["rate_in"], "rate_out": entry["rate_out"]})
 
-            for key in [k for k in self._active if k not in seen]:
-                entry = self._active.pop(key)
-                conn.execute("UPDATE vpn_sessions SET disconnected_at = ? WHERE id = ? AND disconnected_at IS NULL",
-                             (now, entry["session_id"]))
-                self.db.add_event("vpn_disconnect", key[2], None, None, conn=conn)
+            self._close_sessions(conn, [k for k in self._active if k not in seen], now)
 
         live_clients.sort(key=lambda c: (c["cn"], c["connected_since"]))
         with self._lock:
@@ -178,15 +194,18 @@ class Collector(threading.Thread):
             )
         self._publish()
 
+    def _close_sessions(self, conn, keys: list, now: int, detail: str | None = None) -> None:
+        for key in keys:
+            entry = self._active.pop(key)
+            conn.execute("UPDATE vpn_sessions SET disconnected_at = ? WHERE id = ? AND disconnected_at IS NULL",
+                         (now, entry["session_id"]))
+            self.db.add_event("vpn_disconnect", key[2], None, detail, conn=conn)
+
     def _handle_down(self, error: str) -> None:
+        self._status_time = None
         if self._active:
-            now = int(time.time())
             with self.db.tx() as conn:
-                for key, entry in self._active.items():
-                    conn.execute("UPDATE vpn_sessions SET disconnected_at = ? WHERE id = ? AND disconnected_at IS NULL",
-                                 (now, entry["session_id"]))
-                    self.db.add_event("vpn_disconnect", key[2], None, "server unreachable", conn=conn)
-            self._active.clear()
+                self._close_sessions(conn, list(self._active), int(time.time()), "server unreachable")
         with self._lock:
             changed = self.live["connected"] or self.live["error"] != error
             self.live.update(connected=False, error=error, clients=[], load={}, rate_in=0.0, rate_out=0.0,

@@ -1,5 +1,46 @@
 # Changelog
 
+## 1.2.0 - 2026-09-26
+
+### Upgrade notes
+* Guests now use static IPs from `10.0.70.128/25`, inside the tunnel subnet:
+  give existing guest clients a new static IP in the UI (the dashboard lists
+  the ones OpenVPN cannot hand out). No new profiles are needed.
+* Rules from earlier releases were appended straight to `FORWARD`/`POSTROUTING`
+  and stay until the host reboots or its firewall reloads; they are harmless.
+
+### Fixed
+* Guest static IPs from the separate `10.0.71.0/24` never worked with
+  `topology subnet`: OpenVPN only accepts addresses inside the `server`
+  network, and clients got a gateway outside their own subnet. The subnet is
+  now split: pool `10.0.70.2-127`, guests `10.0.70.128/25` (`nopool` +
+  `ifconfig-pool`). The UI rejects static IPs outside the subnet, inside the
+  pool or already taken.
+* Guests could reach the server host itself (SSH, the web UI, ...), other VPN
+  clients and private networks; they are now limited to the internet and the
+  pushed DNS servers, which were blocked before because they sit in `HOME_SUB`.
+* The LAN is `171.134.51.0/24` again (`HOME_SUB`, pushed route and DNS); 1.1.0
+  changed it by mistake.
+* The UI believed `X-Forwarded-For` from any client, so the login rate limit
+  could be bypassed and logged IPs forged. Only `OVPN_UI_TRUSTED_PROXIES`
+  (default `127.0.0.1`) is trusted now.
+* `openvpn.log` only rotated when OpenVPN restarted; it now rotates while it
+  runs, and the Docker logs of both containers are capped.
+* An expired client can be renewed from its page; creating it again explains
+  that instead of failing with "already exists".
+
+### Changed
+* The UI reads the client list from the status file (`status ... 5`,
+  `status-version 3`) instead of polling `status 3`, which OpenVPN logged every
+  5 s (~17 000 lines a day). Rates use the file's own timestamp.
+* Firewall rules live in the chains `OVPN-NAT`, `OVPN-INPUT`, `OVPN-FORWARD`
+  (via `DOCKER-USER` when present) and `OVPN-ACCEPT`, rebuilt on every start.
+* `tun-mtu 1400` / `mssfix 1300` removed: the OpenVPN 2.7 defaults size
+  packets to the path and the server no longer disagrees with its clients.
+* New settings `OVPN_UI_BIND`, `OVPN_UI_TRUSTED_PROXIES`, `GUEST_BLOCK`.
+* Removed `docker-compose-no-ui.yml` and `build-image.sh` (use
+  `docker compose build`).
+
 ## 1.1.0 - 2026-09-12
 
 ### Changed

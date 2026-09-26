@@ -68,3 +68,24 @@ def test_first_traffic_ts(tmp_path):
         db.add_traffic(conn, 1_000_000, "a", 1, 1)
         db.add_traffic(conn, 2_000_000, "b", 1, 1)
     assert db.first_traffic_ts() == 1_000_000
+
+
+def test_status_file_is_preferred_and_unchanged_file_is_skipped(tmp_path):
+    db = Database(tmp_path / "s.db")
+    mgmt = FakeMgmt()
+    mgmt.status = None                      # the management "status" command must not be used
+    f = tmp_path / "status.log"
+    now = int(time.time())
+
+    def write(t, b_in):
+        f.write_text(f"TITLE\tx\nTIME\tx\t{t}\nHEADER\tCLIENT_LIST\tCommon Name\tBytes Received\tBytes Sent"
+                     f"\tConnected Since (time_t)\tClient ID\nCLIENT_LIST\talice\t{b_in}\t0\t{now - 60}\t3\nEND\n")
+
+    c = Collector(db, mgmt, 5, lambda: (f, 5))
+    write(now - 10, 1000)
+    c.poll()
+    write(now - 5, 6000)
+    c.poll()
+    assert c.live["clients"][0]["rate_in"] == 1000.0      # 5000 bytes over the file's own 5 s
+    c.poll()                                              # same file again: nothing counted twice
+    assert db.totals(0, now + 1, "alice") == (6000, 0)

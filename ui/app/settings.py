@@ -20,7 +20,6 @@ class Settings:
         self.db_path = Path(_env("OVPN_UI_DB", str(self.openvpn_dir / "db" / "openvpn-ui.db")))
 
         self.server_conf = self.openvpn_dir / "server.conf"
-        self.client_conf = self.openvpn_dir / "config" / "client.conf"
         self.vars_template = self.openvpn_dir / "config" / "easy-rsa.vars"
         self.clients_dir = self.openvpn_dir / "clients"
         self.static_dir = self.openvpn_dir / "staticclients"
@@ -36,6 +35,7 @@ class Settings:
         self.public_port = _env("OVPN_PUBLIC_PORT", "").strip()
         self.secure_cookies = _env("OVPN_UI_SECURE_COOKIES", "auto").strip().lower()
         self.tfa_issuer = _env("OVPN_TFA_ISSUER", "OpenVPN").strip() or "OpenVPN"
+        self.guest_sub = _env("GUEST_SUB", "10.0.70.128/25").strip()   # same value as the openvpn service
 
     # -- management interface ---------------------------------------------
     def management_endpoint(self) -> tuple[str, int, Path | None]:
@@ -58,6 +58,20 @@ class Settings:
         if host == "0.0.0.0":
             host = "127.0.0.1"
         return host, port, pw_file
+
+    def status_file(self) -> tuple[Path | None, int]:
+        """(path, refresh interval) of the "status" file in server.conf, or (None, 0)."""
+        try:
+            text = self.server_conf.read_text()
+        except OSError:
+            return None, 0
+        m = re.search(r"^\s*status\s+(\S+)(?:\s+(\d+))?", text, re.M)
+        if not m:
+            return None, 0
+        path = Path(m.group(1))
+        if not path.is_absolute():
+            path = self.openvpn_dir / path
+        return path, int(m.group(2) or 60)     # OpenVPN's default refresh is 60 s
 
     def management_password(self) -> str | None:
         _, _, pw_file = self.management_endpoint()
