@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.3.1 - 2026-09-26
+
+### Fixed
+* **Connected clients had no traffic after a restart with kernel offload
+  (DCO).** An ovpn interface outlives an OpenVPN that did not exit cleanly;
+  under host networking the next start found `tun0` taken, opened `tun1`, and
+  replies to clients were routed into the dead `tun0`. The entrypoint now
+  removes its own leftover ovpn interfaces (no IPv4 address, or the server's
+  tunnel address) before every start.
+* Client profiles fell back to the template's `127.0.0.1` when
+  `config/client.conf` was reset (e.g. by a git checkout) while
+  `OVPN_PUBLIC_HOST` was unchanged; the public host is now applied again.
+
+### Changed
+* Pushed DNS server: `171.134.51.1`.
+
 ## 1.3.0 - 2026-09-26
 
 ### Added

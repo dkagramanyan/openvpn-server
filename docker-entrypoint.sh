@@ -212,8 +212,27 @@ on_term() {
 }
 trap on_term TERM INT
 
+# A DCO (kernel "ovpn") interface is a plain netdevice: it outlives an OpenVPN
+# that did not exit cleanly and, in the host's namespace, keeps the tun0 name
+# and the VPN subnet route. The next OpenVPN then gets tun1 while replies to
+# clients are routed into the dead tun0. Remove our own leftovers: ovpn
+# interfaces with no IPv4 address or with the server's tunnel address.
+clean_stale_dco() {
+    local net addr dev
+    net=$(sed -n 's/^[[:space:]]*server[[:space:]]\+\([0-9.]\+\)[[:space:]].*/\1/p' "$SERVER_CONF" | head -1)
+    [[ -n $net ]] || return 0
+    addr=${net%.*}.$(( ${net##*.} + 1 ))
+    for dev in $(ip -o link show type ovpn 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1); do
+        if ! ip -o -4 addr show dev "$dev" | grep -q . || ip -o -4 addr show dev "$dev" | grep -q " $addr/"; then
+            log "Removing leftover DCO interface $dev"
+            ip link del "$dev" || true
+        fi
+    done
+}
+
 while :; do
     rotate_log
+    clean_stale_dco
     log "Starting OpenVPN"
     /usr/sbin/openvpn --cd "$OPENVPN_DIR" --script-security 2 --config "$SERVER_CONF" &
     OVPN_PID=$!

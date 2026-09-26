@@ -53,7 +53,9 @@ def bootstrap() -> None:
             log.warning("created admin user '%s' with generated password: %s  (change it in Settings)",
                         settings.admin_username, password)
     try:
-        if settings.public_host and db.get_setting("remote_from_env") != settings.public_host:
+        # Also when client.conf is back to the template's placeholder (e.g. after a git checkout).
+        placeholder = pki.get_remote()["host"] in ("", "127.0.0.1", "localhost")
+        if settings.public_host and (placeholder or db.get_setting("remote_from_env") != settings.public_host):
             pki.set_remote(settings.public_host)
             db.set_setting("remote_from_env", settings.public_host)
             log.info("client profiles now point at %s", settings.public_host)
