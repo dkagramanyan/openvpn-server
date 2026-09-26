@@ -78,8 +78,9 @@ def test_status_file_is_preferred_and_unchanged_file_is_skipped(tmp_path):
     now = int(time.time())
 
     def write(t, b_in):
-        f.write_text(f"TITLE\tx\nTIME\tx\t{t}\nHEADER\tCLIENT_LIST\tCommon Name\tBytes Received\tBytes Sent"
-                     f"\tConnected Since (time_t)\tClient ID\nCLIENT_LIST\talice\t{b_in}\t0\t{now - 60}\t3\nEND\n")
+        f.write_text(f"TITLE\tx\nTIME\tx\t{t}\nHEADER\tCLIENT_LIST\tCommon Name\tVirtual Address\tBytes Received"
+                     f"\tBytes Sent\tConnected Since (time_t)\tClient ID\n"
+                     f"CLIENT_LIST\talice\t10.0.70.2\t{b_in}\t0\t{now - 60}\t3\nEND\n")
 
     c = Collector(db, mgmt, 5, lambda: (f, 5))
     write(now - 10, 1000)
@@ -89,3 +90,14 @@ def test_status_file_is_preferred_and_unchanged_file_is_skipped(tmp_path):
     assert c.live["clients"][0]["rate_in"] == 1000.0      # 5000 bytes over the file's own 5 s
     c.poll()                                              # same file again: nothing counted twice
     assert db.totals(0, now + 1, "alice") == (6000, 0)
+
+
+def test_handshakes_in_progress_are_not_sessions(tmp_path):
+    db = Database(tmp_path / "u.db")
+    mgmt = FakeMgmt()
+    now = int(time.time())
+    undef = client("UNDEF", 7, now, 2660, 418)
+    undef["vpn_ip"] = ""
+    mgmt.clients = [undef, client("alice", 8, now, 10, 20)]
+    Collector(db, mgmt, 5).poll()
+    assert [r["client_name"] for r in db.query("SELECT client_name FROM vpn_sessions")] == ["alice"]

@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import copy
 import logging
+import os
 import queue
+import re
 import threading
 import time
 from pathlib import Path
@@ -14,13 +16,39 @@ from .mgmt import Management, ManagementError, read_status_file
 
 log = logging.getLogger("openvpn-ui.collector")
 
+_TS = r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) "
+_REJECTS = (
+    # a certificate the server refused: revoked, expired, not from this CA, ...
+    (re.compile(_TS + r"[\w-]+:([0-9a-fA-F.:]+?):\d+ VERIFY ERROR: depth=0, error=([^:]+):.*?\bCN=([^,/]+)"),
+     lambda m: (m[4], m[3])),
+    # control channel key mismatch: a profile from another server, or a scanner
+    (re.compile(_TS + r"TLS Error: (?:(?:tls-crypt unwrapping|incoming packet authentication) failed|"
+                r"could not determine wrapping) from \[AF_INET6?\]([0-9a-fA-F.:]+?):\d+"),
+     lambda m: ("", "unknown control channel key")),
+    # 2FA (log/oath.log, written by bin/oath.sh)
+    (re.compile(_TS + r"2FA FAIL user='[^']*' cn='([^']*)' from='([^']*)' reason=(\S+)"),
+     lambda m: (m[2], "2FA: " + m[4].replace("-", " "))),
+)
+
+
+def parse_rejection(line: str) -> tuple[int, str, str, str] | None:
+    """(time, client, reason, source address) of a rejected connection attempt in a log line."""
+    for rx, fields in _REJECTS:
+        m = rx.match(line)
+        if m:
+            client, reason = fields(m)
+            address = m[3] if rx is _REJECTS[2][0] else m[2]
+            return int(time.mktime(time.strptime(m[1], "%Y-%m-%d %H:%M:%S"))), client, reason, address
+    return None
+
 
 class Collector(threading.Thread):
     def __init__(self, db: Database, mgmt: Management, interval: float,
-                 status_file: Callable[[], tuple[Path | None, int]] = lambda: (None, 0)) -> None:
+                 status_file: Callable[[], tuple[Path | None, int]] = lambda: (None, 0),
+                 logs: tuple[Path, ...] = ()) -> None:
         super().__init__(name="collector", daemon=True)
         self.db, self.mgmt, self.interval = db, mgmt, interval
-        self.status_file = status_file
+        self.status_file, self.logs = status_file, logs
         self._status_time: int | None = None
         self._stop = threading.Event()
         self._lock = threading.Lock()
@@ -78,6 +106,10 @@ class Collector(threading.Thread):
         backoff = 2.0
         while not self._stop.is_set():
             try:
+                self.read_logs()
+            except Exception:
+                log.exception("reading the OpenVPN logs failed")
+            try:
                 self.poll()
                 backoff = 2.0
                 self._stop.wait(self.interval)
@@ -88,6 +120,31 @@ class Collector(threading.Thread):
             except Exception:   # never let the thread die
                 log.exception("collector error")
                 self._stop.wait(self.interval)
+
+    def read_logs(self, max_bytes: int = 4 << 20) -> None:
+        """Count rejected connection attempts in the lines appended to the logs since the last call.
+        The position survives restarts; a rotated (truncated or replaced) file is read from the start."""
+        for path in self.logs:
+            try:
+                with open(path, "rb") as fh:
+                    st = os.fstat(fh.fileno())
+                    key = f"logpos:{path.name}"
+                    inode, _, offset = (self.db.get_setting(key) or "0:0").partition(":")
+                    pos = int(offset) if int(inode) == st.st_ino and int(offset) <= st.st_size else 0
+                    fh.seek(pos)
+                    data = fh.read(max_bytes)
+            except (OSError, ValueError):
+                continue
+            end = data.rfind(b"\n") + 1          # only whole lines; the rest is read next time
+            if not end:
+                continue
+            with self.db.tx() as conn:
+                for line in data[:end].decode("utf-8", "replace").splitlines():
+                    hit = parse_rejection(line)
+                    if hit:
+                        self.db.add_rejection(conn, *hit)
+                conn.execute("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET "
+                             "value = excluded.value", (key, f"{st.st_ino}:{pos + end}"))
 
     def _status(self) -> dict[str, Any]:
         """Client list from the status file when server.conf writes a fresh one, else from the
@@ -128,6 +185,8 @@ class Collector(threading.Thread):
 
         with self.db.tx() as conn:
             for cl in status["clients"]:
+                if cl["cn"] in ("", "UNDEF") or not cl["vpn_ip"]:
+                    continue        # still in the TLS handshake: no certificate accepted yet
                 key = (cl["cid"], cl["connected_since"], cl["cn"])
                 seen.add(key)
                 entry = self._active.get(key)

@@ -23,6 +23,7 @@ class Settings:
         self.vars_template = self.openvpn_dir / "config" / "easy-rsa.vars"
         self.clients_dir = self.openvpn_dir / "clients"
         self.static_dir = self.openvpn_dir / "staticclients"
+        self.guests_dir = self.openvpn_dir / "guests"
         self.oath_secrets = self.clients_dir / "oath.secrets"
 
         self.poll_interval = max(2.0, float(_env("OVPN_UI_POLL_INTERVAL", "5")))
@@ -34,6 +35,8 @@ class Settings:
         self.secure_cookies = _env("OVPN_UI_SECURE_COOKIES", "auto").strip().lower()
         self.tfa_issuer = _env("OVPN_TFA_ISSUER", "OpenVPN").strip() or "OpenVPN"
         self.guest_sub = _env("GUEST_SUB", "10.0.70.128/25").strip()   # same value as the openvpn service
+        # Public base URL of the one-time profile links (a reverse proxy forwarding /p/ to the UI).
+        self.profile_base_url = _env("OVPN_PROFILE_BASE_URL", "").strip().rstrip("/")
 
     # -- management interface ---------------------------------------------
     def management_endpoint(self) -> tuple[str, int, Path | None]:

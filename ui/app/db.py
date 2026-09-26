@@ -84,7 +84,35 @@ CREATE TABLE IF NOT EXISTS events (
     detail      TEXT
 );
 CREATE INDEX IF NOT EXISTS events_ts ON events (ts);
+-- History of a client whose name was later given to a new certificate:
+-- its sessions and traffic were moved to client_name = key ("name#time").
+CREATE TABLE IF NOT EXISTS archived_clients (
+    key         TEXT PRIMARY KEY,
+    name        TEXT NOT NULL,
+    archived_at INTEGER NOT NULL
+);
+-- Connection attempts OpenVPN rejected, counted per day, client, reason and source.
+CREATE TABLE IF NOT EXISTS rejections (
+    day         INTEGER NOT NULL,
+    client_name TEXT NOT NULL,
+    reason      TEXT NOT NULL,
+    address     TEXT NOT NULL,
+    count       INTEGER NOT NULL,
+    last_ts     INTEGER NOT NULL,
+    PRIMARY KEY (day, client_name, reason, address)
+);
+-- One-time profile download links.
+CREATE TABLE IF NOT EXISTS share_tokens (
+    token_hash  TEXT PRIMARY KEY,
+    client_name TEXT NOT NULL,
+    created_at  INTEGER NOT NULL,
+    expires_at  INTEGER NOT NULL,
+    used_at     INTEGER,
+    created_by  TEXT
+);
 """
+
+_HISTORY = (("vpn_sessions", "connected_at"), ("traffic_minute", "ts"), ("traffic_hour", "ts"), ("traffic_day", "ts"))
 
 MINUTE_RETENTION = 2 * 86400      # minute buckets are kept for two days
 HOUR_RETENTION = 90 * 86400       # hourly buckets for 90 days, daily forever
@@ -243,6 +271,54 @@ class Database:
             )
             conn.execute("DELETE FROM traffic_hour WHERE ts < ?", (cutoff,))
             conn.execute("DELETE FROM web_sessions WHERE expires_at < ?", (now,))
+            conn.execute("DELETE FROM rejections WHERE day < ?", (now - HOUR_RETENTION,))
+            conn.execute("DELETE FROM share_tokens WHERE expires_at < ?", (now,))
+
+    # -- client history ------------------------------------------------------
+    def archive_client_history(self, name: str, before: int | None = None) -> str | None:
+        """Move the sessions and traffic of <name> (those older than <before>, if given) to an
+        archive key, so a new certificate with the same name starts with a clean history."""
+        cond = " AND {col} < ?" if before is not None else ""
+        extra = [before] if before is not None else []
+        with self.tx() as conn:
+            if not any(conn.execute(f"SELECT 1 FROM {t} WHERE client_name = ?{cond.format(col=c)} LIMIT 1",
+                                    [name] + extra).fetchone() for t, c in _HISTORY):
+                return None
+            now = int(time.time())
+            key = f"{name}#{now}"
+            for table, col in _HISTORY:
+                conn.execute(f"UPDATE {table} SET client_name = ? WHERE client_name = ?{cond.format(col=col)}",
+                             [key, name] + extra)
+            conn.execute("INSERT OR REPLACE INTO archived_clients (key, name, archived_at) VALUES (?, ?, ?)",
+                         (key, name, now))
+            return key
+
+    def purge_client(self, name: str) -> None:
+        """Remove every trace of a pseudo client (OpenVPN's "UNDEF" for handshakes in progress)."""
+        with self.tx() as conn:
+            for table, _ in _HISTORY:
+                conn.execute(f"DELETE FROM {table} WHERE client_name = ?", (name,))
+            conn.execute("DELETE FROM events WHERE client_name = ?", (name,))
+
+    # -- rejected connection attempts ----------------------------------------
+    def add_rejection(self, conn: sqlite3.Connection, ts: int, client: str, reason: str, address: str) -> None:
+        conn.execute(
+            """INSERT INTO rejections (day, client_name, reason, address, count, last_ts) VALUES (?, ?, ?, ?, 1, ?)
+               ON CONFLICT(day, client_name, reason, address) DO UPDATE SET
+                   count = count + 1, last_ts = MAX(last_ts, excluded.last_ts)""",
+            (ts - ts % 86400, client, reason, address, ts),
+        )
+
+    def rejections(self, since: int, client: str | None = None) -> list[dict[str, Any]]:
+        where, params = "WHERE last_ts >= ?", [since]
+        if client is not None:
+            where += " AND client_name = ?"
+            params.append(client)
+        rows = self.query(
+            f"""SELECT client_name, reason, address, SUM(count) AS n, MAX(last_ts) AS last_ts FROM rejections {where}
+                GROUP BY client_name, reason, address ORDER BY last_ts DESC LIMIT 50""", params)
+        return [{"client": r["client_name"], "reason": r["reason"], "address": r["address"],
+                 "count": int(r["n"]), "last_ts": int(r["last_ts"])} for r in rows]
 
     # -- sessions ------------------------------------------------------------
     def close_stale_sessions(self, at: int | None = None) -> int:

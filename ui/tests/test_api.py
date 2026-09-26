@@ -31,6 +31,7 @@ serial = $dir/serial
 certificate = $dir/ca.crt
 private_key = $dir/private/ca.key
 default_md = sha256
+unique_subject = no
 policy = pol
 x509_extensions = client
 [pol]
@@ -200,16 +201,16 @@ def test_delete_requires_revocation(client):
 
 def test_notes_static_ip_and_config(client):
     assert client.put("/api/clients/alice/note", json={"note": " laptop "}, headers=H).json() == {"note": "laptop"}
-    assert client.put("/api/clients/alice/static-ip", json={"ip": "10.0.70.130"}, headers=H).status_code == 200
-    assert (TMP / "staticclients" / "alice").read_text() == "ifconfig-push 10.0.70.130 255.255.255.0\n"
-    # outside the server subnet, the server's own address, inside the dynamic pool, taken by alice
-    for ip in ("300.1.1.1", "10.0.71.9", "10.0.70.1", "10.0.70.50"):
-        assert client.put("/api/clients/old/static-ip", json={"ip": ip}, headers=H).status_code == 400, ip
-    r = client.put("/api/clients/old/static-ip", json={"ip": "10.0.70.130"}, headers=H)
-    assert r.status_code == 400 and "alice" in r.json()["detail"]
+    assert client.put("/api/clients/alice/static-ip", json={"ip": "10.0.70.100"}, headers=H).status_code == 200
+    assert (TMP / "staticclients" / "alice").read_text() == "ifconfig-push 10.0.70.100 255.255.255.0\n"
+    # invalid, outside the subnet, the server itself, the dynamic pool, the guest range, taken by alice
+    for ip in ("300.1.1.1", "10.0.71.9", "10.0.70.1", "10.0.70.50", "10.0.70.140", "10.0.70.100"):
+        r = client.put("/api/clients/old/static-ip", json={"ip": ip}, headers=H)
+        assert r.status_code == 400, ip
+    assert "alice" in r.json()["detail"]
     row = client.get("/api/clients/alice").json()
-    assert row["note"] == "laptop" and row["static_ip"] == "10.0.70.130" and row["guest"] is True
-    # a static IP left over from the old separate guest subnet is flagged on the dashboard
+    assert row["note"] == "laptop" and row["static_ip"] == "10.0.70.100" and row["guest"] is False
+    # a static IP left over from 1.1 (separate guest subnet) is flagged on the dashboard
     (TMP / "staticclients" / "alice").write_text("ifconfig-push 10.0.71.9 255.255.255.0\n")
     assert any("alice (10.0.71.9)" in w for w in client.get("/api/overview").json()["warnings"])
     (TMP / "staticclients" / "alice").unlink()
@@ -226,17 +227,96 @@ def test_notes_static_ip_and_config(client):
     assert {"login", "client_deleted", "profile_downloaded", "remote_changed", "static_ip_set"} <= {e["kind"] for e in events}
 
 
-def test_guest_switch_on_create(client):
+def test_guests_get_addresses_per_device(client):
     from app import pki
-    # a full-access client may not take a guest address, and a guest needs one
-    r = client.post("/api/clients", json={"name": "carol", "static_ip": "10.0.70.140"}, headers=H)
-    assert r.status_code == 400 and "guest range" in r.json()["detail"]
+    # guests are a marker, not a static IP
     r = client.post("/api/clients", json={"name": "carol", "guest": True, "static_ip": "10.0.70.140"}, headers=H)
-    assert r.status_code != 400 or "guest range" not in r.json()["detail"]   # accepted; fails later without easy-rsa
-    r = client.post("/api/clients", json={"name": "carol", "guest": True, "static_ip": "10.0.70.20"}, headers=H)
     assert r.status_code == 400 and "guest range" in r.json()["detail"]
-    # guests without an address get the first free one
-    assert pki.next_guest_ip("carol") == "10.0.70.129"
+    r = client.put("/api/clients/alice/access", json={"guest": True}, headers=H)
+    assert r.status_code == 200 and (TMP / "guests" / "alice").exists()
+    assert client.get("/api/clients/alice").json()["guest"] is True
+    assert client.put("/api/clients/alice/static-ip", json={"ip": "10.0.70.101"}, headers=H).status_code == 400
+    assert client.put("/api/clients/alice/access", json={"guest": False}, headers=H).status_code == 200
+    assert not (TMP / "guests" / "alice").exists()
+    # 1.3 guests (a static IP in the guest range) become guests with per-device addresses
     (TMP / "staticclients" / "alice").write_text("ifconfig-push 10.0.70.129 255.255.255.0\n")
-    assert pki.next_guest_ip("carol") == "10.0.70.130"
-    (TMP / "staticclients" / "alice").unlink()
+    assert pki.migrate_guest_static_ips() == ["alice"]
+    assert (TMP / "guests" / "alice").exists() and not (TMP / "staticclients" / "alice").exists()
+    pki.set_guest("alice", False)
+
+
+def test_share_link_is_single_use(client):
+    r = client.post("/api/clients/alice/share", json={"hours": 2}, headers=H)
+    assert r.status_code == 200, r.text
+    link = r.json()
+    assert link["import_url"] == "openvpn://import-profile/" + link["url"] and "<svg" in link["qr_svg"]
+    path = "/p/" + link["url"].rsplit("/p/", 1)[1]
+    cookies = dict(client.cookies)
+    client.cookies.clear()                       # the link works without a session
+    try:
+        r = client.get(path)
+        assert r.status_code == 200 and "<cert>" in r.text and r.headers["cache-control"] == "no-store"
+        assert client.get(path).status_code == 404          # used
+        assert client.get("/p/not-a-token").status_code == 404
+    finally:
+        client.cookies.update(cookies)
+    assert client.post("/api/clients/old/share", json={}, headers=H).status_code == 400   # expired cert
+    assert any(e["kind"] == "profile_link_used" for e in client.get("/api/events").json()["events"])
+
+
+def test_rejected_attempts_from_the_logs(client):
+    from app.main import collector
+    (TMP / "log" / "openvpn.log").write_text(
+        "2026-09-26 17:04:27 udp4:194.55.141.10:54333 VERIFY ERROR: depth=0, error=certificate revoked: C=UA, "
+        "CN=Ian_pile_experimental, emailAddress=sweet@home.net, serial=1656\n"
+        "2026-09-26 17:05:02 udp4:194.55.141.10:49920 VERIFY ERROR: depth=0, error=certificate revoked: C=UA, "
+        "CN=Ian_pile_experimental, emailAddress=sweet@home.net, serial=1656\n"
+        "2026-09-26 17:06:00 TLS Error: tls-crypt unwrapping failed from [AF_INET]45.1.2.3:1234\n"
+        "2026-09-26 17:06:30 TLS Error: could not determine wrapping from [AF_INET]45.1.2.3:1235\n"
+        "2026-09-26 17:07:00 MANAGEMENT: CMD 'version'\npartial line without newline")
+    (TMP / "log" / "oath.log").write_text(
+        "2026-09-26 17:08:00 2FA FAIL user='alice' cn='alice' from='5.6.7.8' reason=wrong-code\n")
+    collector.read_logs()
+    collector.read_logs()                        # nothing new: nothing counted twice
+    rows = {(r["client"], r["reason"]): r for r in collector.db.rejections(0)}
+    assert rows[("Ian_pile_experimental", "certificate revoked")]["count"] == 2
+    assert rows[("Ian_pile_experimental", "certificate revoked")]["address"] == "194.55.141.10"
+    assert rows[("", "unknown control channel key")]["address"] == "45.1.2.3"
+    assert rows[("", "unknown control channel key")]["count"] == 2      # shared key and tls-crypt-v2 wording
+    assert rows[("alice", "2FA: wrong code")]["address"] == "5.6.7.8"
+    assert [r["reason"] for r in client.get("/api/clients/alice").json()["rejections"]] == ["2FA: wrong code"]
+
+
+def test_new_certificate_under_an_old_name_starts_a_new_history(client):
+    from app.main import db
+    with db.tx() as conn:
+        conn.execute("INSERT INTO vpn_sessions (client_name, cid, connected_at, last_seen, bytes_in, bytes_out) "
+                     "VALUES ('dora', 1, 100, 200, 5, 6)")
+        db.add_traffic(conn, 120, "dora", 5, 6)
+    key = db.archive_client_history("dora")
+    assert key and key.startswith("dora#")
+    assert db.totals(0, 10**10, "dora") == (0, 0) and db.totals(0, 10**10, key) == (5, 6)
+    assert db.one("SELECT client_name FROM vpn_sessions WHERE cid = 1")["client_name"] == key
+    assert db.archive_client_history("dora") is None       # nothing left to archive
+    # only history before a given time, used to split data merged by earlier releases
+    with db.tx() as conn:
+        db.add_traffic(conn, 1000, "erin", 1, 1)
+        db.add_traffic(conn, 5000, "erin", 2, 2)
+    db.archive_client_history("erin", before=3000)
+    assert db.totals(0, 10**10, "erin") == (2, 2)
+
+
+def test_identity_start_tells_renewals_from_new_certificates(client):
+    from app import pki
+    p = TMP / "pki"
+    # frank: renewed, so the same key signed twice -> history goes back to the first certificate
+    issue(p, "frank", "client", "20260101000000Z", "20360101000000Z")
+    (p / "renewed" / "issued").mkdir(parents=True, exist_ok=True)
+    shutil.move(p / "issued" / "frank.crt", p / "renewed" / "issued" / "frank.crt")
+    ossl("ca", "-batch", "-config", str(p / "ca.cnf"), "-extensions", "client", "-startdate", "20260601000000Z",
+         "-enddate", "20360101000000Z", "-in", str(p / "reqs" / "frank.req"), "-out", str(p / "issued" / "frank.crt"),
+         "-notext")
+    assert pki.identity_start("frank") == pki.parse_asn1_time("20260101000000Z")
+    # bob: revoked earlier, then created again with a new key -> a new client from the new certificate on
+    issue(p, "bob", "client", "20260701000000Z", "20360101000000Z")
+    assert pki.identity_start("bob") == pki.parse_asn1_time("20260701000000Z")

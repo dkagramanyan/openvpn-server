@@ -3,8 +3,8 @@
 #
 #   rmcert.sh <name>
 #
-# Removes the .ovpn profile, the 2FA secret and QR code, and the static IP
-# assignment. The PKI database (pki/index.txt) and the revoked certificate
+# Removes the .ovpn profile, the 2FA secret and QR code, the static IP or
+# guest assignment and the tls-crypt-v2 key. The PKI database (pki/index.txt) and the revoked certificate
 # under pki/revoked/ are deliberately left untouched: the CRL is generated
 # from index.txt, and dropping a revoked entry would make that certificate
 # valid again until it expires.
@@ -28,6 +28,6 @@ if [[ -f $PKI_DIR/issued/$NAME.crt ]]; then
 fi
 
 rm -f "$OPENVPN_DIR/clients/$NAME.ovpn" "$OPENVPN_DIR/clients/$NAME-2fa.png" "$OPENVPN_DIR/clients/$NAME.png"
-rm -f "$OPENVPN_DIR/staticclients/$NAME"
+rm -f "$OPENVPN_DIR/staticclients/$NAME" "$OPENVPN_DIR/guests/$NAME" "$PKI_DIR/tc2/$NAME.key"
 "$BIN_DIR/oath-sec-rm.sh" "$NAME"
 echo "Removed profile, static IP and 2FA data of '$NAME'."

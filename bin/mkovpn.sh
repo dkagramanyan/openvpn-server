@@ -4,7 +4,9 @@
 #   mkovpn.sh <name>
 #
 # The profile is config/client.conf followed by the CA certificate, the
-# client certificate and key, and the tls-crypt (or tls-auth) key, all inline.
+# client certificate and key, and the control channel key, all inline: the
+# shared tls-crypt (or tls-auth) key, or with tls-crypt-v2 a key of this
+# client's own, generated on first use in pki/tc2/<name>.key.
 # The server certificate's common name is pinned with verify-x509-name, and
 # clients enrolled in two-factor authentication additionally get
 # "auth-user-pass" so the OpenVPN client prompts for the TOTP code.
@@ -27,10 +29,18 @@ OUT=$OPENVPN_DIR/clients/$NAME.ovpn
 mkdir -p "$OPENVPN_DIR/clients"
 
 # Match the control-channel protection used by the server.
-if grep -qE '^[[:space:]]*tls-auth[[:space:]]' "$OPENVPN_DIR/server.conf"; then
-    TA_BLOCK=tls-auth
+if grep -qE '^[[:space:]]*tls-crypt-v2[[:space:]]' "$OPENVPN_DIR/server.conf"; then
+    TA_BLOCK=tls-crypt-v2
+    TA_KEY=$PKI_DIR/tc2/$NAME.key
+    if [[ ! -f $TA_KEY ]]; then
+        mkdir -p "$PKI_DIR/tc2"
+        openvpn --tls-crypt-v2 "$PKI_DIR/tc2-server.key" --genkey tls-crypt-v2-client "$TA_KEY" >/dev/null
+        chmod 600 "$TA_KEY"
+    fi
+elif grep -qE '^[[:space:]]*tls-auth[[:space:]]' "$OPENVPN_DIR/server.conf"; then
+    TA_BLOCK=tls-auth TA_KEY=$PKI_DIR/ta.key
 else
-    TA_BLOCK=tls-crypt
+    TA_BLOCK=tls-crypt TA_KEY=$PKI_DIR/ta.key
 fi
 
 # Pin the server certificate name (taken from the actual server certificate).
@@ -49,7 +59,7 @@ SERVER_CN=$(openssl x509 -in "$PKI_DIR/issued/server.crt" -noout -subject -nameo
     echo "<ca>";   openssl x509 -in "$PKI_DIR/ca.crt"; echo "</ca>"
     echo "<cert>"; openssl x509 -in "$CERT";           echo "</cert>"
     echo "<key>";  cat "$KEY";                          echo "</key>"
-    echo "<$TA_BLOCK>"; grep -v '^#' "$PKI_DIR/ta.key"; echo "</$TA_BLOCK>"
+    echo "<$TA_BLOCK>"; grep -v '^#' "$TA_KEY"; echo "</$TA_BLOCK>"
 } > "$OUT.tmp"
 chmod 600 "$OUT.tmp"
 mv -f "$OUT.tmp" "$OUT"

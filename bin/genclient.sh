@@ -30,6 +30,7 @@ if [[ -n $STATIC_IP ]]; then
 fi
 
 export EASYRSA_BATCH=1 EASYRSA_PKI=$PKI_DIR
+rm -f "$PKI_DIR/tc2/$NAME.key"    # a new client gets a new tls-crypt-v2 key too
 opts=(--req-cn="$NAME")
 [[ -n ${OVPN_CERT_DAYS:-} ]] && opts+=(--days="$OVPN_CERT_DAYS")
 

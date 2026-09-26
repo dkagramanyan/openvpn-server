@@ -20,7 +20,7 @@ services:
     security_opt: [no-new-privileges:true]
     environment:
       TRUST_SUB: "10.0.70.0/24"     # the "server" subnet in server.conf
-      GUEST_SUB: &guest_sub "10.0.70.128/25"   # static IPs from here get internet only
+      GUEST_SUB: &guest_sub "10.0.70.128/25"   # guests' addresses: internet and DNS only
       HOME_SUB: "170.134.51.0/24"   # your LAN - guests are blocked from it
       # GUEST_BLOCK: "10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16"
       # OVPN_EGRESS_IFACE: eth0     # auto-detected from the default route
@@ -47,6 +47,7 @@ services:
       OVPN_UI_SECURE_COOKIES: ${OVPN_UI_SECURE_COOKIES:-auto} # "true" when served behind an HTTPS reverse proxy
       UVICORN_HOST: ${OVPN_UI_BIND:-0.0.0.0}                # address the UI listens on (port 8080)
       FORWARDED_ALLOW_IPS: ${OVPN_UI_TRUSTED_PROXIES:-127.0.0.1} # proxies whose X-Forwarded-For is believed
+      OVPN_PROFILE_BASE_URL: ${OVPN_PROFILE_BASE_URL:-}     # public base of one-time profile links (/p/...)
       GUEST_SUB: *guest_sub
     volumes:
       - ./:/etc/openvpn

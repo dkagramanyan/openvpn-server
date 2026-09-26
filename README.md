@@ -58,9 +58,10 @@ server.conf          OpenVPN server configuration (mounted at /etc/openvpn)
 config/client.conf   template for client profiles ("remote" line managed by the UI)
 config/easy-rsa.vars easy-rsa settings used when a *new* PKI is created
 config/management.pw generated management-interface password (git-ignored)
-pki/                 easy-rsa PKI (CA, certificates, CRL, tls-crypt key)
+pki/                 easy-rsa PKI (CA, certificates, CRL, tls-crypt keys)
 clients/             generated .ovpn profiles, 2FA secrets and QR codes
 staticclients/       per-client "ifconfig-push" files (static IPs)
+guests/              one empty file per guest client
 db/                  UI database (sessions, traffic, audit log)
 log/                 openvpn.log, openvpn-status.log, oath.log
 bin/                 CLI scripts (also used by the UI)
@@ -162,17 +163,21 @@ Environment variables of the `openvpn` service:
 
 * **Dashboard** - online clients with live download/upload rates, throughput
   for the last hour, traffic over the selected range (today, 24 h, 7/30/90
-  days, all), top clients, warnings (unreachable server, expiring
-  certificates/CRL, 2FA enforced without secrets).
+  days, all), top clients, rejected connection attempts of the last 24 h,
+  warnings (unreachable server, expiring certificates/CRL, 2FA enforced
+  without secrets).
 * **Clients** - state (online, valid, expiring, expired, revoked), expiry,
   last seen, traffic in the selected range, session count. Create clients with
-  optional validity, static IP, key passphrase, note and 2FA. Download the
-  `.ovpn` profile (always regenerated from the current template), show the 2FA
-  QR code, disconnect, renew, revoke, delete.
+  full access or guest, optional validity, static IP, key passphrase, note and
+  2FA. Download the `.ovpn` profile (always regenerated from the current
+  template) or share it with a one-time link and QR code, switch between full
+  access and guest, show the 2FA QR code and rejected connection attempts,
+  disconnect, renew, revoke, delete.
 * **Sessions** - every connection with duration, source address, VPN IP and
   bytes, filterable by client.
 * **Server** - OpenVPN version, management status, PKI expiry dates, CRL
-  regeneration, 2FA enforcement switch, editors for `server.conf`,
+  regeneration, 2FA enforcement switch, control channel key (shared or per
+  client), editors for `server.conf`,
   `client.conf` and easy-rsa vars (a `.bak` is kept), restart button, log
   viewer (openvpn.log, 2FA log, status file) and audit log.
 * **Settings** - public address for profiles (host and a port per protocol;
@@ -189,6 +194,38 @@ interface; the container entrypoint supervises the process and starts it
 again with the current `server.conf`. Revoking a certificate does not need a
 restart: OpenVPN re-reads the CRL on every connection and the UI kills the
 active session.
+
+History belongs to a certificate, not to a name: creating a client under the
+name of an earlier one starts a new history, and the old sessions stay listed
+as "name (earlier)". Renewing keeps the history (same key). Connection
+attempts OpenVPN rejects (revoked or expired certificate, unknown control
+channel key, wrong 2FA code) are read from `log/openvpn.log` and
+`log/oath.log` and counted per day, client, reason and source address.
+
+### One-time profile links
+
+**Share link** on a client page makes a link that downloads the profile once
+and then expires (1 h to 7 days), shown with a QR code of its
+`openvpn://import-profile/https://...` form: scanning it on a phone opens
+OpenVPN Connect and imports the profile. Only the path `/p/` needs to be
+public. Set `OVPN_PROFILE_BASE_URL` to the public address and let your proxy
+forward just that path to the UI, e.g. with Traefik:
+
+```yaml
+http:
+  routers:
+    ovpn-profiles:
+      rule: Host(`vpn.example.com`) && PathPrefix(`/p/`)
+      service: ovpn-ui
+      tls: { certResolver: letsencrypt }
+  services:
+    ovpn-ui:
+      loadBalancer: { servers: [{ url: "http://170.134.51.30:8080" }] }
+```
+
+In Zoraxy, a proxy rule for the host with a virtual directory `/p/` pointing at
+`170.134.51.30:8080` does the same. Set `OVPN_UI_TRUSTED_PROXIES` to the
+proxy's address so failed attempts are rate limited per visitor, not per proxy.
 
 ## CLI
 
@@ -208,27 +245,46 @@ docker exec openvpn /opt/app/bin/oath-sec-rm.sh <name>
 `rmcert.sh` deliberately never edits `pki/index.txt`: the CRL is generated
 from it, and dropping a revoked entry would make that certificate valid again.
 
-## Subnets, static IPs and the firewall
+## Subnets, guests, devices and the firewall
 
-`server 10.0.70.0 255.255.255.0 nopool` is one tunnel subnet: with
-`topology subnet` OpenVPN only accepts static IPs inside it. Clients without a
-static IP get an address from the pool `10.0.70.2-127` and full access. Choose
-**Guest** in the New client dialog (the next free address from `GUEST_SUB`,
-`10.0.70.128-254`, is assigned) or give a client a static IP from that range,
-and it only gets the internet and the pushed DNS servers: the entrypoint drops its traffic
-to `HOME_SUB`, the `GUEST_BLOCK` ranges (which include the other VPN clients),
-its pings, and everything addressed to the server host itself. The UI refuses
-static IPs outside the subnet, inside the pool or already taken.
+`server 10.0.70.0 255.255.255.0 nopool` is one tunnel subnet (with
+`topology subnet` OpenVPN only accepts addresses inside it):
 
-The rules live in the chains `OVPN-NAT`, `OVPN-INPUT`, `OVPN-FORWARD` (hooked
-into `DOCKER-USER` when Docker manages the firewall, else the top of
-`FORWARD`) and `OVPN-ACCEPT` (end of `FORWARD`). They are flushed and rebuilt
-on every start. `fw-rules.sh` runs in between; append your own rules to
-`OVPN-FORWARD` there.
+| Addresses | For |
+|---|---|
+| `10.0.70.2-99` | dynamic pool (full access) |
+| `10.0.70.100-127` | static IPs (full access) |
+| `10.0.70.128/25` (`GUEST_SUB`) | guests: internet and the pushed DNS servers only |
 
-Note that `duplicate-cn` (in `server.conf`) lets several devices share one
-profile, but a static IP can then only be used by one of them at a time, and
-OpenVPN ignores `ifconfig-pool-persist` in that mode.
+One certificate may be used on several devices at once (`duplicate-cn`).
+`bin/client-access.sh` (`client-connect`) gives every device its own address:
+each device of a guest gets a free address from the guest range, and a static
+IP goes to the first device that connects while the others get a dynamic one.
+Choose **Guest** in the New client dialog or on the client page; it applies the
+next time a device connects.
+
+The entrypoint drops guest traffic to `HOME_SUB`, the `GUEST_BLOCK` ranges
+(which include the other VPN clients), guest pings, and everything addressed
+to the server host itself. The rules live in the chains `OVPN-NAT`,
+`OVPN-INPUT`, `OVPN-FORWARD` (hooked into `DOCKER-USER` when Docker manages the
+firewall, else the top of `FORWARD`) and `OVPN-ACCEPT` (end of `FORWARD`). They
+are flushed and rebuilt on every start. `fw-rules.sh` runs in between; append
+your own rules to `OVPN-FORWARD` there.
+
+Clients get the DNS server both as `dns server` (OpenVPN 2.6+, Connect 3) and
+as `dhcp-option DNS` (older clients). IPv6 is routed into the tunnel as well
+(a private `fd00:70::/64` exists only for that) and answered there with "no
+route" (`block-ipv6`), so it cannot bypass the tunnel.
+
+## Control channel key
+
+By default every profile carries the same `tls-crypt` key. The Server page can
+switch to `tls-crypt-v2`: one key per client, generated into `pki/tc2/`, so a
+leaked profile no longer exposes a key all clients share, and the server
+drops packets from unknown clients before any TLS work. Switching changes every
+profile, and after restarting OpenVPN only the new profiles connect, so hand
+them out again (Share link) right after the switch. Switching back is the same
+button.
 
 ## Two-factor authentication
 

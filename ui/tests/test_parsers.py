@@ -119,7 +119,7 @@ def test_tfa_uri_and_qr(monkeypatch):
     monkeypatch.setattr(pki, "tfa_secrets", lambda: {"alice": "3132333435363738393031323334353637383930"})
     uri = pki.tfa_uri("alice")
     assert uri.startswith("otpauth://totp/OpenVPN:alice?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ")
-    svg = pki.tfa_qr_svg(uri)
+    svg = pki.qr_svg(uri)
     assert "<svg" in svg and "path" in svg and "xmlns" in svg
 
 

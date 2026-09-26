@@ -39,7 +39,7 @@ def verify_password(password: str, stored: str) -> bool:
         return False
 
 
-def _token_hash(token: str) -> str:
+def token_hash(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
 
@@ -49,7 +49,7 @@ def create_session(db: Database, user_id: int, ttl: int, ip: str | None, user_ag
     now = int(time.time())
     db.execute(
         "INSERT INTO web_sessions (token_hash, user_id, created_at, expires_at, ip, user_agent) VALUES (?, ?, ?, ?, ?, ?)",
-        (_token_hash(token), user_id, now, now + ttl, ip, (user_agent or "")[:200]),
+        (token_hash(token), user_id, now, now + ttl, ip, (user_agent or "")[:200]),
     )
     return token
 
@@ -61,7 +61,7 @@ def get_session_user(db: Database, token: str | None, ttl: int) -> dict | None:
     row = db.one(
         """SELECT s.token_hash, s.expires_at, u.id, u.username FROM web_sessions s
            JOIN users u ON u.id = s.user_id WHERE s.token_hash = ?""",
-        (_token_hash(token),),
+        (token_hash(token),),
     )
     if row is None or row["expires_at"] < now:
         return None
@@ -73,12 +73,12 @@ def get_session_user(db: Database, token: str | None, ttl: int) -> dict | None:
 
 def delete_session(db: Database, token: str | None) -> None:
     if token:
-        db.execute("DELETE FROM web_sessions WHERE token_hash = ?", (_token_hash(token),))
+        db.execute("DELETE FROM web_sessions WHERE token_hash = ?", (token_hash(token),))
 
 
 def delete_user_sessions(db: Database, user_id: int, keep_token: str | None = None) -> None:
     if keep_token:
-        db.execute("DELETE FROM web_sessions WHERE user_id = ? AND token_hash != ?", (user_id, _token_hash(keep_token)))
+        db.execute("DELETE FROM web_sessions WHERE user_id = ? AND token_hash != ?", (user_id, token_hash(keep_token)))
     else:
         db.execute("DELETE FROM web_sessions WHERE user_id = ?", (user_id,))
 

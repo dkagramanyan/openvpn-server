@@ -36,7 +36,7 @@ log "OpenVPN $(openvpn --version | head -1 | awk '{print $2}'), easy-rsa $(grep 
 log "OpenVPN dir: $OPENVPN_DIR  PKI: $PKI_DIR"
 
 [[ -f $SERVER_CONF ]] || die "$SERVER_CONF not found. Mount the repository at $OPENVPN_DIR."
-mkdir -p "$PKI_DIR" "$LOG_DIR" "$OPENVPN_DIR"/{clients,config,staticclients,db}
+mkdir -p "$PKI_DIR" "$LOG_DIR" "$OPENVPN_DIR"/{clients,config,staticclients,guests,db}
 
 # --------------------------------------------------------------------------
 # 1. PKI
@@ -65,6 +65,12 @@ if [[ ! -f $PKI_DIR/ca.crt ]]; then
     easyrsa --req-cn=server build-server-full server nopass
 else
     log "PKI already initialised"
+fi
+
+# Per-client control channel keys (tls-crypt-v2, switched on the Server page).
+if grep -qE '^[[:space:]]*tls-crypt-v2[[:space:]]' "$SERVER_CONF" && [[ ! -f $PKI_DIR/tc2-server.key ]]; then
+    log "Generating tls-crypt-v2 server key"
+    openvpn --genkey tls-crypt-v2-server "$PKI_DIR/tc2-server.key"
 fi
 
 if [[ ! -f $PKI_DIR/ta.key ]]; then
@@ -109,8 +115,8 @@ chmod 600 "$MGMT_PW_FILE"
 # Files OpenVPN reads *after* dropping privileges to nobody must be readable.
 chmod 644 "$PKI_DIR/crl.pem" "$PKI_DIR/ca.crt" 2>/dev/null || true
 chmod 600 "$PKI_DIR/private/"*.key 2>/dev/null || true
-chmod 755 "$PKI_DIR" "$OPENVPN_DIR/staticclients"
-chmod 644 "$OPENVPN_DIR/staticclients/"* 2>/dev/null || true
+chmod 755 "$PKI_DIR" "$OPENVPN_DIR/staticclients" "$OPENVPN_DIR/guests"
+chmod 644 "$OPENVPN_DIR/staticclients/"* "$OPENVPN_DIR/guests/"* 2>/dev/null || true
 [[ -f $OPENVPN_DIR/clients/oath.secrets ]] && chmod 644 "$OPENVPN_DIR/clients/oath.secrets"
 # The 2FA verify script runs as nobody and appends to this log.
 touch "$LOG_DIR/oath.log" && chown nobody "$LOG_DIR/oath.log" && chmod 644 "$LOG_DIR/oath.log"
@@ -152,7 +158,8 @@ iptables -t nat -A OVPN-NAT -s "$TRUST_SUB" -o "$egress" -j MASQUERADE   # guest
 
 # Guests: the pushed DNS servers and the internet, nothing else - no LAN, no
 # private ranges, no other VPN clients, no ping, and nothing on this host.
-for dns in $(sed -n 's/^[[:space:]]*push[[:space:]]\+"dhcp-option DNS \([0-9.]\+\)".*/\1/p' "$SERVER_CONF"); do
+for dns in $(sed -n -e 's/^[[:space:]]*push[[:space:]]\+"dhcp-option DNS \([0-9.]\+\)".*/\1/p' \
+                    -e 's/^[[:space:]]*push[[:space:]]\+"dns server [0-9]\+ address \([0-9.]\+\)".*/\1/p' "$SERVER_CONF" | sort -u); do
     for p in udp tcp; do iptables -A OVPN-FORWARD -s "$GUEST_SUB" -d "$dns" -p $p --dport 53 -j ACCEPT; done
 done
 iptables -A OVPN-FORWARD -s "$GUEST_SUB" -p icmp --icmp-type echo-request -j DROP
@@ -230,9 +237,23 @@ clean_stale_dco() {
     done
 }
 
+# Per-device addresses (bin/client-access.sh): the guest range and netmask for
+# the script, and an empty lease directory, since no client is connected yet.
+ip2int() { local IFS=.; set -- $1; echo $(( ($1 << 24) + ($2 << 16) + ($3 << 8) + $4 )); }
+int2ip() { echo "$(( $1 >> 24 & 255 )).$(( $1 >> 16 & 255 )).$(( $1 >> 8 & 255 )).$(( $1 & 255 ))"; }
+prepare_access() {
+    local net=$(ip2int "${GUEST_SUB%/*}") size=$(( 1 << (32 - ${GUEST_SUB#*/}) ))
+    local mask=$(sed -n 's/^[[:space:]]*server[[:space:]]\+[0-9.]\+[[:space:]]\+\([0-9.]\+\).*/\1/p' "$SERVER_CONF" | head -1)
+    printf 'GUEST_FIRST=%s\nGUEST_LAST=%s\nNETMASK=%s\n' \
+        "$(int2ip $(( net + 1 )))" "$(int2ip $(( net + size - 2 )))" "${mask:-255.255.255.0}" > /tmp/openvpn-access.env
+    rm -rf /tmp/openvpn-leases
+    install -d -o nobody -m 700 /tmp/openvpn-leases
+}
+
 while :; do
     rotate_log
     clean_stale_dco
+    prepare_access
     log "Starting OpenVPN"
     /usr/sbin/openvpn --cd "$OPENVPN_DIR" --script-security 2 --config "$SERVER_CONF" &
     OVPN_PID=$!

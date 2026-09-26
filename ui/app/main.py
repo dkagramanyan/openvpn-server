@@ -34,15 +34,17 @@ RANGES = {"today": None, "24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400, "90d"
 db = Database(settings.db_path)
 _mgmt_host, _mgmt_port, _ = settings.management_endpoint()
 mgmt = Management(_mgmt_host, _mgmt_port, settings.management_password())
-collector = Collector(db, mgmt, settings.poll_interval, settings.status_file)
+collector = Collector(db, mgmt, settings.poll_interval, settings.status_file,
+                      (settings.log_dir / "openvpn.log", settings.log_dir / "oath.log"))
 maintenance = Maintenance(db, [lambda: pki.ensure_crl_fresh()])
 limiter = auth.LoginLimiter()
 
 
 # -- startup ---------------------------------------------------------------------
 def bootstrap() -> None:
-    for d in (settings.clients_dir, settings.static_dir, settings.db_path.parent):
+    for d in (settings.clients_dir, settings.static_dir, settings.guests_dir, settings.db_path.parent):
         d.mkdir(parents=True, exist_ok=True)
+    migrate()
     if db.one("SELECT 1 FROM users LIMIT 1") is None:
         password = settings.admin_password or secrets.token_urlsafe(12)
         db.execute("INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)",
@@ -63,6 +65,21 @@ def bootstrap() -> None:
             log.info("client profiles now list every protocol OpenVPN listens on")
     except PkiError as exc:
         log.error("cannot update the client profiles' address: %s", exc)
+
+
+def migrate() -> None:
+    """One-time data fixes for databases and client files from earlier releases."""
+    db.purge_client("UNDEF")          # handshakes in progress that 1.3 recorded as sessions
+    moved = pki.migrate_guest_static_ips()
+    if moved:
+        log.info("guests now get an address per device: %s", ", ".join(moved))
+    if db.get_setting("migration:identities") != "1":
+        # Up to 1.3 a client created again under an old name inherited the old history.
+        for name in pki.list_clients(set()):
+            start = pki.identity_start(name)
+            if start and db.archive_client_history(name, before=start):
+                log.info("history of an earlier '%s' archived", name)
+        db.set_setting("migration:identities", "1")
 
 
 @asynccontextmanager
@@ -93,7 +110,7 @@ async def security_headers(request: Request, call_next):
     h.setdefault("Content-Security-Policy",
                  "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; "
                  "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
-    if request.url.path.startswith("/api/"):
+    if request.url.path.startswith(("/api/", "/p/")):
         h["Cache-Control"] = "no-store"
     return response
 
@@ -194,6 +211,18 @@ class TfaEnforceBody(BaseModel):
     enforced: bool
 
 
+class AccessBody(BaseModel):
+    guest: bool
+
+
+class ShareBody(BaseModel):
+    hours: int = Field(default=24, ge=1, le=24 * 30)
+
+
+class ControlChannelBody(BaseModel):
+    per_client: bool
+
+
 class RemoteBody(BaseModel):
     host: str = Field(min_length=1, max_length=253)
     ports: dict[str, int] = {}          # public port per protocol, e.g. {"udp": 1197, "tcp": 1196}
@@ -237,6 +266,7 @@ def clients_payload(range_name: str, tz: int) -> list[dict[str, Any]]:
     start, end = range_bounds(range_name, tz)
     certs = pki.list_clients(hidden_serials())
     statics = pki.static_ips()
+    guests = pki.guests()
     tfa = pki.tfa_secrets()
     live = collector.snapshot()
     online: dict[str, list[dict[str, Any]]] = {}
@@ -260,7 +290,7 @@ def clients_payload(range_name: str, tz: int) -> list[dict[str, Any]]:
             "expires": cert["not_after"],
             "days_left": (cert["not_after"] - now) // 86400 if cert["not_after"] else None,
             "static_ip": statics.get(name),
-            "guest": pki.is_guest(statics.get(name)),
+            "guest": name in guests,
             "tfa": name in tfa,
             "online": bool(online.get(name)),
             "sessions_live": online.get(name, []),
@@ -281,6 +311,10 @@ def find_client(name: str) -> dict[str, Any]:
         if row["name"] == name:
             return row
     raise HTTPException(404, "Client not found")
+
+
+def drop_share_links(name: str) -> None:
+    db.execute("DELETE FROM share_tokens WHERE client_name = ?", (name,))
 
 
 def event(kind: str, user: dict[str, Any] | None, client: str | None = None, detail: str | None = None) -> None:
@@ -401,6 +435,7 @@ def overview(range: str = "today", tz: int = 0, user: dict[str, Any] = Authed):
         "counts": counts,
         "warnings": warnings,
         "tfa_enforced": pki.tfa_enforced(),
+        "rejections": db.rejections(now - 86400),
     }
 
 
@@ -439,19 +474,23 @@ def create_client(body: NewClientBody, user: dict[str, Any] = Authed):
     if existing and existing["cert"]["state"] == "expired":
         raise HTTPException(409, "This client's certificate has expired - renew it on the client's page")
     static_ip = (body.static_ip or "").strip() or None
-    if body.guest:
-        static_ip = static_ip or pki.next_guest_ip(name)
-        if not pki.is_guest(static_ip):
-            raise HTTPException(400, f"A guest needs an address from the guest range {settings.guest_sub}")
-    elif static_ip and pki.is_guest(static_ip):
-        raise HTTPException(400, f"{static_ip} is in the guest range - choose Guest or another address")
+    if body.guest and static_ip:
+        raise HTTPException(400, "Guests get an address from the guest range for each device, not a static IP")
     pki.create_client(name, body.days, body.passphrase or None, static_ip)
+    # A new certificate is a new client: history, access and 2FA of an earlier one with this name stay behind.
+    db.archive_client_history(name)
+    drop_share_links(name)
+    pki.set_guest(name, body.guest)
+    if not static_ip:
+        pki.set_static_ip(name, None)
     db.execute("INSERT INTO clients (name, note, created_at) VALUES (?, ?, ?) "
-               "ON CONFLICT(name) DO UPDATE SET note = excluded.note",
+               "ON CONFLICT(name) DO UPDATE SET note = excluded.note, created_at = excluded.created_at",
                (name, body.note.strip(), int(time.time())))
     tfa_uri = None
     if body.tfa:
         tfa_uri = pki.enable_tfa(name)
+    elif name in pki.tfa_secrets():
+        pki.disable_tfa(name)
     event("client_created", user, name, f"static_ip={static_ip or '-'} guest={body.guest} tfa={body.tfa}")
     return {"client": find_client(name), "tfa_uri": tfa_uri}
 
@@ -466,6 +505,7 @@ def client_detail(name: str, tz: int = 0, user: dict[str, Any] = Authed):
     row["sessions"] = [dict(s) for s in sessions]
     row["daily"] = fill_series(db.series(start, now + 1, 86400, name, tz), start, now + 1, 86400, tz)
     row["tfa_uri"] = pki.tfa_uri(name) if row["tfa"] else None
+    row["rejections"] = db.rejections(now - 30 * 86400, name)
     return row
 
 
@@ -486,7 +526,7 @@ def tfa_qr(name: str, user: dict[str, Any] = Authed):
     uri = pki.tfa_uri(name)
     if not uri:
         raise HTTPException(404, "2FA is not enabled for this client")
-    return Response(pki.tfa_qr_svg(uri), media_type="image/svg+xml", headers={"Cache-Control": "no-store"})
+    return Response(pki.qr_svg(uri), media_type="image/svg+xml", headers={"Cache-Control": "no-store"})
 
 
 @app.post("/api/clients/{name}/tfa", dependencies=[Csrf])
@@ -507,6 +547,7 @@ def revoke(name: str, body: ReasonBody, user: dict[str, Any] = Authed):
     if row["state"] == "revoked":
         raise HTTPException(400, "Already revoked")
     pki.revoke_client(name, body.reason or None)
+    drop_share_links(name)
     killed = ""
     try:
         killed = mgmt.kill(name)
@@ -543,6 +584,7 @@ def delete_client(name: str, user: dict[str, Any] = Authed):
     if row["state"] != "revoked":
         raise HTTPException(400, "Revoke the certificate before deleting the client")
     pki.remove_client(name)
+    drop_share_links(name)
     serials = [row["cert"]["serial"]] + [h["serial"] for h in row["history"]]
     with db.tx() as conn:
         for serial in serials:
@@ -568,6 +610,54 @@ def static_ip(name: str, body: StaticIpBody, user: dict[str, Any] = Authed):
     pki.set_static_ip(name, ip)
     event("static_ip_set", user, name, ip or "removed")
     return {"static_ip": ip, "note": "Applies the next time the client connects"}
+
+
+@app.put("/api/clients/{name}/access", dependencies=[Csrf])
+def set_access(name: str, body: AccessBody, user: dict[str, Any] = Authed):
+    find_client(name)
+    pki.set_guest(name, body.guest)
+    event("access_changed", user, name, "guest" if body.guest else "full")
+    return {"guest": body.guest, "note": "Applies the next time a device connects"}
+
+
+@app.post("/api/clients/{name}/share", dependencies=[Csrf])
+def share_profile(name: str, body: ShareBody, request: Request, user: dict[str, Any] = Authed):
+    """A one-time download link for the profile, also as openvpn://import-profile/ link and QR code."""
+    row = find_client(name)
+    if row["state"] != "valid":
+        raise HTTPException(400, "Only a client with a valid certificate can be shared")
+    token = secrets.token_urlsafe(24)
+    now = int(time.time())
+    db.execute("INSERT INTO share_tokens (token_hash, client_name, created_at, expires_at, created_by) "
+               "VALUES (?, ?, ?, ?, ?)", (auth.token_hash(token), name, now, now + body.hours * 3600, user["username"]))
+    base = settings.profile_base_url or str(request.base_url).rstrip("/")
+    url = f"{base}/p/{token}"
+    event("profile_link_created", user, name, f"valid {body.hours} h")
+    return {"url": url, "import_url": "openvpn://import-profile/" + url, "expires_at": now + body.hours * 3600,
+            "public": bool(settings.profile_base_url),
+            "qr_svg": pki.qr_svg("openvpn://import-profile/" + url)}
+
+
+@app.get("/p/{token}")
+def shared_profile(token: str, request: Request):
+    """Public: the profile behind a one-time link. The only route meant to be exposed by a proxy."""
+    ip = client_ip(request)
+    wait = limiter.retry_after(f"share|{ip}")
+    if wait:
+        raise HTTPException(429, f"Too many attempts, try again in {wait}s", headers={"Retry-After": str(wait)})
+    now = int(time.time())
+    with db.tx() as conn:
+        row = conn.execute("SELECT client_name FROM share_tokens WHERE token_hash = ? AND used_at IS NULL "
+                           "AND expires_at > ?", (auth.token_hash(token), now)).fetchone()
+        if row is not None:
+            conn.execute("UPDATE share_tokens SET used_at = ? WHERE token_hash = ?", (now, auth.token_hash(token)))
+    if row is None or not (settings.pki_dir / "issued" / f"{row['client_name']}.crt").exists():
+        limiter.record_failure(f"share|{ip}")
+        raise HTTPException(404, "This link is invalid, expired or already used")
+    name = row["client_name"]
+    db.add_event("profile_link_used", name, None, ip)
+    return PlainTextResponse(pki.build_profile(name), media_type="application/x-openvpn-profile",
+                             headers={"Content-Disposition": f'attachment; filename="{name}.ovpn"'})
 
 
 @app.put("/api/clients/{name}/note", dependencies=[Csrf])
@@ -621,6 +711,7 @@ def server_info(user: dict[str, Any] = Authed):
         "live": live,
         "pki": pki.pki_status(),
         "tfa_enforced": pki.tfa_enforced(),
+        "control_channel": pki.control_channel(),
         "remote": pki.get_remote(),
         "listen": pki.server_listen(),
         "config_mtime": mtime,
@@ -676,6 +767,13 @@ def enforce_tfa(body: TfaEnforceBody, user: dict[str, Any] = Authed):
     pki.regenerate_profiles()
     event("tfa_enforced" if body.enforced else "tfa_unenforced", user)
     return {"enforced": body.enforced, "restart_required": True}
+
+
+@app.put("/api/server/control-channel", dependencies=[Csrf])
+def control_channel(body: ControlChannelBody, user: dict[str, Any] = Authed):
+    pki.set_control_channel(body.per_client)
+    event("control_channel_changed", user, None, pki.control_channel())
+    return {"control_channel": pki.control_channel(), "restart_required": True}
 
 
 @app.get("/api/events")

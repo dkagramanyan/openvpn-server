@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import ipaddress
 import os
@@ -216,28 +217,55 @@ def static_ip_problem(name: str, ip: str) -> str | None:
             return f"{ip} is not a client address in the VPN subnet {net}"
         if first <= int(addr) <= last:
             return (f"{ip} is in the dynamic pool {ipaddress.IPv4Address(first)}-{ipaddress.IPv4Address(last)}; "
-                    f"use a free address outside it (guests: {settings.guest_sub})")
+                    "use a free address outside it")
+    if in_guest_range(ip):
+        return f"{ip} is in the guest range {settings.guest_sub}, where guests get their addresses"
     other = next((n for n, a in static_ips().items() if a == ip and n != name), None)
     return f"{ip} is already assigned to {other}" if other else None
 
 
-def is_guest(ip: str | None) -> bool:
+def in_guest_range(ip: str | None) -> bool:
     try:
         return bool(ip) and ipaddress.IPv4Address(ip) in ipaddress.IPv4Network(settings.guest_sub, strict=False)
     except ValueError:
         return False
 
 
-def next_guest_ip(name: str) -> str:
-    """The first guest address OpenVPN can hand out to <name>."""
-    for addr in ipaddress.IPv4Network(settings.guest_sub, strict=False).hosts():
-        if not static_ip_problem(name, str(addr)):
-            return str(addr)
-    raise PkiError(f"No free address left in the guest range {settings.guest_sub}")
+# -- guests ------------------------------------------------------------------------
+# A guest is a file guests/<name>. bin/client-access.sh gives each of its devices
+# a free address from the guest range, which the firewall limits to internet + DNS.
+def guests() -> set[str]:
+    try:
+        return {f.name for f in settings.guests_dir.iterdir() if f.is_file() and NAME_RE.match(f.name)}
+    except OSError:
+        return set()
+
+
+def set_guest(name: str, guest: bool) -> None:
+    validate_name(name)
+    marker = settings.guests_dir / name
+    if guest:
+        (settings.static_dir / name).unlink(missing_ok=True)    # guests get addresses per device
+        settings.guests_dir.mkdir(parents=True, exist_ok=True)
+        marker.touch()
+        marker.chmod(0o644)
+    else:
+        marker.unlink(missing_ok=True)
+
+
+def migrate_guest_static_ips() -> list[str]:
+    """Up to 1.3, a guest was a static IP in the guest range. Turn those into guest markers."""
+    moved = [n for n, ip in static_ips().items() if in_guest_range(ip) and NAME_RE.match(n)]
+    for name in moved:
+        set_guest(name, True)
+    return moved
 
 
 def set_static_ip(name: str, ip: str | None) -> None:
     validate_name(name)
+    if ip and name in guests():
+        raise PkiError("Guests get an address from the guest range for each device; make the client "
+                       "a full-access one to give it a static IP")
     path = settings.static_dir / name
     if not ip:
         path.unlink(missing_ok=True)
@@ -275,7 +303,7 @@ def tfa_uri(name: str) -> str | None:
     return f"otpauth://totp/{issuer}:{name}?secret={b32}&issuer={issuer}&algorithm=SHA1&digits=6&period=30"
 
 
-def tfa_qr_svg(uri: str) -> str:
+def qr_svg(uri: str) -> str:
     buf = io.BytesIO()
     segno.make(uri, error="m").save(buf, kind="svg", scale=5, dark="#0b0b0b", light=None, xmldecl=True, svgns=True)
     return buf.getvalue().decode()
@@ -361,6 +389,32 @@ def list_clients(hidden_serials: set[str]) -> dict[str, dict[str, Any]]:
     for c in clients.values():
         c["history"].sort(key=lambda x: x.get("not_before") or 0, reverse=True)
     return clients
+
+
+def identity_start(name: str) -> int | None:
+    """When the current client <name> began: the earliest certificate with the same public key.
+    A renewal keeps the key, so it continues the client; a certificate created again under the
+    same name has a new key and starts a new one."""
+    def pubkey(path: Path) -> str:
+        try:
+            return hashlib.sha256(openssl("x509", "-in", str(path), "-noout", "-pubkey").encode()).hexdigest()
+        except PkiError:
+            return ""
+    current = settings.pki_dir / "issued" / f"{name}.crt"
+    info = cert_info(current)
+    if not info or not info.get("not_before"):
+        return None
+    key, start = pubkey(current), info["not_before"]
+    others = [settings.pki_dir / "renewed" / "issued" / f"{name}.crt"]
+    try:
+        others += list((settings.pki_dir / "revoked" / "certs_by_serial").glob("*.crt"))
+    except OSError:
+        pass
+    for path in others:
+        other = cert_info(path)
+        if other and other["cn"] == name and other.get("not_before") and pubkey(path) == key:
+            start = min(start, other["not_before"])
+    return start
 
 
 # -- client operations -------------------------------------------------------------
@@ -514,6 +568,24 @@ def regenerate_profiles() -> list[str]:
         except PkiError:
             failed.append(name)
     return failed
+
+
+def control_channel() -> str:
+    """How server.conf protects the control channel: tls-crypt-v2, tls-crypt or tls-auth."""
+    m = re.search(r"^\s*(tls-crypt-v2|tls-crypt|tls-auth)\s", read_config("server"), re.M)
+    return m.group(1) if m else "none"
+
+
+def set_control_channel(per_client: bool) -> None:
+    """Switch between one shared tls-crypt key and a tls-crypt-v2 key per client. Every profile
+    changes, so clients need their profile again, and OpenVPN a restart."""
+    key = settings.pki_dir / "tc2-server.key"
+    if per_client and not key.exists():
+        _run(["openvpn", "--genkey", "tls-crypt-v2-server", str(key)])
+    line = "tls-crypt-v2 pki/tc2-server.key" if per_client else "tls-crypt pki/ta.key"
+    text = re.sub(r"(?m)^\s*(tls-crypt-v2|tls-crypt|tls-auth)\s.*$", line, read_config("server"), count=1)
+    write_config("server", text)
+    regenerate_profiles()
 
 
 def tfa_enforced() -> bool:

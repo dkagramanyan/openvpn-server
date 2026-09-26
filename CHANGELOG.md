@@ -1,5 +1,50 @@
 # Changelog
 
+## 1.4.0 - 2026-09-27
+
+### Added
+* **One certificate on several devices**, each with its own address:
+  `bin/client-access.sh` (client-connect) gives every device of a guest a free
+  address from the guest range, and a static IP to the first device only.
+  Guests are now a marker (`guests/<name>`) instead of a static IP; 1.3 guests
+  are converted on start. Pool `10.0.70.2-99`, static IPs `10.0.70.100-127`.
+* **Full access / Guest switch** on the client page.
+* **One-time profile links** (Share link): a link valid once, for 1 h to 7 days,
+  with a QR code of its `openvpn://import-profile/` form for OpenVPN Connect.
+  Only `/p/` has to be public (`OVPN_PROFILE_BASE_URL`).
+* **Rejected connection attempts** (revoked or expired certificate, unknown
+  control channel key, wrong 2FA code) read from the logs, on the dashboard
+  (24 h) and the client page (30 days).
+* **Control channel key per client** (`tls-crypt-v2`), switched on the Server
+  page. Off by default: the shared key and all current profiles keep working
+  until you switch.
+* DNS is also pushed as `dns server` (OpenVPN 2.6+, Connect 3).
+* IPv6 no longer leaks around the tunnel: it is routed into it (private
+  `fd00:70::/64`) and answered there with "no route" (`block-ipv6`). Verified
+  with a client that has IPv6: before, public IPv6 left through its own link.
+
+### Fixed
+* Sessions named `UNDEF`: OpenVPN lists connections still in the TLS
+  handshake without a name; they are no longer recorded, and old rows are
+  removed.
+* A client created again under an earlier name inherited that name's history.
+  History now belongs to a certificate: a new certificate starts a new one, the
+  old one stays as "name (earlier)", and renewals keep it. Data merged by
+  earlier releases is split once, by the certificates' public keys.
+* A client created again under an earlier name also inherited its static IP,
+  guest access and 2FA secret.
+* The "`duplicate-cn` and `client-config-dir`" warning: static IPs are applied
+  by the connect script now.
+
+### Upgrade notes
+* Existing certificates and profiles keep working; nothing has to be handed
+  out again unless you switch to per-client keys on the Server page.
+* `server.conf` changed (`client-connect`, pool `10.0.70.2-99`, IPv6 lines,
+  `dns` push). If you edited it on the server: `git stash && git pull &&
+  git stash pop`, then `docker compose up -d --build`.
+* A static IP inside the new pool (`10.0.70.2-99`) is listed on the dashboard;
+  move it to `10.0.70.100-127`.
+
 ## 1.3.1 - 2026-09-26
 
 ### Fixed

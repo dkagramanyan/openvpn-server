@@ -437,7 +437,8 @@ function dashboardView(el) {
         h('div', { class: 'grid kpi', id: 'kpi' }),
         h('div', { class: 'grid two' }, card('Throughput · last 60 minutes', hourEl), card('Top clients · ' + rl, h('div', { id: 'top' }))),
         card('Traffic · ' + rl, rangeEl),
-        card('Connected clients', liveTable));
+        card('Connected clients', liveTable),
+        h('div', { id: 'rej' }));
       hourChart = lineChart(hourEl, hourOpts); rangeChart = lineChart(rangeEl, rangeOpts);
     } else { hourChart.update(hourOpts); rangeChart.update(rangeOpts); body.querySelectorAll('.card-h h2').forEach(x => { if (x.textContent.startsWith('Top clients')) x.textContent = 'Top clients · ' + rl; if (x.textContent.startsWith('Traffic ·')) x.textContent = 'Traffic · ' + rl; }); }
     $('#warnings', body).replaceChildren(warnings(data.warnings) || '');
@@ -446,8 +447,9 @@ function dashboardView(el) {
       tile('Download · ' + rl, fmtBytes(t.bytes_out), `${fmtNum(t.sessions)} session${t.sessions === 1 ? '' : 's'} · ${t.clients} client${t.clients === 1 ? '' : 's'}`, sparkline(dl.slice(-24))),
       tile('Upload · ' + rl, fmtBytes(t.bytes_in), 'from clients to the server', sparkline(ul.slice(-24))),
       throughputTile);
-    $('#top', body).replaceChildren(bars(data.top.map(c => ({ label: c.name, value: c.bytes_in + c.bytes_out, href: '#/clients/' + encodeURIComponent(c.name), title: `↓ ${fmtBytes(c.bytes_out)} · ↑ ${fmtBytes(c.bytes_in)}` }))));
+    $('#top', body).replaceChildren(bars(data.top.map(c => ({ label: clientLabel(c.name), value: c.bytes_in + c.bytes_out, href: c.name.includes('#') ? null : '#/clients/' + encodeURIComponent(c.name), title: `↓ ${fmtBytes(c.bytes_out)} · ↑ ${fmtBytes(c.bytes_in)}` }))));
     renderLiveTable(live);
+    $('#rej', body).replaceChildren(data.rejections.length ? card('Rejected connection attempts · last 24 h', rejectionsTable(data.rejections, true)) : '');
     body.classList.remove('loading');
   }
   load();
@@ -486,7 +488,7 @@ function clientsView(el) {
       h('thead', null, h('tr', null, th('Name', 'name'), th('Status'), th('Expires', 'expires'), th('Last seen', 'seen'), th('Download', 'dl', 'r'), th('Upload', 'ul', 'r'), th('Sessions', 'sessions', 'r'), h('th', null))),
       h('tbody', null, list.map(c => h('tr', { class: 'clickable', onClick: e => { if (!e.target.closest('button,a')) go('#/clients/' + encodeURIComponent(c.name)); } },
         h('td', { class: 'name-cell' }, c.name, c.note ? h('span', { class: 'sub' }, c.note) : null),
-        h('td', null, h('div', { class: 'row', style: 'gap:6px' }, stateBadge(c), c.tfa ? h('span', { class: 'badge plain', title: 'Two-factor authentication enabled' }, '2FA') : null, c.static_ip ? h('span', { class: 'subnet', title: c.guest ? 'Guest: internet only' : 'Static IP' }, (c.guest ? 'guest ' : '') + c.static_ip) : null, c.previous ? h('span', { class: 'badge plain expiring', title: 'Previous certificate still valid' }, 'renewed') : null)),
+        h('td', null, h('div', { class: 'row', style: 'gap:6px' }, stateBadge(c), c.tfa ? h('span', { class: 'badge plain', title: 'Two-factor authentication enabled' }, '2FA') : null, c.guest ? h('span', { class: 'subnet', title: 'Guest: internet and DNS only' }, 'guest') : c.static_ip ? h('span', { class: 'subnet', title: 'Static IP' }, c.static_ip) : null, c.previous ? h('span', { class: 'badge plain expiring', title: 'Previous certificate still valid' }, 'renewed') : null)),
         h('td', { class: 'num' }, c.expires ? [fmtDate(c.expires), h('span', { class: 'muted small' }, ' · ' + fmtDays(c.days_left))] : '—'),
         h('td', null, c.online ? h('span', { class: 'ink2' }, 'now') : fmtAgo(c.total.last_seen)),
         h('td', { class: 'r num' }, fmtBytes(c.traffic.bytes_out)), h('td', { class: 'r num' }, fmtBytes(c.traffic.bytes_in)),
@@ -514,7 +516,9 @@ function newClientDialog(after) {
     guest = g;
     access.querySelectorAll('button').forEach((b, i) => b.classList.toggle('active', (i === 1) === g));
     accessHelp.textContent = g ? 'Internet and DNS only - no access to your LAN, this server or other VPN clients.' : 'Internet, your LAN and this server.';
-    ip.placeholder = g ? `automatic, from ${state.user.guest_sub}` : 'optional - dynamic if empty';
+    ip.disabled = g;
+    if (g) ip.value = '';
+    ip.placeholder = g ? 'a free guest address per device' : 'optional - dynamic if empty';
   };
   access.append(h('button', { type: 'button', onClick: () => setAccess(false) }, 'Full access'), h('button', { type: 'button', onClick: () => setAccess(true) }, 'Guest'));
   setAccess(false);
@@ -561,7 +565,7 @@ function clientDetailView(el) {
   async function load() {
     body.classList.add('loading');
     try { c = await api(`/api/clients/${enc}?tz=${TZ}`); } catch (e) { toast(e.message, 'err'); body.replaceChildren(h('div', { class: 'empty' }, e.message)); return; }
-    setChildren(badges, stateBadge(c), c.tfa ? h('span', { class: 'badge plain' }, '2FA') : null, c.static_ip ? h('span', { class: 'subnet' }, (c.guest ? 'guest ' : 'static ') + c.static_ip) : null, c.previous ? h('span', { class: 'badge plain expiring' }, 'renewed · previous cert still valid') : null);
+    setChildren(badges, stateBadge(c), c.tfa ? h('span', { class: 'badge plain' }, '2FA') : null, c.guest ? h('span', { class: 'subnet' }, 'guest') : c.static_ip ? h('span', { class: 'subnet' }, 'static ' + c.static_ip) : null, c.previous ? h('span', { class: 'badge plain expiring' }, 'renewed · previous cert still valid') : null);
     setChildren(actions, 
       c.state === 'valid' ? h('a', { class: 'btn primary', href: `/api/clients/${enc}/ovpn`, download: name + '.ovpn' }, icon('download'), 'Download profile') : null,
       c.online ? act('Disconnect', async () => { if (await confirmDialog('Disconnect', `Disconnect all sessions of ${name}?`, 'Disconnect', true)) { await withToast(api(`/api/clients/${enc}/disconnect`, { method: 'POST', body: {} }), 'Disconnected'); } }) : null,
@@ -571,13 +575,21 @@ function clientDetailView(el) {
           const r = await withToast(api(`/api/clients/${enc}/tfa`, { method: 'POST', body: { enabled: true } }), '2FA enabled'); tfaDialog(name, r.tfa_uri); load();
         } }) : null,
       c.state === 'valid' && c.tfa ? act('Disable 2FA', async () => { if (await confirmDialog('Disable 2FA', `Remove the TOTP secret of ${name}?`, 'Disable', true)) { await withToast(api(`/api/clients/${enc}/tfa`, { method: 'POST', body: { enabled: false } }), '2FA disabled'); load(); } }) : null,
-      c.state === 'valid' ? act('Static IP', () => staticIpDialog(c, load)) : null,
+      c.state === 'valid' ? act('Share link', () => shareDialog(name)) : null,
+      c.state === 'valid' && !c.guest ? act('Static IP', () => staticIpDialog(c, load)) : null,
       c.state !== 'revoked' && !c.previous ? act('Renew', async () => { if (await confirmDialog('Renew certificate', 'A new certificate is issued for the same key. The previous certificate stays valid until you revoke it, so the client keeps working while you deliver the new profile.', 'Renew')) { await withToast(api(`/api/clients/${enc}/renew`, { method: 'POST', body: {} }), 'Certificate renewed'); load(); } }) : null,
       c.previous ? act('Revoke previous cert', async () => { if (await confirmDialog('Revoke previous certificate', 'The old certificate will be added to the CRL. Make sure the client already uses the new profile.', 'Revoke', true)) { await withToast(api(`/api/clients/${enc}/revoke-previous`, { method: 'POST' }), 'Previous certificate revoked'); load(); } }, 'danger') : null,
       c.state !== 'revoked' ? act('Revoke', async () => { if (await confirmDialog('Revoke certificate', `${name} will be disconnected and can no longer connect. This cannot be undone.`, 'Revoke', true)) { await withToast(api(`/api/clients/${enc}/revoke`, { method: 'POST', body: {} }), 'Certificate revoked'); load(); } }, 'danger') : null,
       c.state === 'revoked' ? act('Delete', async () => { if (await confirmDialog('Delete client', `Remove the profile, static IP and 2FA data of ${name}? Traffic history is kept.`, 'Delete', true)) { await withToast(api(`/api/clients/${enc}`, { method: 'DELETE' }), 'Client deleted'); go('#/clients'); } }, 'danger') : null);
 
     const cert = c.cert, t = c.total;
+    const accessSeg = h('div', { class: 'seg', role: 'group', 'aria-label': 'Access' }, [['Full access', false], ['Guest', true]].map(([label, g]) =>
+      h('button', { class: c.guest === g ? 'active' : '', disabled: c.state !== 'valid', onClick: async () => {
+        if (c.guest === g) return;
+        const text = g ? `${name} will reach only the internet and DNS: not your LAN, this server or other VPN clients.` : `${name} will reach your LAN and this server.`;
+        if (await confirmDialog(g ? 'Make guest' : 'Give full access', text + ' Applies the next time a device connects.', g ? 'Make guest' : 'Give full access')) {
+          await withToast(api(`/api/clients/${enc}/access`, { method: 'PUT', body: { guest: g } }), 'Access changed'); load();
+        } } }, label)));
     const kv = (pairs) => h('dl', { class: 'kv' }, pairs.map(([k, v]) => [h('dt', null, k), h('dd', null, v)]));
     const dailyEl = h('div');
     const noteIn = h('textarea', { class: 'input', style: 'min-height:60px', placeholder: 'Notes about this client…' }, c.note || '');
@@ -598,16 +610,45 @@ function clientDetailView(el) {
             ['Fingerprint', h('span', { class: 'mono small' }, cert.fingerprint)],
             c.previous ? ['Previous cert', h('span', null, `serial ${c.previous.serial.slice(0, 16)}… valid until ${fmtDate(c.previous.not_after)} - revoke it once the new profile is deployed`)] : null,
             c.history.length ? ['History', `${c.history.length} revoked certificate${c.history.length > 1 ? 's' : ''}`] : null,
-            ['Static IP', c.static_ip ? c.static_ip + (c.guest ? ' · guest, internet only' : '') : 'dynamic (trusted)'],
+            ['Access', accessSeg],
+            ['Address', c.guest ? 'a free guest address per device' : c.static_ip ? `static ${c.static_ip} (first device; others get a dynamic one)` : 'dynamic'],
             ['2FA', c.tfa ? 'enabled' : 'off'],
           ].filter(Boolean))),
           card('Note', h('div', { class: 'stack', style: 'gap:8px' }, noteIn, h('div', null, h('button', { class: 'btn sm', onClick: () => withToast(api(`/api/clients/${enc}/note`, { method: 'PUT', body: { note: noteIn.value } }), 'Note saved') }, 'Save note')))))),
+      c.rejections.length ? card('Rejected connection attempts · last 30 days', rejectionsTable(c.rejections, false)) : '',
       card('Sessions · last 100', sessionsTable(c.sessions, false)));
     lineChart(dailyEl, { ts: c.daily.map(p => p.ts), series: [{ label: 'Download', cls: 's1', values: c.daily.map(p => p.bytes_out) }, { label: 'Upload', cls: 's2', values: c.daily.map(p => p.bytes_in) }], fmtY: v => fmtBytes(v, 0), fmtX: fmtDate, fmtXFull: fmtDate, height: 220, aria: 'Daily traffic' });
     body.classList.remove('loading');
   }
   load();
   return { onLive: live => { if (!c) return; const on = live.clients.some(x => x.cn === name); if (on !== c.online) load(); } };
+}
+// History of an earlier certificate with the same name is stored as "name#time".
+function clientLabel(key) { return key.includes('#') ? key.split('#')[0] + ' (earlier)' : key; }
+function rejectionsTable(list, withName) {
+  return h('div', { class: 'table-wrap' }, h('table', { class: 'tbl' },
+    h('thead', null, h('tr', null, withName ? h('th', null, 'Client') : null, h('th', null, 'Reason'), h('th', null, 'From'), h('th', { class: 'r' }, 'Attempts'), h('th', null, 'Last'))),
+    h('tbody', null, list.map(r => h('tr', null,
+      withName ? h('td', null, r.client || h('span', { class: 'muted' }, 'unknown')) : null,
+      h('td', null, r.reason), h('td', { class: 'mono small' }, r.address), h('td', { class: 'r num' }, fmtNum(r.count)), h('td', { class: 'num' }, fmtAgo(r.last_ts)))))));
+}
+function shareDialog(name) {
+  const hours = h('select', { class: 'input' }, [['1', '1 hour'], ['24', '24 hours'], ['168', '7 days']].map(([v, l]) => h('option', { value: v, selected: v === '24' }, l)));
+  const out = h('div', { class: 'stack', style: 'gap:10px' });
+  const copy = (text, what) => navigator.clipboard.writeText(text).then(() => toast(what + ' copied', 'ok'), () => toast('Copying needs HTTPS - select the link instead', 'err'));
+  const make = async () => {
+    let r;
+    try { r = await api(`/api/clients/${encodeURIComponent(name)}/share`, { method: 'POST', body: { hours: Number(hours.value) } }); } catch (e) { toast(e.message, 'err'); return; }
+    out.replaceChildren(h('div', { class: 'qr' }, h('div', { class: 'code' }, h('img', { src: 'data:image/svg+xml;base64,' + btoa(r.qr_svg), alt: 'QR code of the import link' })),
+      h('div', { class: 'stack', style: 'flex:1;min-width:220px;gap:8px' },
+        h('p', { style: 'margin:0' }, `Scan it with the phone camera, or open the link on the device: OpenVPN Connect imports the profile. The link works once and expires ${fmtDateTime(r.expires_at)}.`),
+        h('div', { class: 'uri mono muted' }, r.url),
+        h('div', { class: 'row' }, h('button', { class: 'btn sm', onClick: () => copy(r.import_url, 'Import link') }, 'Copy import link'), h('button', { class: 'btn sm', onClick: () => copy(r.url, 'Download link') }, 'Copy download link')))),
+      r.public ? '' : warnings(['OVPN_PROFILE_BASE_URL is not set, so the link uses this admin address and only works where that is reachable.']));
+  };
+  dialog({ title: `Share profile · ${name}`, wide: true, body: h('div', { class: 'stack' },
+    h('div', { class: 'row', style: 'align-items:flex-end' }, field('Valid for', hours), h('button', { class: 'btn primary', onClick: make }, 'Create link')), out),
+    buttons: [{ label: 'Done', cls: 'primary', value: true }] });
 }
 function staticIpDialog(c, after) {
   const ip = h('input', { class: 'input', value: c.static_ip || '', placeholder: 'leave empty for a dynamic address' });
@@ -619,7 +660,7 @@ function sessionsTable(list, withName) {
   return h('div', { class: 'table-wrap' }, h('table', { class: 'tbl' },
     h('thead', null, h('tr', null, withName ? h('th', null, 'Client') : null, h('th', null, 'Connected'), h('th', null, 'Duration'), h('th', null, 'From'), h('th', null, 'VPN IP'), h('th', { class: 'r' }, 'Download'), h('th', { class: 'r' }, 'Upload'), h('th', null, 'Cipher'))),
     h('tbody', null, list.map(s => h('tr', null,
-      withName ? h('td', { class: 'name-cell' }, h('a', { href: '#/clients/' + encodeURIComponent(s.client_name) }, s.client_name)) : null,
+      withName ? h('td', { class: 'name-cell' }, s.client_name.includes('#') ? h('span', { class: 'muted', title: 'An earlier certificate with this name' }, clientLabel(s.client_name)) : h('a', { href: '#/clients/' + encodeURIComponent(s.client_name) }, s.client_name)) : null,
       h('td', { class: 'num' }, fmtDateTime(s.connected_at)),
       h('td', null, s.disconnected_at ? fmtDur(s.disconnected_at - s.connected_at) : h('span', { class: 'ink2' }, h('span', { class: 'dot-live' }), fmtDur(Date.now() / 1000 - s.connected_at))),
       h('td', { class: 'mono small' }, s.real_address || '—'), h('td', { class: 'mono small' }, s.vpn_ip || '—'),
@@ -660,8 +701,8 @@ function serverView(el) {
   el.append(topbar('Server', sub, h('button', { class: 'btn danger', onClick: async () => { if (await confirmDialog('Restart OpenVPN', 'All connected clients will be disconnected and reconnect automatically. Configuration changes are applied on restart.', 'Restart', true)) await withToast(api('/api/server/restart', { method: 'POST' }), 'OpenVPN is restarting'); } }, icon('power'), 'Restart OpenVPN')), body);
   let info = null;
   const status = h('div', { class: 'grid two' });
-  const tfaCard = h('div');
-  body.append(status, tfaCard, configEditor(), logsCard(), eventsCard());
+  const tfaCard = h('div'), ccCard = h('div');
+  body.append(status, h('div', { class: 'grid two' }, tfaCard, ccCard), configEditor(), logsCard(), eventsCard());
   const kv = pairs => h('dl', { class: 'kv' }, pairs.filter(Boolean).map(([k, v]) => [h('dt', null, k), h('dd', null, v)]));
   const expiry = (c, warnDays) => { if (!c || !c.not_after) return '—'; const d = Math.floor((c.not_after - Date.now() / 1000) / 86400); return h('span', { class: d < warnDays ? 'badge expiring' : '' }, `${fmtDate(c.not_after)} (${fmtDays(d)})`); };
 
@@ -697,6 +738,14 @@ function serverView(el) {
     tfaCard.replaceChildren(card('Two-factor authentication', h('div', { class: 'stack', style: 'gap:8px' },
         h('label', { class: 'check' }, tfaToggle, h('b', null, 'Require a TOTP code from every client')),
         h('p', { class: 'small muted', style: 'margin:0' }, 'Adds "auth-user-pass-verify" to server.conf. Enrol clients first (Clients → client → Enable 2FA), then enforce and restart. Clients without a secret cannot connect while enforced.'))));
+    const v2 = info.control_channel === 'tls-crypt-v2';
+    ccCard.replaceChildren(card('Control channel key', h('div', { class: 'stack', style: 'gap:8px' },
+      h('div', null, h('b', null, v2 ? 'One key per client (tls-crypt-v2)' : info.control_channel === 'tls-crypt' ? 'One key shared by all clients (tls-crypt)' : info.control_channel)),
+      h('p', { class: 'small muted', style: 'margin:0' }, 'With a key per client, a leaked profile does not expose a key every client shares, and the server drops packets from unknown clients before doing any TLS work. Switching changes every profile: after restarting OpenVPN, clients connect only with their new profile (hand them out with Share link).'),
+      h('div', null, h('button', { class: 'btn' + (v2 ? '' : ' primary'), onClick: async () => {
+        if (await confirmDialog(v2 ? 'Switch to one shared key' : 'Switch to a key per client', 'Every client profile changes. After restarting OpenVPN, clients can only connect with their new profile.', 'Switch', true)) {
+          await withToast(api('/api/server/control-channel', { method: 'PUT', body: { per_client: !v2 } }), 'Saved - restart OpenVPN, then hand out the profiles again'); load();
+        } } }, v2 ? 'Switch to one shared key' : 'Switch to a key per client')))));
   }
   function configEditor() {
     const tabs = h('div', { class: 'tabs' });
