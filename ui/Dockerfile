@@ -3,15 +3,15 @@
 # OpenVPN web UI image. Build context is the repository root:
 #   docker build -f ui/Dockerfile .
 
-ARG ALPINE_VERSION=3.24.1
-ARG PYTHON_IMAGE=python:3.13-alpine3.24
+ARG ALPINE_VERSION=3.24.2
+ARG PYTHON_IMAGE=python:3.14-alpine3.24
 
 # --------------------------------------------------------------------------
 # easy-rsa (same pinned release as the server image)
 # --------------------------------------------------------------------------
 FROM alpine:${ALPINE_VERSION} AS easyrsa
-ARG EASYRSA_VERSION=3.2.6
-ARG EASYRSA_SHA256=c2572990ce91112eef8d1b8e4a3b58790da95b68501785c621f69121dfbd22d7
+ARG EASYRSA_VERSION=3.2.7
+ARG EASYRSA_SHA256=308743bc9fe871b902d47dbe98d749daff3a05b27531684f02625ce7208d4598
 RUN apk add --no-cache curl \
     && curl -fsSL -o /tmp/easyrsa.tgz \
         "https://github.com/OpenVPN/easy-rsa/releases/download/v${EASYRSA_VERSION}/EasyRSA-${EASYRSA_VERSION}.tgz" \

@@ -506,19 +506,31 @@ function clientsView(el) {
 function newClientDialog(after) {
   const name = h('input', { class: 'input', placeholder: 'e.g. alice-laptop', pattern: '[A-Za-z0-9][A-Za-z0-9_.@-]{0,63}', required: true, autofocus: true });
   const days = h('input', { class: 'input', type: 'number', min: 1, max: 3650, placeholder: 'default from easy-rsa vars' });
-  const ip = h('input', { class: 'input', placeholder: 'guests: ' + state.user.guest_sub });
+  const ip = h('input', { class: 'input' });
+  let guest = false;
+  const accessHelp = h('div', { class: 'help' });
+  const access = h('div', { class: 'seg', role: 'group', 'aria-label': 'Access', style: 'align-self:flex-start' });
+  const setAccess = g => {
+    guest = g;
+    access.querySelectorAll('button').forEach((b, i) => b.classList.toggle('active', (i === 1) === g));
+    accessHelp.textContent = g ? 'Internet and DNS only - no access to your LAN, this server or other VPN clients.' : 'Internet, your LAN and this server.';
+    ip.placeholder = g ? `automatic, from ${state.user.guest_sub}` : 'optional - dynamic if empty';
+  };
+  access.append(h('button', { type: 'button', onClick: () => setAccess(false) }, 'Full access'), h('button', { type: 'button', onClick: () => setAccess(true) }, 'Guest'));
+  setAccess(false);
   const pass = h('input', { class: 'input', type: 'password', autocomplete: 'new-password', placeholder: 'optional' });
   const note = h('input', { class: 'input', placeholder: 'optional' });
   const tfa = h('input', { type: 'checkbox' });
   const body = h('div', { class: 'form cols' },
     h('div', { class: 'full' }, field('Client name', name, 'Letters, digits, _ . @ - (becomes the certificate common name)')),
-    field('Validity (days)', days), field('Static IP', ip, 'Guest range = internet only'),
+    h('div', { class: 'full field' }, h('label', null, 'Access'), access, accessHelp),
+    field('Validity (days)', days), field('Static IP', ip),
     field('Key passphrase', pass, 'Encrypts the private key inside the profile'), field('Note', note),
     h('label', { class: 'check full' }, tfa, 'Require a TOTP code (two-factor authentication)'));
   dialog({ title: 'New client', body, buttons: [{ label: 'Cancel', value: null }, { label: 'Create', cls: 'primary', onClick: async () => {
     if (!name.checkValidity()) { name.reportValidity(); return false; }
     try {
-      const r = await api('/api/clients', { method: 'POST', body: { name: name.value.trim(), days: days.value ? Number(days.value) : null, passphrase: pass.value || null, static_ip: ip.value.trim() || null, tfa: tfa.checked, note: note.value } });
+      const r = await api('/api/clients', { method: 'POST', body: { name: name.value.trim(), days: days.value ? Number(days.value) : null, passphrase: pass.value || null, static_ip: ip.value.trim() || null, guest, tfa: tfa.checked, note: note.value } });
       toast(`Client ${r.client.name} created`, 'ok');
       after && after();
       if (r.tfa_uri) tfaDialog(r.client.name, r.tfa_uri);
@@ -669,9 +681,9 @@ function serverView(el) {
           ['Data channel offload', live.stats && live.stats.dco_enabled !== undefined ? (live.stats.dco_enabled === '1' ? 'enabled (kernel)' : 'not available on this kernel') : '—'],
           ['Connected clients', live.connected ? String(live.clients.length) : '—'],
           ['Since process start', live.load && live.load.bytesin !== undefined ? `↓ ${fmtBytes(live.load.bytesout)} · ↑ ${fmtBytes(live.load.bytesin)}` : '—'],
-          ['Listening on', h('span', null, `${info.listen.port}/${info.listen.proto}`, h('span', { class: 'muted small' }, ' · "port" and "proto" in server.conf'))],
-          ['Client profiles point to', h('span', { class: info.remote.port !== info.listen.port || info.remote.proto !== info.listen.proto ? 'badge expiring' : '' },
-            `${info.remote.host || '(not set)'}:${info.remote.port}/${info.remote.proto}`)],
+          ['Listening on', h('span', null, socks(info.listen), h('span', { class: 'muted small' }, ' · server.conf'))],
+          ['Client profiles point to', h('span', { class: socks(info.remote.remotes, true) !== socks(info.listen, true) ? 'badge expiring' : '' },
+            `${info.remote.host || '(not set)'} · ${socks(info.remote.remotes)}`)],
           ['UI version', info.ui_version],
         ])),
         card('PKI', kv([
@@ -734,6 +746,7 @@ function serverView(el) {
 }
 
 /* ------------------------------------------------------------- settings */
+function socks(list, sorted) { const s = list.map(x => `${x.port}/${x.proto}`); return (sorted ? s.sort() : s).join(', '); }
 function settingsView(el) {
   const body = h('div', { class: 'stack' });
   el.append(topbar('Settings'), body);
@@ -741,15 +754,10 @@ function settingsView(el) {
     let s;
     try { s = await api('/api/settings'); } catch (e) { toast(e.message, 'err'); return; }
     const host = h('input', { class: 'input', value: s.remote.host, placeholder: 'vpn.example.com or public IP' });
-    const port = h('input', { class: 'input', type: 'number', min: 1, max: 65535, value: s.remote.port, onInput: () => checkPort() });
-    const proto = h('div', { class: 'row', style: 'gap:8px;align-items:center;min-height:36px' },
-      h('span', { class: 'badge plain' }, (s.listen.proto || '').toUpperCase()), h('span', { class: 'small muted' }, 'from server.conf'));
+    const ports = s.listen.map(l => ({ l, input: h('input', { class: 'input', type: 'number', min: 1, max: 65535, value: (s.remote.remotes.find(r => r.proto === l.proto) || l).port, onInput: () => checkPort() }) }));
     const mismatch = h('div');
-    const checkPort = () => {
-      const p = String(port.value || '');
-      if (p && p !== String(s.listen.port)) mismatch.replaceChildren(warnings([`OpenVPN listens on port ${s.listen.port}. Use ${p} only if a router or relay forwards ${p} to it.`]));
-      else mismatch.replaceChildren();
-    };
+    const checkPort = () => mismatch.replaceChildren(warnings(ports.filter(({ l, input }) => input.value && input.value !== String(l.port))
+      .map(({ l, input }) => `OpenVPN listens on ${l.port}/${l.proto}. Use ${input.value} only if a router or relay forwards ${input.value} to it.`)) || '');
     checkPort();
     const cur = h('input', { class: 'input', type: 'password', autocomplete: 'current-password' });
     const nw = h('input', { class: 'input', type: 'password', autocomplete: 'new-password', minlength: 8 });
@@ -759,10 +767,11 @@ function settingsView(el) {
     for (const t of ['system', 'light', 'dark']) theme.append(h('button', { class: t === curTheme ? 'active' : '', onClick: e => { localStorage.setItem('theme', t); applyTheme(); theme.querySelectorAll('button').forEach(b => b.classList.toggle('active', b === e.currentTarget)); } }, t));
     body.append(
       h('div', { class: 'grid two' },
-        card('Public address for client profiles', h('div', { class: 'form' }, h('div', { class: 'form cols' }, h('div', { class: 'full' }, field('Host', host)), field('Port', port), field('Protocol', proto)),
+        card('Public address for client profiles', h('div', { class: 'form' }, h('div', { class: 'form cols' }, h('div', { class: 'full' }, field('Host', host)),
+          ports.map(({ l, input }) => field(`${l.proto.toUpperCase()} port`, input, ports.length < 2 ? null : l.proto === 'udp' ? 'tried first' : 'fallback when UDP is blocked'))),
           mismatch,
-          h('p', { class: 'small muted', style: 'margin:0' }, 'The address clients dial, written as the "remote" line of config/client.conf. It is the public one, which differs from the listening address whenever a router or relay forwards the port. The protocol is not set here: a forward can remap a port but never change UDP into TCP, so it always follows "proto" in server.conf. Saving regenerates every profile; hand them out again if the address changed.'),
-          h('div', null, h('button', { class: 'btn primary', onClick: async () => { const r = await withToast(api('/api/settings', { method: 'PUT', body: { host: host.value.trim(), port: Number(port.value) } }), 'Saved and profiles regenerated'); s = r; checkPort(); } }, 'Save')))),
+          h('p', { class: 'small muted', style: 'margin:0' }, 'The address clients dial: one "remote" line per protocol OpenVPN listens on (the "local" lines of server.conf), UDP first. It is the public one, which differs from the listening address whenever a router or relay forwards the port. Protocols are not set here: a forward can remap a port but never change UDP into TCP. Saving regenerates every profile; hand them out again if the address changed.'),
+          h('div', null, h('button', { class: 'btn primary', onClick: async () => { const r = await withToast(api('/api/settings', { method: 'PUT', body: { host: host.value.trim(), ports: Object.fromEntries(ports.map(({ l, input }) => [l.proto, Number(input.value)])) } }), 'Saved and profiles regenerated'); s = r; checkPort(); } }, 'Save')))),
         card('Change password', h('div', { class: 'form' }, field('Current password', cur), field('New password', nw, 'At least 8 characters'), field('Repeat new password', nw2),
           h('div', null, h('button', { class: 'btn primary', onClick: async () => { if (nw.value !== nw2.value) { toast('Passwords do not match', 'err'); return; } await withToast(api('/api/me/password', { method: 'POST', body: { current: cur.value, new: nw.value } }), 'Password changed'); cur.value = nw.value = nw2.value = ''; } }, 'Change password'))))),
       h('div', { class: 'grid two' },

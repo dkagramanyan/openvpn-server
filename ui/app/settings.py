@@ -29,10 +29,8 @@ class Settings:
         self.session_ttl = int(_env("OVPN_UI_SESSION_TTL", str(12 * 3600)))
         self.admin_username = _env("OPENVPN_ADMIN_USERNAME", "admin").strip() or "admin"
         self.admin_password = _env("OPENVPN_ADMIN_PASSWORD", "")
-        # Public address for client profiles. The protocol is not configurable
-        # here: it always follows "proto" in server.conf.
+        # Public host for client profiles; protocols and default ports follow server.conf.
         self.public_host = _env("OVPN_PUBLIC_HOST", "").strip()
-        self.public_port = _env("OVPN_PUBLIC_PORT", "").strip()
         self.secure_cookies = _env("OVPN_UI_SECURE_COOKIES", "auto").strip().lower()
         self.tfa_issuer = _env("OVPN_TFA_ISSUER", "OpenVPN").strip() or "OpenVPN"
         self.guest_sub = _env("GUEST_SUB", "10.0.70.128/25").strip()   # same value as the openvpn service

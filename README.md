@@ -3,7 +3,7 @@
 OpenVPN server in Docker with a web UI for client management, live status and
 per-client traffic statistics.
 
-* **OpenVPN 2.7.7** and **easy-rsa 3.2.6**, built from the signed upstream
+* **OpenVPN 2.7.7** and **easy-rsa 3.2.7**, built from the signed upstream
   release tarballs on Alpine 3.24 (38 MB image).
 * **Web UI** (`ui/`): dashboard with live throughput and connected clients,
   per-client traffic history (minute/hour/day roll-ups), session history,
@@ -34,7 +34,7 @@ certificate, the tls-crypt key and the CRL under `pki/`. Then:
 |---|---|
 | Web UI, on the server itself | **http://localhost:8080** |
 | Web UI, from another machine | `http://<server-ip>:8080` |
-| VPN endpoint for clients | `<server-ip>:1197/udp`, i.e. the `port` and `proto` set in `server.conf` |
+| VPN endpoint for clients | `<server-ip>:1197/udp`, falling back to `1196/tcp` (the `local` lines of `server.conf`) |
 
 Sign in as `admin` with the password from `.env`. If you left that empty, a
 random one is printed once in `docker compose logs openvpn-ui`.
@@ -76,7 +76,7 @@ there is no port mapping to keep in sync:
 
 | | Where it comes from |
 |---|---|
-| VPN port | `port` (and `proto`) in `server.conf`, bound directly on the host |
+| VPN ports | the `local` lines in `server.conf`, bound directly on the host |
 | Web UI | host port `8080` |
 | Management interface | `127.0.0.1:2080` on the host, behind a generated password |
 
@@ -94,13 +94,14 @@ Consequences worth knowing:
   opened explicitly. With firewalld:
 
   ```shell
-  sudo firewall-cmd --permanent --add-port=1197/udp   # the "port" from server.conf
+  sudo firewall-cmd --permanent --add-port=1197/udp   # the "local" lines of server.conf
+  sudo firewall-cmd --permanent --add-port=1196/tcp
   sudo firewall-cmd --permanent --add-port=8080/tcp   # web UI
   sudo firewall-cmd --permanent --zone=trusted --add-interface=tun0
   sudo firewall-cmd --reload
   ```
 
-  With ufw: `sudo ufw allow 1197/udp` and `sudo ufw allow 8080/tcp`.
+  With ufw: `sudo ufw allow 1197/udp`, `sudo ufw allow 1196/tcp` and `sudo ufw allow 8080/tcp`.
 * **The other firewall rules are the host's rules.** MASQUERADE, the
   guest-subnet `DROP`s and, with `OVPN_STRICT_FORWARD=1`, the `FORWARD` policy
   `DROP` are applied to the host (that policy is Docker's own default). Set
@@ -112,27 +113,32 @@ Consequences worth knowing:
   two containers. The management password file is `config/management.pw`
   (mode 600).
 
-## The public address
+## The public address and the TCP fallback
 
-Three things look like "the port", and they are not the same thing:
+OpenVPN listens on UDP and TCP at the same time (OpenVPN 2.7 multi-socket):
+
+```
+proto udp
+local * 1197 udp     # fast, tried first
+local * 1196 tcp     # for networks that block or mangle UDP
+```
+
+Every profile gets one `remote` line per socket, UDP first, and
+`server-poll-timeout 10`: a client that gets no answer over UDP within 10 s
+switches to TCP by itself, with the same certificate and the same VPN address.
+Both ports must be forwarded by your router. Adding or removing a `local` line
+in `server.conf` rewrites the profiles' `remote` lines to match.
 
 | | Set in | Meaning |
 |---|---|---|
-| `port`, `proto` | `server.conf` | what OpenVPN binds on the host |
-| `remote <host> <port>` | **Settings**, or `OVPN_PUBLIC_HOST` / `OVPN_PUBLIC_PORT` | what clients dial |
-| the profile's protocol | nowhere: it follows `server.conf` | a forward can remap a port, never the protocol |
+| `local * <port> <proto>` | `server.conf` | what OpenVPN binds on the host |
+| `remote <host> <port> <proto>` | host: **Settings** or `OVPN_PUBLIC_HOST`; port per protocol: **Settings** | what clients dial |
 
-Host and port are deliberately separate from the listening address. Behind a
-router or a relay, clients dial a public address that differs from the one
-OpenVPN binds, and the forward may map one port onto another. The protocol
-cannot differ that way, so it is never asked for twice: editing `proto` in
-`server.conf` rewrites every profile to match.
-
-Leave `OVPN_PUBLIC_PORT` empty to use the listening port. When the two do
-differ, the dashboard says so, because it is legal but usually a mistake.
-
-Changing `port` in `server.conf` takes effect on a plain restart, since no
-port mapping is involved: `docker compose restart`.
+The public port defaults to the listening one; change it under Settings only
+when a router forwards a different public port (the dashboard flags the
+difference, because it is legal but usually a mistake). The protocols cannot
+differ that way, so they always follow `server.conf`. Changes to the `local`
+lines take effect on a plain restart: `docker compose restart`.
 
 Environment variables of the `openvpn` service:
 
@@ -140,7 +146,7 @@ Environment variables of the `openvpn` service:
 |---|---|---|
 | `TRUST_SUB` | `10.0.70.0/24` | the `server` subnet (NAT) |
 | `GUEST_SUB` | `10.0.70.128/25` | static IPs here get internet only (also given to the UI) |
-| `HOME_SUB` | `171.134.51.0/24` | your LAN, hidden from guests |
+| `HOME_SUB` | `170.134.51.0/24` | your LAN, hidden from guests |
 | `GUEST_BLOCK` | RFC 1918, CGNAT, link-local | further ranges hidden from guests |
 | `OVPN_EGRESS_IFACE` | default-route interface | interface used for MASQUERADE |
 | `OVPN_STRICT_FORWARD` | `1` | only VPN-originated traffic and replies are forwarded |
@@ -149,7 +155,7 @@ Environment variables of the `openvpn` service:
 | `OVPN_CRL_RENEW_DAYS` | `30` | regenerate the CRL when it expires within this many days |
 
 `.env` (see `.env.example`): `OPENVPN_ADMIN_USERNAME`, `OPENVPN_ADMIN_PASSWORD`,
-`OVPN_PUBLIC_HOST`, `OVPN_PUBLIC_PORT`, `OVPN_UI_SECURE_COOKIES`, `OVPN_UI_BIND`,
+`OVPN_PUBLIC_HOST`, `OVPN_UI_SECURE_COOKIES`, `OVPN_UI_BIND`,
 `OVPN_UI_TRUSTED_PROXIES`.
 
 ## Web UI
@@ -169,8 +175,8 @@ Environment variables of the `openvpn` service:
   regeneration, 2FA enforcement switch, editors for `server.conf`,
   `client.conf` and easy-rsa vars (a `.bak` is kept), restart button, log
   viewer (openvpn.log, 2FA log, status file) and audit log.
-* **Settings** - public address for profiles (host and port; the protocol
-  follows `server.conf`), admin password, theme.
+* **Settings** - public address for profiles (host and a port per protocol;
+  the protocols follow `server.conf`), admin password, theme.
 
 Traffic is read every 5 s from the status file OpenVPN writes (`status ... 5`,
 `status-version 3`; a management `status` command would be logged on every
@@ -206,9 +212,10 @@ from it, and dropping a revoked entry would make that certificate valid again.
 
 `server 10.0.70.0 255.255.255.0 nopool` is one tunnel subnet: with
 `topology subnet` OpenVPN only accepts static IPs inside it. Clients without a
-static IP get an address from the pool `10.0.70.2-127` and full access. Give a
-client a static IP from `GUEST_SUB` (`10.0.70.128-254`) in the UI and it only
-gets the internet and the pushed DNS servers: the entrypoint drops its traffic
+static IP get an address from the pool `10.0.70.2-127` and full access. Choose
+**Guest** in the New client dialog (the next free address from `GUEST_SUB`,
+`10.0.70.128-254`, is assigned) or give a client a static IP from that range,
+and it only gets the internet and the pushed DNS servers: the entrypoint drops its traffic
 to `HOME_SUB`, the `GUEST_BLOCK` ranges (which include the other VPN clients),
 its pings, and everything addressed to the server host itself. The UI refuses
 static IPs outside the subnet, inside the pool or already taken.
@@ -244,16 +251,16 @@ older setups worth knowing:
 * `dh none` - ECDH is used, no DH parameters are generated.
 * `tls-crypt pki/ta.key` - profiles embed `<tls-crypt>`; profiles made for a
   `tls-auth` server must be regenerated (download them again).
-* `persist-key` is gone (always on in 2.7), `explicit-exit-notify` is not
-  valid with `proto tcp`.
+* `persist-key` is gone (always on in 2.7); `explicit-exit-notify` only
+  affects the UDP socket.
 * `push "block-outside-dns"` protects Windows clients from DNS leaks; other
   platforms log a harmless "Unrecognized option" line and continue.
 * `management 127.0.0.1 2080 /etc/openvpn/config/management.pw` - keep the
   address and port, the UI depends on them. With host networking this is the
   host's loopback.
-* `port` and `proto` are bound directly on the host. A profile's `remote` line
-  may name a different port when one is forwarded to the other, but never a
-  different protocol - see [The public address](#the-public-address).
+* The `local` sockets are bound directly on the host. A profile's `remote`
+  line may name a different port when one is forwarded to the other, but never
+  a different protocol - see [The public address](#the-public-address-and-the-tcp-fallback).
 * Data-channel offload (DCO) is compiled in and used automatically when the
   host kernel provides the `ovpn` module (Linux 6.16+).
 

@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.3.0 - 2026-09-26
+
+### Added
+* **UDP with a TCP fallback in one profile.** OpenVPN listens on 1197/udp and
+  1196/tcp at once (2.7 multi-socket `local` lines). Profiles carry a `remote`
+  line per socket, UDP first, and `server-poll-timeout 10`, so a client whose
+  UDP is blocked switches to TCP within about 10 s (verified end to end).
+  Settings has a public port per protocol; editing the `local` lines rewrites
+  the profiles. `OVPN_PUBLIC_PORT` is gone (ports default to the listening ones).
+* **Full access / Guest switch** in the New client dialog. A guest gets the
+  next free address from `GUEST_SUB` automatically; a full-access client may not
+  take a guest address.
+
+### Fixed
+* The LAN is `170.134.51.0/24` (the server is 170.134.51.30): 1.2.0 set
+  `HOME_SUB`, the pushed route and the pushed DNS to 171.134.51.0/24.
+
+### Updated
+* easy-rsa 3.2.7 (signature checked with the pinned maintainer key), Alpine
+  3.24.2, Python 3.14 for the UI, uvicorn 0.54.0. OpenVPN 2.7.7, FastAPI and
+  segno were already current.
+
+### Upgrade notes
+* Forward 1196/tcp to the server as well (and open it in the host firewall),
+  then hand out the profiles again so clients learn the TCP fallback.
+
 ## 1.2.0 - 2026-09-26
 
 ### Upgrade notes

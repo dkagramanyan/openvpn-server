@@ -228,6 +228,14 @@ def is_guest(ip: str | None) -> bool:
         return False
 
 
+def next_guest_ip(name: str) -> str:
+    """The first guest address OpenVPN can hand out to <name>."""
+    for addr in ipaddress.IPv4Network(settings.guest_sub, strict=False).hosts():
+        if not static_ip_problem(name, str(addr)):
+            return str(addr)
+    raise PkiError(f"No free address left in the guest range {settings.guest_sub}")
+
+
 def set_static_ip(name: str, ip: str | None) -> None:
     validate_name(name)
     path = settings.static_dir / name
@@ -444,68 +452,53 @@ def write_config(which: str, content: str) -> None:
         raise PkiError(f"cannot write {path.name}: {exc}") from exc
 
 
-def get_remote() -> dict[str, str]:
+def get_remote() -> dict[str, Any]:
+    """The address in client profiles: {"host", "remotes": [{"port", "proto"}, ...]}."""
     text = read_config("client")
-    host, port, proto = "", "1195", "tcp"
-    m = re.search(r"^\s*remote\s+(\S+)\s+(\d+)(?:\s+(\S+))?", text, re.M)
-    if m:
-        host, port = m.group(1), m.group(2)
-        if m.group(3):
-            proto = m.group(3)
-    m = re.search(r"^\s*proto\s+(\S+)", text, re.M)
-    if m and m.group(1).startswith(("udp", "tcp")):
-        proto = m.group(1)[:3]
-    return {"host": host, "port": port, "proto": proto}
+    m = re.search(r"^\s*proto\s+(udp|tcp)", text, re.M)
+    default = m.group(1) if m else "udp"
+    found = re.findall(r"^\s*remote\s+(\S+)\s+(\d+)(?:\s+(udp|tcp)\S*)?", text, re.M)
+    return {"host": found[0][0] if found else "",
+            "remotes": [{"port": port, "proto": proto or default} for _, port, proto in found]}
 
 
-def server_listen() -> dict[str, str]:
-    """What OpenVPN actually listens on, from server.conf."""
+def server_listen() -> list[dict[str, str]]:
+    """The sockets OpenVPN listens on, from server.conf: the "local" lines, else "port"/"proto"."""
     text = read_config("server")
-    port, proto = "1194", "udp"          # OpenVPN's own defaults
+    m = re.search(r"^\s*proto\s+(udp|tcp)", text, re.M)
+    proto = m.group(1) if m else "udp"                 # OpenVPN's own defaults
     m = re.search(r"^\s*port\s+(\d+)", text, re.M)
-    if m:
-        port = m.group(1)
-    m = re.search(r"^\s*proto\s+(\S+)", text, re.M)
-    if m and m.group(1).lower().startswith(("udp", "tcp")):
-        proto = m.group(1).lower()[:3]
-    return {"port": port, "proto": proto}
+    port = m.group(1) if m else "1194"
+    local = re.findall(r"^\s*local\s+\S+(?:\s+(\d+))?(?:\s+(udp|tcp)\S*)?", text, re.M)
+    return [{"port": p or port, "proto": pr or proto} for p, pr in local] or [{"port": port, "proto": proto}]
 
 
-def set_remote(host: str, port: int | str) -> None:
-    """Point client profiles at <host>:<port>. The protocol always follows server.conf:
-    a port forward can remap the port, but it can never turn UDP into TCP."""
+def set_remote(host: str, ports: dict[str, int | str] | None = None) -> None:
+    """Point client profiles at <host>, with one "remote" line per listening socket, UDP first
+    so the client falls back to TCP. A port forward can remap a port but never the protocol, so
+    the protocols always follow server.conf; <ports> sets the public port per protocol."""
     host = host.strip()
     if not HOST_RE.match(host):
         raise PkiError("Invalid host name or IP address")
-    try:
-        port = int(port)
-    except ValueError:
-        raise PkiError("Invalid port") from None
-    if not (1 <= port <= 65535):
-        raise PkiError("Invalid port")
-    proto = server_listen()["proto"]
-    text = read_config("client")
-    lines = [l for l in text.splitlines() if not re.match(r"^\s*(remote|proto)\s+", l)]
-    # keep "client" first, then proto/remote
-    out: list[str] = []
-    inserted = False
-    for line in lines:
-        out.append(line)
-        if not inserted and line.strip() == "client":
-            out += [f"proto {proto}", f"remote {host} {port}"]
-            inserted = True
-    if not inserted:
-        out = [f"proto {proto}", f"remote {host} {port}"] + out
-    write_config("client", "\n".join(out) + "\n")
+    current = {r["proto"]: r["port"] for r in get_remote()["remotes"]}
+    remotes = []
+    for sock in sorted(server_listen(), key=lambda l: l["proto"] != "udp"):
+        port = str((ports or {}).get(sock["proto"]) or current.get(sock["proto"]) or sock["port"])
+        if not port.isdigit() or not 1 <= int(port) <= 65535:
+            raise PkiError(f"Invalid {sock['proto'].upper()} port")
+        remotes.append(f"remote {host} {port} {sock['proto']}")
+    lines = [l for l in read_config("client").splitlines() if not re.match(r"^\s*(remote|proto)\s+", l)]
+    at = next((i + 1 for i, l in enumerate(lines) if l.strip() == "client"), 0)   # keep "client" first
+    write_config("client", "\n".join(lines[:at] + remotes + lines[at:]) + "\n")
     regenerate_profiles()
 
 
-def sync_remote_proto() -> bool:
-    """Rewrite the profiles' protocol when server.conf changed it. True when it did."""
+def sync_remotes() -> bool:
+    """Give the profiles one remote per listening protocol after server.conf changed. True when it did."""
     remote = get_remote()
-    if not remote["host"] or remote["proto"] == server_listen()["proto"]:
+    if not remote["host"] or sorted(r["proto"] for r in remote["remotes"]) == sorted(l["proto"] for l in server_listen()):
         return False
-    set_remote(remote["host"], remote["port"])
+    set_remote(remote["host"])
     return True
 
 

@@ -52,17 +52,15 @@ def bootstrap() -> None:
         else:
             log.warning("created admin user '%s' with generated password: %s  (change it in Settings)",
                         settings.admin_username, password)
-    if settings.public_host:
-        # The public port defaults to the port OpenVPN listens on; the protocol always follows it.
-        port = settings.public_port or pki.server_listen()["port"]
-        wanted = f"{settings.public_host}:{port}"
-        if db.get_setting("remote_from_env") != wanted:
-            try:
-                pki.set_remote(settings.public_host, port)
-                db.set_setting("remote_from_env", wanted)
-                log.info("client profiles now point at %s", wanted)
-            except PkiError as exc:
-                log.error("cannot apply OVPN_PUBLIC_HOST: %s", exc)
+    try:
+        if settings.public_host and db.get_setting("remote_from_env") != settings.public_host:
+            pki.set_remote(settings.public_host)
+            db.set_setting("remote_from_env", settings.public_host)
+            log.info("client profiles now point at %s", settings.public_host)
+        elif pki.sync_remotes():
+            log.info("client profiles now list every protocol OpenVPN listens on")
+    except PkiError as exc:
+        log.error("cannot update the client profiles' address: %s", exc)
 
 
 @asynccontextmanager
@@ -158,6 +156,7 @@ class NewClientBody(BaseModel):
     passphrase: str | None = Field(default=None, max_length=256)
     static_ip: str | None = Field(default=None, max_length=15)
     tfa: bool = False
+    guest: bool = False
     note: str = Field(default="", max_length=500)
 
 
@@ -195,7 +194,7 @@ class TfaEnforceBody(BaseModel):
 
 class RemoteBody(BaseModel):
     host: str = Field(min_length=1, max_length=253)
-    port: int = Field(ge=1, le=65535)
+    ports: dict[str, int] = {}          # public port per protocol, e.g. {"udp": 1197, "tcp": 1196}
 
 
 # -- helpers --------------------------------------------------------------------
@@ -358,12 +357,15 @@ def overview(range: str = "today", tz: int = 0, user: dict[str, Any] = Authed):
     if remote["host"] in ("", "127.0.0.1", "localhost", "::1"):
         warnings.append("Client profiles point at " + (remote["host"] or "no address")
                         + " - set this server's public address under Settings, then hand out the profiles again")
-    if remote["port"] != listen["port"]:
-        warnings.append(f"Client profiles dial port {remote['port']} but OpenVPN listens on {listen['port']}"
-                        " - correct it under Settings, unless a router forwards one port to the other")
-    if remote["proto"] != listen["proto"]:
-        warnings.append(f"Client profiles use {remote['proto'].upper()} but OpenVPN listens on "
-                        f"{listen['proto'].upper()} - save the public address again under Settings to fix it")
+    dial = {r["proto"]: r["port"] for r in remote["remotes"]}
+    for sock in listen:
+        port, proto = sock["port"], sock["proto"]
+        if proto not in dial:
+            warnings.append(f"OpenVPN listens on {port}/{proto} but client profiles have no {proto.upper()} "
+                            "address - save the public address again under Settings")
+        elif dial[proto] != port:
+            warnings.append(f"Client profiles dial {dial[proto]}/{proto} but OpenVPN listens on {port}/{proto}"
+                            " - correct it under Settings, unless a router forwards one port to the other")
     crl = status["crl"]
     if crl["exists"] and crl["next_update"] and crl["next_update"] - now < EXPIRING_DAYS * 86400:
         warnings.append("The certificate revocation list expires soon - regenerate it on the Server page")
@@ -434,14 +436,21 @@ def create_client(body: NewClientBody, user: dict[str, Any] = Authed):
         raise HTTPException(409, "A client with this name already exists")
     if existing and existing["cert"]["state"] == "expired":
         raise HTTPException(409, "This client's certificate has expired - renew it on the client's page")
-    pki.create_client(name, body.days, body.passphrase or None, (body.static_ip or "").strip() or None)
+    static_ip = (body.static_ip or "").strip() or None
+    if body.guest:
+        static_ip = static_ip or pki.next_guest_ip(name)
+        if not pki.is_guest(static_ip):
+            raise HTTPException(400, f"A guest needs an address from the guest range {settings.guest_sub}")
+    elif static_ip and pki.is_guest(static_ip):
+        raise HTTPException(400, f"{static_ip} is in the guest range - choose Guest or another address")
+    pki.create_client(name, body.days, body.passphrase or None, static_ip)
     db.execute("INSERT INTO clients (name, note, created_at) VALUES (?, ?, ?) "
                "ON CONFLICT(name) DO UPDATE SET note = excluded.note",
                (name, body.note.strip(), int(time.time())))
     tfa_uri = None
     if body.tfa:
         tfa_uri = pki.enable_tfa(name)
-    event("client_created", user, name, f"static_ip={body.static_ip or '-'} tfa={body.tfa}")
+    event("client_created", user, name, f"static_ip={static_ip or '-'} guest={body.guest} tfa={body.tfa}")
     return {"client": find_client(name), "tfa_uri": tfa_uri}
 
 
@@ -630,9 +639,9 @@ def put_config(which: str, body: ConfigBody, user: dict[str, Any] = Authed):
     event("config_saved", user, None, which)
     if which == "client":
         pki.regenerate_profiles()
-    elif which == "server" and pki.sync_remote_proto():
-        # server.conf changed the protocol, so the profiles have to follow it.
-        event("remote_changed", user, None, f"protocol now {pki.server_listen()['proto']} (from server.conf)")
+    elif which == "server" and pki.sync_remotes():
+        # server.conf changed the protocols, so the profiles have to follow them.
+        event("remote_changed", user, None, "protocols now " + ", ".join(l["proto"] for l in pki.server_listen()))
     return {"ok": True, "restart_required": which == "server"}
 
 
@@ -681,9 +690,9 @@ def get_settings(user: dict[str, Any] = Authed):
 
 @app.put("/api/settings", dependencies=[Csrf])
 def put_settings(body: RemoteBody, user: dict[str, Any] = Authed):
-    pki.set_remote(body.host, body.port)
+    pki.set_remote(body.host, body.ports)
     remote = pki.get_remote()
-    event("remote_changed", user, None, f"{remote['host']}:{remote['port']}/{remote['proto']}")
+    event("remote_changed", user, None, remote["host"] + " " + ", ".join(f"{r['port']}/{r['proto']}" for r in remote["remotes"]))
     return {"remote": remote, "listen": pki.server_listen()}
 
 

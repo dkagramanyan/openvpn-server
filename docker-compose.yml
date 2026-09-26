@@ -21,7 +21,7 @@ services:
     environment:
       TRUST_SUB: "10.0.70.0/24"     # the "server" subnet in server.conf
       GUEST_SUB: &guest_sub "10.0.70.128/25"   # static IPs from here get internet only
-      HOME_SUB: "171.134.51.0/24"   # your LAN - guests are blocked from it
+      HOME_SUB: "170.134.51.0/24"   # your LAN - guests are blocked from it
       # GUEST_BLOCK: "10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16"
       # OVPN_EGRESS_IFACE: eth0     # auto-detected from the default route
       # OVPN_STRICT_FORWARD: "1"    # set to 0 to allow unsolicited inbound to VPN clients
@@ -44,7 +44,6 @@ services:
       OPENVPN_ADMIN_USERNAME: ${OPENVPN_ADMIN_USERNAME:-admin}
       OPENVPN_ADMIN_PASSWORD: ${OPENVPN_ADMIN_PASSWORD:-}   # empty = random, printed once in the logs
       OVPN_PUBLIC_HOST: ${OVPN_PUBLIC_HOST:-}               # public address written into client profiles
-      OVPN_PUBLIC_PORT: ${OVPN_PUBLIC_PORT:-}               # empty = the "port" from server.conf
       OVPN_UI_SECURE_COOKIES: ${OVPN_UI_SECURE_COOKIES:-auto} # "true" when served behind an HTTPS reverse proxy
       UVICORN_HOST: ${OVPN_UI_BIND:-0.0.0.0}                # address the UI listens on (port 8080)
       FORWARDED_ALLOW_IPS: ${OVPN_UI_TRUSTED_PROXIES:-127.0.0.1} # proxies whose X-Forwarded-For is believed

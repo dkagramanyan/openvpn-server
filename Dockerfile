@@ -9,7 +9,7 @@
 # F554A3687412CFFEBDEFE0A312F5F7B42F2B01E7, easy-rsa maintainer key
 # 6F4056821152F03B6B24F2FCF8489F839D7367F3).
 
-ARG ALPINE_VERSION=3.24.1
+ARG ALPINE_VERSION=3.24.2
 
 # --------------------------------------------------------------------------
 # Build stage: compile OpenVPN, unpack easy-rsa
@@ -18,8 +18,8 @@ FROM alpine:${ALPINE_VERSION} AS build
 
 ARG OPENVPN_VERSION=2.7.7
 ARG OPENVPN_SHA256=3ab8f48fd6c26d49ba2333a092433949afdb5c85c0e6a1ff265784fbc04a2463
-ARG EASYRSA_VERSION=3.2.6
-ARG EASYRSA_SHA256=c2572990ce91112eef8d1b8e4a3b58790da95b68501785c621f69121dfbd22d7
+ARG EASYRSA_VERSION=3.2.7
+ARG EASYRSA_SHA256=308743bc9fe871b902d47dbe98d749daff3a05b27531684f02625ce7208d4598
 
 RUN apk add --no-cache build-base linux-headers pkgconf curl \
         openssl-dev lz4-dev lzo-dev libcap-ng-dev libnl3-dev
@@ -78,7 +78,7 @@ RUN chmod 755 /opt/app/bin/* /opt/app/docker-entrypoint.sh \
 ENV OPENVPN_DIR=/etc/openvpn \
     EASYRSA_DIR=/usr/share/easy-rsa
 
-EXPOSE 1197/udp
+EXPOSE 1197/udp 1196/tcp
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
     CMD ["/opt/app/bin/healthcheck.sh"]

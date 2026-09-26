@@ -81,11 +81,10 @@ def build_env():
     ossl("ca", "-batch", "-config", str(pki / "ca.cnf"), "-gencrl", "-crldays", "180", "-out", str(pki / "crl.pem"))
     (pki / "ta.key").write_text("#\n# 2048 bit OpenVPN static key\n#\n-----BEGIN OpenVPN Static key V1-----\n"
                                 "00\n-----END OpenVPN Static key V1-----\n")
-    # Pin the listening port and protocol so the tests do not depend on the
+    # Pin the listening sockets so the tests do not depend on the
     # deployment-specific values in the repository's server.conf.
-    conf = (ROOT / "server.conf").read_text()
-    conf = re.sub(r"(?m)^\s*port\s+\d+", "port 1197", conf)
-    conf = re.sub(r"(?m)^\s*proto\s+\S+", "proto udp", conf)
+    conf = re.sub(r"(?m)^\s*local\s+.*\n", "", (ROOT / "server.conf").read_text())
+    conf = conf.replace("proto udp\n", "proto udp\nlocal * 1197 udp\nlocal * 1196 tcp\n", 1)
     (TMP / "server.conf").write_text(conf)
     shutil.copy(ROOT / "config" / "client.conf", TMP / "config" / "client.conf")
     (TMP / "clients" / "oath.secrets").write_text("alice:3132333435363738393031323334353637383930\n")
@@ -146,45 +145,48 @@ def test_overview_all_range_is_short(client):
     assert client.get("/api/overview?range=bogus").status_code == 400
 
 
+UDP, TCP = {"port": "1197", "proto": "udp"}, {"port": "1196", "proto": "tcp"}
+
+
 def test_profile_download_and_remote(client):
     r = client.get("/api/clients/alice/ovpn")
     assert r.status_code == 200
     assert "<cert>" in r.text and "verify-x509-name server name" in r.text and "auth-user-pass" in r.text
     assert client.get("/api/clients/old/ovpn").status_code == 200   # expired but still issued
     assert client.get("/api/clients/bob/ovpn").status_code == 404
-    r = client.put("/api/settings", json={"host": "vpn.example.org", "port": 443}, headers=H)
+    # one remote per listening socket, UDP first; ports default to the listening ones
+    r = client.put("/api/settings", json={"host": "vpn.example.org"}, headers=H)
     assert r.status_code == 200, r.text
-    # The protocol is never taken from the request; it follows server.conf.
-    assert r.json()["remote"] == {"host": "vpn.example.org", "port": "443", "proto": "udp"}
-    assert r.json()["listen"] == {"port": "1197", "proto": "udp"}
+    assert r.json()["remote"] == {"host": "vpn.example.org", "remotes": [UDP, TCP]}
+    assert r.json()["listen"] == [UDP, TCP]
     profile = client.get("/api/clients/alice/ovpn").text
-    assert "remote vpn.example.org 443" in profile and "proto udp" in profile
-    # A protocol sent anyway is ignored rather than honoured.
-    r = client.put("/api/settings", json={"host": "vpn.example.org", "port": 443, "proto": "tcp"}, headers=H)
-    assert r.json()["remote"]["proto"] == "udp"
-    assert client.put("/api/settings", json={"host": "bad host", "port": 443}, headers=H).status_code == 400
+    assert "remote vpn.example.org 1197 udp\nremote vpn.example.org 1196 tcp\n" in profile
+    assert "\nproto " not in profile and "server-poll-timeout 10" in profile
+    # a forwarded public port per protocol; protocols can not be added from here
+    r = client.put("/api/settings", json={"host": "vpn.example.org", "ports": {"tcp": 443, "sctp": 9}}, headers=H)
+    assert r.json()["remote"]["remotes"] == [UDP, {"port": "443", "proto": "tcp"}]
+    assert client.put("/api/settings", json={"host": "bad host"}, headers=H).status_code == 400
+    assert client.put("/api/settings", json={"host": "h", "ports": {"udp": 70000}}, headers=H).status_code == 400
 
 
-def test_port_mismatch_warns_and_protocol_follows_server_conf(client):
-    # profiles dial 443 while OpenVPN listens on 1197
+def test_port_mismatch_warns_and_protocols_follow_server_conf(client):
+    # profiles dial 443/tcp while OpenVPN listens on 1196/tcp
     warns = client.get("/api/overview?range=today").json()["warnings"]
-    assert any("443" in w and "1197" in w for w in warns), warns
+    assert any("443/tcp" in w and "1196/tcp" in w for w in warns), warns
 
-    # switching the server to TCP rewrites the protocol of every profile
+    # dropping the TCP socket from server.conf drops the TCP remote from every profile
     conf = client.get("/api/server/config/server").json()["content"]
-    r = client.put("/api/server/config/server", json={"content": conf.replace("proto udp", "proto tcp")}, headers=H)
+    r = client.put("/api/server/config/server", json={"content": conf.replace("local * 1196 tcp\n", "")}, headers=H)
     assert r.status_code == 200 and r.json()["restart_required"] is True
-    s = client.get("/api/settings").json()
-    assert s["listen"]["proto"] == "tcp" and s["remote"]["proto"] == "tcp"
-    assert "proto tcp" in client.get("/api/clients/alice/ovpn").text
-    assert any(e["kind"] == "remote_changed" and "tcp" in (e["detail"] or "")
+    assert client.get("/api/settings").json()["remote"]["remotes"] == [UDP]
+    assert "1196 tcp" not in client.get("/api/clients/alice/ovpn").text and "443" not in client.get("/api/clients/alice/ovpn").text
+    assert any(e["kind"] == "remote_changed" and "udp" in (e["detail"] or "")
                for e in client.get("/api/events").json()["events"])
 
-    # and back to UDP
-    conf = client.get("/api/server/config/server").json()["content"]
-    client.put("/api/server/config/server", json={"content": conf.replace("proto tcp", "proto udp")}, headers=H)
-    assert client.get("/api/settings").json()["remote"]["proto"] == "udp"
-    assert "proto udp" in client.get("/api/clients/alice/ovpn").text
+    # and back: the TCP remote returns with the listening port
+    client.put("/api/server/config/server", json={"content": conf}, headers=H)
+    assert client.get("/api/settings").json()["remote"]["remotes"] == [UDP, TCP]
+    assert "remote vpn.example.org 1196 tcp" in client.get("/api/clients/alice/ovpn").text
 
 
 def test_delete_requires_revocation(client):
@@ -218,7 +220,23 @@ def test_notes_static_ip_and_config(client):
     assert r.status_code == 400
     assert client.get("/api/server/config/nope").status_code == 400
     s = client.get("/api/server").json()
-    assert s["pki"]["ca"]["cn"] == "Test CA" and s["pki"]["crl"]["revoked"] == 1 and s["remote"]["port"] == "443"
+    assert s["pki"]["ca"]["cn"] == "Test CA" and s["pki"]["crl"]["revoked"] == 1 and s["listen"] == [UDP, TCP]
     assert client.post("/api/server/restart", headers=H).status_code == 503   # no OpenVPN here
     events = client.get("/api/events").json()["events"]
     assert {"login", "client_deleted", "profile_downloaded", "remote_changed", "static_ip_set"} <= {e["kind"] for e in events}
+
+
+def test_guest_switch_on_create(client):
+    from app import pki
+    # a full-access client may not take a guest address, and a guest needs one
+    r = client.post("/api/clients", json={"name": "carol", "static_ip": "10.0.70.140"}, headers=H)
+    assert r.status_code == 400 and "guest range" in r.json()["detail"]
+    r = client.post("/api/clients", json={"name": "carol", "guest": True, "static_ip": "10.0.70.140"}, headers=H)
+    assert r.status_code != 400 or "guest range" not in r.json()["detail"]   # accepted; fails later without easy-rsa
+    r = client.post("/api/clients", json={"name": "carol", "guest": True, "static_ip": "10.0.70.20"}, headers=H)
+    assert r.status_code == 400 and "guest range" in r.json()["detail"]
+    # guests without an address get the first free one
+    assert pki.next_guest_ip("carol") == "10.0.70.129"
+    (TMP / "staticclients" / "alice").write_text("ifconfig-push 10.0.70.129 255.255.255.0\n")
+    assert pki.next_guest_ip("carol") == "10.0.70.130"
+    (TMP / "staticclients" / "alice").unlink()
