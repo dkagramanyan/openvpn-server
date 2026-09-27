@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.4.2 - 2026-09-27
+
+### Changed
+* Clients get DNS `170.134.51.1` again, as on the old server: it answers the
+  home domains with LAN addresses, so clients reach home services directly
+  instead of looping through the public IP (Traefik saw every VPN client as
+  `171.134.51.1`). The pushed route is `171.134.51.0/24` again, like before,
+  instead of `170.134.51.0/24`.
+
 ## 1.4.1 - 2026-09-27
 
 ### Fixed
