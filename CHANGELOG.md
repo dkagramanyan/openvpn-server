@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.4.1 - 2026-09-27
+
+### Fixed
+* **The UI stopped answering after some hours** and Docker marked it
+  unhealthy. Every open live stream (`/api/stream`, one per browser tab or
+  reverse-proxy connection) held one of the 40 worker threads, so about 40
+  streams stalled every page and `/healthz` for up to 15 s; closed streams also
+  stayed subscribed. The stream now runs on the event loop and holds no
+  thread: 200 open streams leave `/healthz` at under 10 ms.
+* **Duplicate IPv6 addresses.** A pushed IPv4 address (guests, static IPs)
+  left OpenVPN's IPv6 pool out of step, so two devices could get the same
+  `fd00:70::` address ("MULTI_sva: WARNING: if --ifconfig-push is used for
+  IPv4 ..."). `client-access.sh` now pushes an IPv6 address derived from the
+  IPv4 one (`10.0.70.129` -> `fd00:70::a00:4681`).
+
 ## 1.4.0 - 2026-09-27
 
 ### Added

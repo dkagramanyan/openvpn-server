@@ -11,7 +11,7 @@
 # client at a time, so leases cannot race.
 OPENVPN_DIR=${OPENVPN_DIR:-/etc/openvpn}
 LEASES=/tmp/openvpn-leases
-# GUEST_FIRST, GUEST_LAST and NETMASK, written by the entrypoint.
+# GUEST_FIRST, GUEST_LAST, NETMASK and the V6_* values, written by the entrypoint.
 source /tmp/openvpn-access.env 2>/dev/null || exit 0
 
 cn=${common_name:-}
@@ -37,6 +37,11 @@ client-connect)
     if [[ -n $ip ]]; then
         echo "$me" > "$LEASES/$ip"
         echo "ifconfig-push $ip $NETMASK" > "$1"
+        # OpenVPN's IPv6 pool is tied to its IPv4 pool, so a pushed IPv4 address needs its
+        # own IPv6 one: the IPv4 address as the last 32 bits (10.0.70.129 -> fd00:70::a00:4681).
+        n=$(ip2int "$ip")
+        [[ -n ${V6_BASE:-} ]] && printf 'ifconfig-ipv6-push %s%x:%x/%s %s\n' \
+            "$V6_BASE" $(( n >> 16 )) $(( n & 65535 )) "$V6_BITS" "$V6_GW" >> "$1"
     fi
     ;;
 client-disconnect)

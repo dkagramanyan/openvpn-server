@@ -244,8 +244,12 @@ int2ip() { echo "$(( $1 >> 24 & 255 )).$(( $1 >> 16 & 255 )).$(( $1 >> 8 & 255 )
 prepare_access() {
     local net=$(ip2int "${GUEST_SUB%/*}") size=$(( 1 << (32 - ${GUEST_SUB#*/}) ))
     local mask=$(sed -n 's/^[[:space:]]*server[[:space:]]\+[0-9.]\+[[:space:]]\+\([0-9.]\+\).*/\1/p' "$SERVER_CONF" | head -1)
-    printf 'GUEST_FIRST=%s\nGUEST_LAST=%s\nNETMASK=%s\n' \
-        "$(int2ip $(( net + 1 )))" "$(int2ip $(( net + size - 2 )))" "${mask:-255.255.255.0}" > /tmp/openvpn-access.env
+    # "ifconfig-ipv6 fd00:70::1/64 ..." -> V6_BASE=fd00:70:: V6_BITS=64 V6_GW=fd00:70::1
+    local v6=$(sed -n 's/^[[:space:]]*ifconfig-ipv6[[:space:]]\+\([0-9a-fA-F:]*::\)\([0-9a-fA-F]\+\)\/\([0-9]\+\).*/\1 \2 \3/p' "$SERVER_CONF" | head -1)
+    local v6base v6host v6bits; read -r v6base v6host v6bits <<< "$v6"
+    printf 'GUEST_FIRST=%s\nGUEST_LAST=%s\nNETMASK=%s\nV6_BASE=%s\nV6_BITS=%s\nV6_GW=%s\n' \
+        "$(int2ip $(( net + 1 )))" "$(int2ip $(( net + size - 2 )))" "${mask:-255.255.255.0}" \
+        "$v6base" "$v6bits" "${v6base:+$v6base$v6host}" > /tmp/openvpn-access.env
     rm -rf /tmp/openvpn-leases
     install -d -o nobody -m 700 /tmp/openvpn-leases
 }

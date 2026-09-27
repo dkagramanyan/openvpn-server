@@ -1,10 +1,10 @@
 """Background threads: poll the management interface, persist sessions and traffic, run maintenance."""
 from __future__ import annotations
 
+import asyncio
 import copy
 import logging
 import os
-import queue
 import re
 import threading
 import time
@@ -42,6 +42,13 @@ def parse_rejection(line: str) -> tuple[int, str, str, str] | None:
     return None
 
 
+def _offer(q: asyncio.Queue, item: dict[str, Any]) -> None:
+    try:
+        q.put_nowait(item)
+    except asyncio.QueueFull:           # a slow reader skips updates
+        pass
+
+
 class Collector(threading.Thread):
     def __init__(self, db: Database, mgmt: Management, interval: float,
                  status_file: Callable[[], tuple[Path | None, int]] = lambda: (None, 0),
@@ -52,7 +59,7 @@ class Collector(threading.Thread):
         self._status_time: int | None = None
         self._stop = threading.Event()
         self._lock = threading.Lock()
-        self._subscribers: list[queue.Queue] = []
+        self._subscribers: list[tuple[asyncio.AbstractEventLoop, asyncio.Queue]] = []
         # key -> {session_id, bytes_in, bytes_out, ts, rate_in, rate_out}
         self._active: dict[tuple[int, int, str], dict[str, Any]] = {}
         self.live: dict[str, Any] = {
@@ -70,16 +77,17 @@ class Collector(threading.Thread):
         }
 
     # -- pub/sub -------------------------------------------------------------
-    def subscribe(self) -> queue.Queue:
-        q: queue.Queue = queue.Queue(maxsize=8)
+    # Subscribers are asyncio queues on the web server's event loop, so an open live stream
+    # holds no worker thread; the collector thread hands snapshots over with call_soon_threadsafe.
+    def subscribe(self) -> asyncio.Queue:
+        q: asyncio.Queue = asyncio.Queue(maxsize=8)
         with self._lock:
-            self._subscribers.append(q)
+            self._subscribers.append((asyncio.get_running_loop(), q))
         return q
 
-    def unsubscribe(self, q: queue.Queue) -> None:
+    def unsubscribe(self, q: asyncio.Queue) -> None:
         with self._lock:
-            if q in self._subscribers:
-                self._subscribers.remove(q)
+            self._subscribers = [s for s in self._subscribers if s[1] is not q]
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
@@ -89,10 +97,10 @@ class Collector(threading.Thread):
         with self._lock:
             snap = copy.deepcopy(self.live)
             subs = list(self._subscribers)
-        for q in subs:
+        for loop, q in subs:
             try:
-                q.put_nowait(snap)
-            except queue.Full:
+                loop.call_soon_threadsafe(_offer, q, snap)
+            except RuntimeError:        # the event loop has shut down
                 pass
 
     # -- main loop -----------------------------------------------------------

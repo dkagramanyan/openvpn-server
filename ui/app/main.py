@@ -1,14 +1,14 @@
 """HTTP API and static frontend."""
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
-import queue
 import secrets
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, AsyncIterator
 from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
@@ -440,17 +440,18 @@ def overview(range: str = "today", tz: int = 0, user: dict[str, Any] = Authed):
 
 
 @app.get("/api/stream")
-def stream(user: dict[str, Any] = Authed):
-    q = collector.subscribe()
-
-    def gen() -> Iterator[str]:
+async def stream(user: dict[str, Any] = Authed):
+    # Async on purpose: a sync generator would hold one of the 40 worker threads for as long as
+    # the stream is open, and enough open tabs (or proxy connections) would stall every endpoint.
+    async def gen() -> AsyncIterator[str]:
+        q = collector.subscribe()
         try:
             yield "data: " + json.dumps(collector.snapshot()) + "\n\n"
             while True:
                 try:
-                    item = q.get(timeout=15)
+                    item = await asyncio.wait_for(q.get(), 15)
                     yield "data: " + json.dumps(item) + "\n\n"
-                except queue.Empty:
+                except TimeoutError:
                     yield ": keepalive\n\n"
         finally:
             collector.unsubscribe(q)

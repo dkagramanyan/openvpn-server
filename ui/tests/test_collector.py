@@ -101,3 +101,20 @@ def test_handshakes_in_progress_are_not_sessions(tmp_path):
     mgmt.clients = [undef, client("alice", 8, now, 10, 20)]
     Collector(db, mgmt, 5).poll()
     assert [r["client_name"] for r in db.query("SELECT client_name FROM vpn_sessions")] == ["alice"]
+
+
+def test_live_updates_reach_async_subscribers_from_the_collector_thread(tmp_path):
+    # The live stream waits on an asyncio queue, so an open stream holds no worker thread.
+    import asyncio
+    import threading
+    c = Collector(Database(tmp_path / "c.db"), FakeMgmt(), 5)
+
+    async def main():
+        q = c.subscribe()
+        threading.Thread(target=c.poll).start()      # publishes from another thread
+        snap = await asyncio.wait_for(q.get(), 5)
+        c.unsubscribe(q)
+        return snap
+
+    assert asyncio.run(main())["connected"] is True
+    assert c._subscribers == []
