@@ -38,6 +38,9 @@ class Settings:
         # Daily backup archives (PKI, profiles, configuration, database); keep 0 turns them off.
         self.backup_dir = Path(_env("OVPN_BACKUP_DIR", str(self.openvpn_dir / "backups")))
         self.backup_keep = max(0, int(_env("OVPN_BACKUP_KEEP", "14")))
+        # An age public key ("age1..."): archives are encrypted to it and only the matching
+        # private key, which is kept off this server, opens them.
+        self.backup_recipient = _env("OVPN_BACKUP_RECIPIENT", "").strip()
         # Public base URL of the one-time profile links (a reverse proxy forwarding /p/ to the UI).
         self.profile_base_url = _env("OVPN_PROFILE_BASE_URL", "").strip().rstrip("/")
 

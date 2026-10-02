@@ -122,6 +122,69 @@ def test_login_requires_csrf_header_and_password(client):
     assert client.get("/api/me").json()["username"] == "admin"
 
 
+def test_login_is_throttled_per_user_and_per_address(client, monkeypatch):
+    from app import auth
+    from app.main import limiter
+    cookies = dict(client.cookies)
+    client.cookies.clear()
+    post = lambda user, pw: client.post("/api/login", json={"username": user, "password": pw}, headers=H).status_code
+    try:
+        # one user name: the sixth attempt has to wait, even with the right password
+        limiter._state.clear()
+        assert [post("admin", "wrong") for _ in range(5)] == [401] * 5
+        assert post("admin", "test-password") == 429
+        # one address trying many names: stopped as well, so it cannot fill the table of counters;
+        # an unknown name costs the server a password check like a known one
+        limiter._state.clear()
+        checked = []
+        monkeypatch.setattr(auth, "verify_unknown_user", checked.append)
+        codes = [post(f"user{i}", "x") for i in range(25)]
+        assert codes == [401] * 20 + [429] * 5 and len(checked) == 20
+        assert post("admin", "test-password") == 429
+        # a successful login clears the counters of its address
+        limiter._state.clear()
+        assert [post("admin", "wrong") for _ in range(3)] == [401] * 3
+        assert post("admin", "test-password") == 200 and not limiter._state
+    finally:
+        limiter._state.clear()
+        client.cookies.clear()
+        client.cookies.update(cookies)
+    assert client.get("/api/me").json()["username"] == "admin"
+    rows = [e for e in client.get("/api/events?limit=1000").json()["events"] if e["kind"] == "login_failed"]
+    assert len(rows) == 1 + 5 + 20 + 3      # attempts that had to wait are not logged
+
+
+def test_every_route_needs_a_session_and_every_change_the_csrf_header(client):
+    from fastapi.routing import APIRoute
+    from app.main import app, limiter
+    public = {"/healthz", "/", "/p/{token}", "/p/{token}/download"}
+    cookies = dict(client.cookies)
+    seen = 0
+    try:
+        for route in app.routes:
+            if not isinstance(route, APIRoute):
+                continue
+            path = route.path.replace("{name}", "alice").replace("{which}", "server").replace("{token}", "x")
+            for method in route.methods:
+                seen += 1
+                client.cookies.update(cookies)
+                if method != "GET":     # no header: refused whoever asks
+                    assert client.request(method, path, json={}).status_code == 403, (method, path)
+                client.cookies.clear()
+                r = client.request(method, path, json={}, headers=H)
+                if route.path in public or route.path == "/api/logout":
+                    assert r.status_code != 401, (method, path)
+                elif route.path == "/api/login":
+                    assert r.status_code == 422, (method, path)      # an empty body
+                else:
+                    assert r.status_code == 401, (method, path)
+    finally:
+        limiter._state.clear()
+        client.cookies.clear()
+        client.cookies.update(cookies)
+    assert seen > 35
+
+
 def test_clients_listing(client):
     rows = {r["name"]: r for r in client.get("/api/clients").json()["clients"]}
     assert rows["alice"]["state"] == "valid" and rows["alice"]["tfa"] is True
@@ -204,7 +267,7 @@ def test_notes_static_ip_and_config(client):
     assert client.put("/api/clients/alice/static-ip", json={"ip": "10.0.70.100"}, headers=H).status_code == 200
     assert (TMP / "staticclients" / "alice").read_text() == "ifconfig-push 10.0.70.100 255.255.255.0\n"
     # invalid, outside the subnet, the server itself, the dynamic pool, the guest range, taken by alice
-    for ip in ("300.1.1.1", "10.0.71.9", "10.0.70.1", "10.0.70.50", "10.0.70.140", "10.0.70.100"):
+    for ip in ("300.1.1.1", "10.0.70.07", "10.0.71.9", "10.0.70.1", "10.0.70.50", "10.0.70.140", "10.0.70.100"):
         r = client.put("/api/clients/old/static-ip", json={"ip": ip}, headers=H)
         assert r.status_code == 400, ip
     assert "alice" in r.json()["detail"]
@@ -220,11 +283,68 @@ def test_notes_static_ip_and_config(client):
     r = client.put("/api/server/config/server", json={"content": conf.replace("management ", "#management ")}, headers=H)
     assert r.status_code == 400
     assert client.get("/api/server/config/nope").status_code == 400
+    # a mistyped network in server.conf is reported by OpenVPN, not by a broken dashboard
+    (TMP / "server.conf").write_text(conf.replace("server 10.0.70.0 255.255.255.0", "server 10.0.70.0 255.255.300.0"))
+    assert client.get("/api/overview").status_code == 200
+    assert client.put("/api/clients/alice/static-ip", json={"ip": "10.0.70.100"}, headers=H).status_code == 200
+    (TMP / "staticclients" / "alice").unlink()
+    (TMP / "server.conf").write_text(conf)
     s = client.get("/api/server").json()
     assert s["pki"]["ca"]["cn"] == "Test CA" and s["pki"]["crl"]["revoked"] == 1 and s["listen"] == [UDP, TCP]
     assert client.post("/api/server/restart", headers=H).status_code == 503   # no OpenVPN here
     events = client.get("/api/events").json()["events"]
     assert {"login", "client_deleted", "profile_downloaded", "remote_changed", "static_ip_set"} <= {e["kind"] for e in events}
+
+
+def test_config_editor_refuses_lines_that_run_programs(client):
+    def save(which, content):
+        return client.put(f"/api/server/config/{which}", json={"content": content}, headers=H)
+
+    conf = client.get("/api/server/config/server").json()["content"]
+    assert "client-connect /opt/app/bin/client-access.sh" in conf and save("server", conf).status_code == 200
+    for line in ("up /tmp/x.sh", "--up /tmp/x.sh", '"up" /tmp/x.sh', "u\\p /tmp/x.sh", "plugin /tmp/x.so",
+                 "script-security 3", "log-append /etc/openvpn/fw-rules.sh", "setenv PATH /tmp",
+                 "setenv opt up /tmp/x.sh", "client-connect /tmp/x.sh", "config /tmp/other.conf",
+                 "dns-updown /tmp/x.sh", "tls-crypt-v2-verify /tmp/x.sh", "providers /tmp/x", "engine /tmp/x.so",
+                 # the ways OpenVPN's parser reads an option name that a naive split does not
+                 '"up"/tmp/x.sh', "'log'/tmp/x", '"plugin""/tmp/x.so"', "\\ up /tmp/x.sh", "\\\tscript-security 3",
+                 "\tup\t/tmp/x.sh", "<up>"):
+        r = save("server", conf + line + "\n")
+        assert r.status_code == 400 and "cannot be added" in r.json()["detail"], line
+    # a byte order mark before the first line, a line long enough for OpenVPN to read its end as a
+    # line of its own, control characters
+    assert save("server", "\ufeffup /tmp/x.sh\n" + conf).status_code == 400
+    assert "longer than" in save("server", conf + "# " + "x" * 254 + "up /tmp/x.sh\n").json()["detail"]
+    for text in ("verb 3\x00up /tmp/x.sh", "\x1fup /tmp/x.sh", "verb 3\rup /tmp/x.sh"):
+        assert save("server", conf + text + "\n").status_code == 400, text
+    assert save("server", conf.replace("\n", "\r\n")).status_code == 200      # a Windows clipboard
+    # changing such a line counts as adding one; so does bringing one in as a comment first
+    assert save("server", conf.replace("client-connect /opt/app/bin/client-access.sh", "client-connect /tmp/x.sh")).status_code == 400
+    assert save("server", conf.replace("status /var/log/openvpn/openvpn-status.log 5", "status /etc/passwd 5")).status_code == 400
+    assert save("server", conf + "#up /tmp/x.sh\n").status_code == 200
+    assert save("server", conf + "up /tmp/x.sh\n").status_code == 400
+    # ordinary options, and the 2FA switch the file documents, are saved
+    r = save("server", conf.replace("#auth-user-pass-verify", "auth-user-pass-verify") + "push \"route 10.9.0.0 255.255.255.0\"\n")
+    assert r.status_code == 200, r.text
+    assert save("server", conf).status_code == 200
+    assert (TMP / "server.conf").read_text() == conf
+
+    # client profiles run on other people's devices
+    profile = client.get("/api/server/config/client").json()["content"]
+    assert save("client", profile + "script-security 2\nup /tmp/x.sh\n").status_code == 400
+    assert save("client", profile + "mssfix 1300\n").status_code == 200
+    assert save("client", profile).status_code == 200
+
+    # easy-rsa runs its vars file as a shell script
+    vars_file = client.get("/api/server/config/vars").json()["content"]
+    for line in ("touch /tmp/x", 'set_var EASYRSA_REQ_CN "$(id)"', "set_var EASYRSA_REQ_CN `id`", "set_var PATH /tmp",
+                 "set_var EASYRSA_CERT_EXPIRE 1; id", 'set_var EASYRSA_REQ_OU "a"#;touch /tmp/x',
+                 "set_var EASYRSA_REQ_OU a#;touch /tmp/x", 'set_var EASYRSA_OPENSSL "/bin/sh"',
+                 "set_var EASYRSA_PKI /tmp/pki"):
+        assert save("vars", vars_file + line + "\n").status_code == 400, line
+    assert save("vars", vars_file + 'set_var EASYRSA_CERT_EXPIRE 400\nset_var EASYRSA_REQ_ORG "My Org"  # ; a comment\n'
+                '# note\n').status_code == 200
+    (TMP / "config" / "easy-rsa.vars").unlink()      # no pki/vars here: the editor wrote the template
 
 
 def test_guests_get_addresses_per_device(client):
@@ -249,16 +369,35 @@ def test_share_link_is_single_use(client):
     r = client.post("/api/clients/alice/share", json={"hours": 2}, headers=H)
     assert r.status_code == 200, r.text
     link = r.json()
-    assert link["import_url"] == "openvpn://import-profile/" + link["url"] and "<svg" in link["qr_svg"]
+    assert link["import_url"] == "openvpn://import-profile/" + link["url"] + "/download" and "<svg" in link["qr_svg"]
     path = "/p/" + link["url"].rsplit("/p/", 1)[1]
     cookies = dict(client.cookies)
     client.cookies.clear()                       # the link works without a session
     try:
-        r = client.get(path)
+        # the link itself is a page offering the profile: a messenger's preview does not use it up
+        for _ in range(3):
+            r = client.get(path)
+            assert r.status_code == 200 and r.headers["content-type"].startswith("text/html")
+            assert "<cert>" not in r.text and "alice" not in r.text
+            assert f'href="{link["url"]}/download"' in r.text and f'href="{link["import_url"]}"' in r.text
+            assert "script-src" not in r.headers["content-security-policy"] and r.headers["cache-control"] == "no-store"
+        # a profile that cannot be built leaves the link usable
+        from app import pki
+        build = pki.build_profile
+        pki.build_profile = lambda name: (_ for _ in ()).throw(pki.PkiError("no disk space"))
+        try:
+            assert client.get(path + "/download").status_code == 400
+        finally:
+            pki.build_profile = build
+        r = client.get(path + "/download")
         assert r.status_code == 200 and "<cert>" in r.text and r.headers["cache-control"] == "no-store"
-        assert client.get(path).status_code == 404          # used
+        assert 'filename="alice.ovpn"' in r.headers["content-disposition"]
+        assert client.get(path + "/download").status_code == 404        # used
+        assert client.get(path).status_code == 404
         assert client.get("/p/not-a-token").status_code == 404
     finally:
+        from app.main import limiter
+        limiter._state.clear()
         client.cookies.update(cookies)
     assert client.post("/api/clients/old/share", json={}, headers=H).status_code == 400   # expired cert
     assert any(e["kind"] == "profile_link_used" for e in client.get("/api/events").json()["events"])
@@ -273,6 +412,7 @@ def test_rejected_attempts_from_the_logs(client):
         "CN=Ian_pile_experimental, emailAddress=sweet@home.net, serial=1656\n"
         "2026-09-26 17:06:00 TLS Error: tls-crypt unwrapping failed from [AF_INET]45.1.2.3:1234\n"
         "2026-09-26 17:06:30 TLS Error: could not determine wrapping from [AF_INET]45.1.2.3:1235\n"
+        "2026-09-26 17:06:40 client-access: refused cn='alice' from='5.6.7.9' reason=too-many-devices\n"
         "2026-09-26 17:07:00 MANAGEMENT: CMD 'version'\npartial line without newline")
     (TMP / "log" / "oath.log").write_text(
         "2026-09-26 17:08:00 2FA FAIL user='alice' cn='alice' from='5.6.7.8' reason=wrong-code\n")
@@ -284,7 +424,8 @@ def test_rejected_attempts_from_the_logs(client):
     assert rows[("", "unknown control channel key")]["address"] == "45.1.2.3"
     assert rows[("", "unknown control channel key")]["count"] == 2      # shared key and tls-crypt-v2 wording
     assert rows[("alice", "2FA: wrong code")]["address"] == "5.6.7.8"
-    assert [r["reason"] for r in client.get("/api/clients/alice").json()["rejections"]] == ["2FA: wrong code"]
+    assert rows[("alice", "too many devices")]["address"] == "5.6.7.9"
+    assert [r["reason"] for r in client.get("/api/clients/alice").json()["rejections"]] == ["2FA: wrong code", "too many devices"]
 
 
 def test_new_certificate_under_an_old_name_starts_a_new_history(client):
@@ -377,6 +518,42 @@ def test_backup_archive(client):
     finally:
         settings.backup_keep = 14
     assert any(e["kind"] == "backup_created" for e in client.get("/api/events").json()["events"])
+
+
+def test_backup_archive_encrypted(client, monkeypatch, tmp_path):
+    from app import backup
+    from app.settings import settings
+    # A stand-in for age (the real one runs in the end-to-end test): marks its output, fails on request.
+    fake = tmp_path / "age"
+    fake.write_text('#!/bin/sh\n[ "$1" = -r ] || exit 2\n[ -e "$FAIL" ] && { echo "age: no" >&2; exit 1; }\n'
+                    'printf "sealed for %s\\n" "$2"; cat\n')
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
+    monkeypatch.setenv("FAIL", str(tmp_path / "fail"))
+    key = "age1" + "q" * 58
+    before = {a.name for a in backup.archives()}
+    monkeypatch.setattr(settings, "backup_recipient", key)
+    new = backup.create()
+    assert new.name.endswith(".tar.gz.age") and new.stat().st_mode & 0o777 == 0o600
+    head, _, rest = new.read_bytes().partition(b"\n")
+    assert head == f"sealed for {key}".encode() and rest[:2] == b"\x1f\x8b"       # the gzip stream went through age
+    assert client.get("/api/server").json()["backup"]["encrypted"] is True
+    # a failing age or a recipient that is not a key: an error, never an unencrypted archive
+    (tmp_path / "fail").touch()
+    r = client.post("/api/server/backup", headers=H)
+    assert r.status_code == 500 and "age: no" in r.json()["detail"]
+    monkeypatch.setattr(settings, "backup_recipient", "not-a-key")
+    assert client.post("/api/server/backup", headers=H).status_code == 500
+    assert {a.name for a in backup.archives()} == before | {new.name}
+    assert list(new.parent.glob(".*")) == []
+    new.unlink()
+
+
+def test_health_reports_a_dead_collector(client, monkeypatch):
+    from app.main import collector
+    assert client.get("/healthz").status_code == 200
+    monkeypatch.setattr(collector, "alive", lambda: False)
+    assert client.get("/healthz").status_code == 503
 
 
 def test_page_asks_for_the_assets_of_this_version(client):

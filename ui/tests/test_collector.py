@@ -269,3 +269,44 @@ def test_a_database_from_1_4_gets_the_new_columns_and_visits(tmp_path):
     assert db.group_sessions() == 4 and db.group_sessions() == 0
     got = [(r["grp"], r["proto"]) for r in db.query("SELECT grp, proto FROM vpn_sessions ORDER BY id")]
     assert got == [(1, "udp"), (1, "tcp"), (3, None), (4, None)]
+
+
+def test_a_failed_database_write_does_not_stop_the_collector(tmp_path):
+    import sqlite3
+    import threading
+    db = Database(tmp_path / "c.db")
+    mgmt = FakeMgmt()
+    since = int(time.time()) - 100
+    mgmt.clients = [client("alice", 0, since, 100, 200), client("bob", 1, since, 1, 2)]
+    c = Collector(db, mgmt, 0.01)
+    c.poll()
+
+    # the disk fills up: every write fails, also the one that reports OpenVPN as gone
+    real_tx, broken = db.tx, threading.Event()
+
+    def tx():
+        if broken.is_set():
+            raise sqlite3.OperationalError("database or disk is full")
+        return real_tx()
+    db.tx = tx
+    broken.set()
+    mgmt.load_stats = lambda: (_ for _ in ()).throw(ManagementError("down"))
+    c.start()
+    time.sleep(0.2)
+    assert c.alive() and not c._active          # still turning, and no longer trusting its own state
+
+    # space is back, bob has left meanwhile: alice continues in her row, bob's row is closed
+    mgmt.load_stats = lambda: {}
+    mgmt.clients = [client("alice", 0, since, 150, 260)]
+    broken.clear()
+    deadline = time.time() + 10                 # the collector retries a few seconds after an outage
+    while time.time() < deadline and db.one("SELECT bytes_in FROM vpn_sessions WHERE client_name = 'alice'")["bytes_in"] != 150:
+        time.sleep(0.05)
+    c.stop()
+    c.join(2)
+    rows = {r["client_name"]: r for r in db.query("SELECT * FROM vpn_sessions")}
+    assert len(rows) == 2
+    assert rows["alice"]["disconnected_at"] is None and rows["alice"]["bytes_in"] == 150
+    assert rows["bob"]["disconnected_at"] is not None
+    assert db.totals(0, int(time.time()) + 1, "alice") == (150, 260)
+    assert not c.alive()                        # stopped: /healthz would say so

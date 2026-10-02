@@ -24,7 +24,9 @@ mkdir -p "$OPENVPN_DIR/clients"
 touch "$OATH_SECRETS"
 { grep -v "^${NAME//./\\.}:" "$OATH_SECRETS" || true; echo "$NAME:$SECRET"; } > "$OATH_SECRETS.tmp"
 mv -f "$OATH_SECRETS.tmp" "$OATH_SECRETS"
-chmod 644 "$OATH_SECRETS"   # must stay readable by the unprivileged OpenVPN user
+# Only for the unprivileged OpenVPN user, whose verify script reads it. Where the
+# owner cannot be changed (not root), it stays readable for everyone instead.
+chown nobody "$OATH_SECRETS" 2>/dev/null && chmod 600 "$OATH_SECRETS" || chmod 644 "$OATH_SECRETS"
 
 label=$(printf '%s' "$ISSUER:$NAME" | sed 's/ /%20/g')
 issuer=$(printf '%s' "$ISSUER" | sed 's/ /%20/g')

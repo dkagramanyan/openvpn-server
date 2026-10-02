@@ -26,13 +26,13 @@ RUN apk add --no-cache curl \
 FROM ${PYTHON_IMAGE}
 
 RUN apk --no-cache --no-progress upgrade \
-    && apk add --no-cache --no-progress bash openssl openvpn oath-toolkit-oathtool libqrencode-tools tzdata
+    && apk add --no-cache --no-progress bash openssl openvpn oath-toolkit-oathtool libqrencode-tools tzdata age
 
 COPY --from=easyrsa /out/usr/share/easy-rsa/ /usr/share/easy-rsa/
 
 WORKDIR /opt/openvpn-ui
 COPY ui/requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --require-hashes -r requirements.txt
 
 COPY bin/ /opt/app/bin/
 COPY ui/app/ ./app/
@@ -47,7 +47,7 @@ ENV OPENVPN_DIR=/etc/openvpn \
 EXPOSE 8080
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-    CMD ["python", "-c", "import os,sys,urllib.request as u; h=os.environ['UVICORN_HOST']; h='127.0.0.1' if h=='0.0.0.0' else h; sys.exit(u.urlopen(f'http://{h}:8080/healthz', timeout=4).status != 200)"]
+    CMD ["python", "-c", "import os,sys,urllib.request as u; h=os.environ['UVICORN_HOST']; h='127.0.0.1' if h=='0.0.0.0' else h; sys.exit(u.build_opener(u.ProxyHandler({})).open(f'http://{h}:8080/healthz', timeout=4).status != 200)"]
 
 # UVICORN_HOST sets the listen address; X-Forwarded-For is only believed from
 # FORWARDED_ALLOW_IPS (a reverse proxy), never from arbitrary clients.

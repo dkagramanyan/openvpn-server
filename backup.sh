@@ -2,20 +2,24 @@
 # Backup / restore the OpenVPN server environment (PKI, profiles, configs, UI database).
 #
 # The web UI also writes an archive of the same files once a day into
-# <server dir>/backups; -r restores from such an archive as well.
+# <server dir>/backups; -r restores from such an archive as well, also from an
+# encrypted one (.tar.gz.age) when given the private key with -i.
 set -euo pipefail
 
 usage() {
     echo -e "\n\033[1mBackup or restore of the OpenVPN server environment\033[0m"
     echo -e "  \033[1;32mBackup:\033[0m  sudo ./backup.sh [-y] -b <server dir> <backup dir>"
-    echo -e "  \033[1;34mRestore:\033[0m sudo ./backup.sh [-y] -r <server dir> <backup dir | backup archive>\n"
+    echo -e "  \033[1;34mRestore:\033[0m sudo ./backup.sh [-y] [-i <key file>] -r <server dir> <backup dir | backup archive>\n"
     echo -e "  -y  do not ask for confirmation (for cron)"
+    echo -e "  -i  the age private key that opens an encrypted archive (.tar.gz.age)"
     echo -e "  Example: sudo ./backup.sh -b ~/openvpn-server ~/backup/openvpn-$(date +%F)\n"
     exit 1
 }
 
 YES=0
+IDENTITY=
 if [[ ${1:-} == -y ]]; then YES=1; shift; fi
+if [[ ${1:-} == -i ]]; then IDENTITY=${2:-}; shift 2 || usage; fi
 [[ $# -eq 3 ]] || usage
 ACTION=$1
 SERVER_ENV=${2%/}
@@ -64,7 +68,13 @@ case $ACTION in
         if [[ -f $BACKUP_DIR ]]; then     # an archive written by the web UI
             tmp=$(mktemp -d)
             trap 'rm -rf "$tmp"' EXIT
-            tar xzpf "$BACKUP_DIR" -C "$tmp"
+            if [[ $BACKUP_DIR == *.age ]]; then
+                [[ -f $IDENTITY ]] || { echo -e "\033[1;31mThis archive is encrypted: pass the private key with -i <key file>\033[0m"; exit 1; }
+                command -v age >/dev/null || { echo -e "\033[1;31mage is not installed. Install it, or decrypt on another machine: age -d -i <key file> archive.tar.gz.age > archive.tar.gz\033[0m"; exit 1; }
+                age -d -i "$IDENTITY" "$BACKUP_DIR" | tar xzpf - -C "$tmp"
+            else
+                tar xzpf "$BACKUP_DIR" -C "$tmp"
+            fi
             BACKUP_DIR=$tmp
         fi
         for item in "${ITEMS[@]}"; do

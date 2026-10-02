@@ -12,7 +12,8 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.14"
-      - run: pip install -r ui/requirements.txt pytest httpx
+      - run: pip install --require-hashes -r ui/requirements.txt
+      - run: pip install pytest httpx
       - run: python -m pytest ui/tests -q
 
   e2e:

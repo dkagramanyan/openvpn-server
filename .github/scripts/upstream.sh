@@ -1,6 +1,7 @@
 #!/bin/bash
-# Compare the versions pinned in the Dockerfile with the newest upstream
-# releases and open an issue when one is behind. DRY_RUN=1 only prints.
+# Compare the versions pinned in the Dockerfile and in ui/requirements.in with
+# the newest upstream releases and open an issue when one is behind.
+# DRY_RUN=1 only prints.
 set -euo pipefail
 
 pinned() { sed -n "s/^ARG $1=//p" Dockerfile | head -1; }
@@ -22,15 +23,20 @@ check easy-rsa "$(pinned EASYRSA_VERSION)" "$(newest OpenVPN/easy-rsa)" https://
 check Alpine "$(pinned ALPINE_VERSION)" \
     "$(curl -fsSL https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/x86_64/latest-releases.yaml | sed -n 's/^ *version: *//p' | head -1)" \
     https://alpinelinux.org/releases/
+for pkg in $(sed -n 's/==.*//p' ui/requirements.in); do
+    check "$pkg" "$(sed -n "s/^$pkg==//p" ui/requirements.in)" \
+        "$(curl -fsSL "https://pypi.org/pypi/$pkg/json" | python3 -c 'import json, sys; print(json.load(sys.stdin)["info"]["version"])')" \
+        "https://pypi.org/project/$pkg/"
+done
 
 (( ${#behind[@]} )) || { echo "Everything is current."; exit 0; }
 
 title="Upstream releases: $(printf '%s\n' "${behind[@]}" | sed 's/^- \*\*\(.*\)\*\* .* -> \([^ ]*\) .*/\1 \2/' | paste -sd, | sed 's/,/, /g')"
-body="Newer releases than the ones pinned in \`Dockerfile\` and \`ui/Dockerfile\`:
+body="Newer releases than the ones pinned in \`Dockerfile\`, \`ui/Dockerfile\` and \`ui/requirements.in\`:
 
 $(printf '%s\n' "${behind[@]}")
 
-For OpenVPN and easy-rsa, verify the tarball's OpenPGP signature before pinning its SHA-256 (the keys are named at the top of \`Dockerfile\`). A new Alpine minor release also changes \`PYTHON_IMAGE\` in \`ui/Dockerfile\`. Run \`tests/e2e/run.sh\` before releasing."
+For OpenVPN and easy-rsa, verify the tarball's OpenPGP signature before pinning its SHA-256 (the keys are named at the top of \`Dockerfile\`). A new Alpine minor release also changes \`PYTHON_IMAGE\` in \`ui/Dockerfile\`. After changing \`ui/requirements.in\`, regenerate \`ui/requirements.txt\` with the command at its top. Run \`tests/e2e/run.sh\` before releasing."
 echo "$title"
 if [[ -n ${DRY_RUN:-} ]]; then
     echo "$body"

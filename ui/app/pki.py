@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import base64
+import functools
 import hashlib
 import io
 import ipaddress
 import os
 import re
 import subprocess
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,7 +19,7 @@ import segno
 
 from .settings import settings
 
-NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@-]{0,63}$")
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@-]{0,63}\Z")       # \Z: "$" would accept a trailing newline
 IP_RE = re.compile(r"^(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)$")
 HOST_RE = re.compile(r"^[A-Za-z0-9.\-:]{1,253}$")
 RESERVED = {"server", "ca"}
@@ -25,6 +27,18 @@ REVOKE_REASONS = {"unspecified", "keyCompromise", "CACompromise", "affiliationCh
                   "cessationOfOperation", "certificateHold"}
 
 TFA_LINES = ("auth-user-pass-verify /opt/app/bin/oath.sh via-file", "auth-gen-token 43200")
+
+# One at a time for everything that changes the PKI, the profiles or a configuration file: two
+# easy-rsa runs at once corrupt its index, and the scripts write through fixed temporary names.
+lock = threading.RLock()
+
+
+def _locked(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with lock:
+            return fn(*args, **kwargs)
+    return wrapper
 
 
 class PkiError(Exception):
@@ -69,11 +83,13 @@ def _run(cmd: list[str], extra_env: dict[str, str] | None = None, timeout: int =
 
 
 def script(name: str, *args: str, extra_env: dict[str, str] | None = None) -> str:
-    return _run([str(settings.bin_dir / name), *args], extra_env)
+    with lock:
+        return _run([str(settings.bin_dir / name), *args], extra_env)
 
 
 def easyrsa(*args: str) -> str:
-    return _run([str(settings.easyrsa_dir / "easyrsa"), *args])
+    with lock:
+        return _run([str(settings.easyrsa_dir / "easyrsa"), *args])
 
 
 def openssl(*args: str) -> str:
@@ -196,22 +212,26 @@ def vpn_subnet() -> tuple[ipaddress.IPv4Network, tuple[int, int]] | None:
     m = re.search(r"^\s*server\s+([\d.]+)\s+([\d.]+)(\s+nopool)?", text, re.M)
     if not m:
         return None
-    net = ipaddress.IPv4Network(f"{m.group(1)}/{m.group(2)}", strict=False)
-    pool = (int(net.network_address) + 2, int(net.broadcast_address) - 1)
-    if m.group(3):
-        p = re.search(r"^\s*ifconfig-pool\s+([\d.]+)\s+([\d.]+)", text, re.M)
-        pool = (int(ipaddress.IPv4Address(p.group(1))), int(ipaddress.IPv4Address(p.group(2)))) if p else (0, -1)
+    try:
+        net = ipaddress.IPv4Network(f"{m.group(1)}/{m.group(2)}", strict=False)
+        pool = (int(net.network_address) + 2, int(net.broadcast_address) - 1)
+        if m.group(3):
+            p = re.search(r"^\s*ifconfig-pool\s+([\d.]+)\s+([\d.]+)", text, re.M)
+            pool = (int(ipaddress.IPv4Address(p.group(1))), int(ipaddress.IPv4Address(p.group(2)))) if p else (0, -1)
+    except ValueError:      # a mistyped address or mask in server.conf
+        return None
     return net, pool
 
 
 def static_ip_problem(name: str, ip: str) -> str | None:
     """Why OpenVPN could not hand out <ip> to <name> as a static address, or None."""
-    if not IP_RE.match(ip):
+    try:
+        addr = ipaddress.IPv4Address(ip)        # stricter than IP_RE: no "10.0.70.07"
+    except ValueError:
         return "Invalid IPv4 address"
     subnet = vpn_subnet()
     if subnet:
         net, (first, last) = subnet
-        addr = ipaddress.IPv4Address(ip)
         # With "topology subnet" OpenVPN only accepts addresses inside the server network.
         if addr not in net or addr in (net.network_address, net.network_address + 1, net.broadcast_address):
             return f"{ip} is not a client address in the VPN subnet {net}"
@@ -241,6 +261,7 @@ def guests() -> set[str]:
         return set()
 
 
+@_locked
 def set_guest(name: str, guest: bool) -> None:
     validate_name(name)
     marker = settings.guests_dir / name
@@ -261,6 +282,7 @@ def migrate_guest_static_ips() -> list[str]:
     return moved
 
 
+@_locked
 def set_static_ip(name: str, ip: str | None) -> None:
     validate_name(name)
     if ip and name in guests():
@@ -485,6 +507,87 @@ def read_config(which: str) -> str:
         return ""
 
 
+# OpenVPN runs as root on the server and often on the clients, so a configuration line that
+# names a program to run, code to load or a file to write hands that power to whoever can edit
+# the file. The editor keeps such lines as they are and refuses new or changed ones.
+PRIVILEGED = frozenset((
+    # programs OpenVPN runs (every option of the class OPT_P_SCRIPT in options.c), and plugins
+    "up", "down", "ipchange", "route-up", "route-pre-down", "tls-verify", "auth-user-pass-verify",
+    "client-connect", "client-disconnect", "client-crresponse", "learn-address", "dns-updown",
+    "tls-crypt-v2-verify", "tls-export-cert", "plugin",
+    # code OpenSSL loads, and the "ip" program
+    "engine", "providers", "pkcs11-providers", "iproute",
+    # what scripts may do and see, other files of options, where OpenVPN runs
+    "script-security", "setenv", "setenv-safe", "config", "cd", "chroot", "daemon",
+    # files OpenVPN writes
+    "log", "log-append", "status", "writepid", "ifconfig-pool-persist", "replay-persist", "tmp-dir",
+    "management-client-user", "management-client-group",
+))
+MAX_LINE = 255          # OpenVPN reads longer lines in pieces, the rest as a line of its own
+_C_SPACE = " \t\n\v\f\r"
+# The variables of easy-rsa that describe certificates; others name programs and directories.
+_VARS_LINE = re.compile(
+    r"set_var[ \t]+EASYRSA_(DN|REQ_(COUNTRY|PROVINCE|CITY|ORG|EMAIL|OU|CN|SERIAL)|ALGO|CURVE|KEY_SIZE|DIGEST|"
+    r"CA_EXPIRE|CERT_EXPIRE|CRL_DAYS|CERT_RENEW|PRE_EXPIRY_WINDOW|RAND_SN|NS_SUPPORT|NS_COMMENT)"
+    r'[ \t]+("[^"$`\\]*"|[A-Za-z0-9_.,@:/+-]+)([ \t]+#.*)?')
+
+
+def option_name(line: str) -> str:
+    """The option a configuration line sets, read the way OpenVPN reads it (parse_line() in
+    options_parse.c): quotes and backslashes resolved, a leading "--" and the <> of an inline
+    block dropped. "" for a blank or comment line."""
+    name, state, backslash = [], "start", False
+    for ch in line + "\0":
+        space = ch == "\0" or ch in _C_SPACE
+        if ch == "\\" and not backslash and state != "single":
+            backslash = True
+            continue
+        if state == "start":
+            if not space:
+                if ch in ";#":
+                    break
+                if ch == '"' and not backslash:
+                    state = "double"
+                elif ch == "'" and not backslash:
+                    state = "single"
+                else:
+                    name.append(ch)
+                    state = "plain"
+        elif (state == "plain" and space and not backslash) or (state == "double" and ch == '"' and not backslash) \
+                or (state == "single" and ch == "'"):
+            break               # the first parameter is complete
+        elif ch != "\0":
+            name.append(ch)
+        backslash = False
+    word = "".join(name)
+    if len(word) >= 3 and word.startswith("--"):
+        word = word[2:]
+    return word[1:-1] if word.startswith("<") and word.endswith(">") else word
+
+
+def check_edit(which: str, content: str) -> None:
+    """Refuse what an edit made in the web UI may not add to a configuration file."""
+    content = content.replace("\r\n", "\n")
+    if re.search(r"[\x00-\x08\x0b-\x1f\x7f]", content):
+        raise PkiError("The file contains control characters")
+    # A line that is in force today stays; so do the two lines of the 2FA switch.
+    known = {l.strip(_C_SPACE) for l in read_config(which).split("\n")} | set(TFA_LINES)
+    # Lines as OpenVPN and the shell see them: ended by "\n" only, after a byte order mark.
+    for n, raw in enumerate(content.removeprefix("﻿").split("\n"), 1):
+        line = raw.strip(_C_SPACE)
+        if line in known:
+            continue
+        if which == "vars":     # easy-rsa runs this file as a shell script
+            if line and not line.startswith("#") and not _VARS_LINE.fullmatch(line):
+                raise PkiError(f"Line {n}: only comments and 'set_var EASYRSA_... value' lines for the certificate "
+                               "fields, key type and lifetimes can be added here")
+        elif len(raw.encode()) > MAX_LINE:
+            raise PkiError(f"Line {n} is longer than {MAX_LINE} bytes, which OpenVPN does not read as one line")
+        elif option_name(raw) in PRIVILEGED:
+            raise PkiError(f"Line {n}: '{option_name(raw)}' runs a program or redirects a file. Such a line cannot "
+                           f"be added or changed here - edit {CONFIG_FILES[which]} on the server instead.")
+
+
 def write_config(which: str, content: str) -> None:
     path = config_path(which)
     if len(content) > 200_000:
@@ -496,12 +599,13 @@ def write_config(which: str, content: str) -> None:
         if not re.search(r"^\s*management\s+", content, re.M):
             raise PkiError("server.conf must keep the 'management' line - the UI needs it")
     try:
-        if path.exists():
-            backup = path.with_name(path.name + ".bak")
-            backup.write_text(path.read_text())
-        # Write in place so bind mounts keep pointing at the same inode.
-        with open(path, "w") as fh:
-            fh.write(content)
+        with lock:
+            if path.exists():
+                backup = path.with_name(path.name + ".bak")
+                backup.write_text(path.read_text())
+            # Write in place so bind mounts keep pointing at the same inode.
+            with open(path, "w") as fh:
+                fh.write(content)
     except OSError as exc:
         raise PkiError(f"cannot write {path.name}: {exc}") from exc
 
@@ -527,6 +631,7 @@ def server_listen() -> list[dict[str, str]]:
     return [{"port": p or port, "proto": pr or proto} for p, pr in local] or [{"port": port, "proto": proto}]
 
 
+@_locked
 def set_remote(host: str, ports: dict[str, int | str] | None = None) -> None:
     """Point client profiles at <host>, with one "remote" line per listening socket, UDP first
     so the client falls back to TCP. A port forward can remap a port but never the protocol, so
@@ -576,6 +681,7 @@ def control_channel() -> str:
     return m.group(1) if m else "none"
 
 
+@_locked
 def set_control_channel(per_client: bool) -> None:
     """Switch between one shared tls-crypt key and a tls-crypt-v2 key per client. Every profile
     changes, so clients need their profile again, and OpenVPN a restart."""
@@ -592,6 +698,7 @@ def tfa_enforced() -> bool:
     return bool(re.search(r"^\s*auth-user-pass-verify\s+", read_config("server"), re.M))
 
 
+@_locked
 def set_tfa_enforced(enabled: bool) -> None:
     text = read_config("server")
     lines = [l for l in text.splitlines()

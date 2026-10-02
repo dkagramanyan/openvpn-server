@@ -64,13 +64,89 @@ def test_password_hashing_and_limiter():
     assert auth.verify_password("correct horse", h)
     assert not auth.verify_password("wrong", h)
     assert not auth.verify_password("x", "garbage")
+    assert not auth.needs_rehash(h) and auth.needs_rehash("scrypt$32768$8$1$c2FsdA==$ZGlnZXN0")
+    assert auth.verify_password("pw", auth.hash_password("pw").replace("$3$", "$1$")) is False
+
+
+def test_login_limiter():
     lim = auth.LoginLimiter(threshold=2, max_delay=10)
-    lim.record_failure("k")
-    assert lim.retry_after("k") == 0
-    lim.record_failure("k")
-    assert lim.retry_after("k") > 0
-    lim.record_success("k")
-    assert lim.retry_after("k") == 0
+    assert lim.attempt("k") == 0            # the first attempt goes ahead ...
+    assert lim.attempt("k") == 0            # ... and the second, which reaches the threshold
+    assert lim.attempt("k") > 0             # so the third has to wait
+    lim.success("k")
+    assert lim.attempt("k") == 0
+    # several keys with a threshold each (user name and address of the login form): an attempt
+    # that one key holds back is not counted against the other
+    assert [lim.attempt({"ip": 4, "ip|admin": 2}) > 0 for _ in range(6)] == [False, False] + [True] * 4
+    assert lim._state["ip"][0] == 2 and lim._state["ip|admin"][0] == 2
+    assert lim.attempt({"ip": 4, "ip|other": 2}) == 0
+
+
+def test_login_limiter_counts_parallel_attempts_and_is_not_reset_by_a_flood():
+    import threading
+    lim = auth.LoginLimiter(threshold=5, max_keys=100)
+    passed = []
+    threads = [threading.Thread(target=lambda: passed.append(lim.attempt("admin") == 0)) for _ in range(40)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert sum(passed) == 5                 # not 40: each attempt is counted before it is checked
+    # 150 other names push out the oldest entries, never the whole table
+    lim = auth.LoginLimiter(threshold=2, max_keys=100)
+    lim.attempt("old")
+    for i in range(150):
+        lim.attempt(f"flood{i}")
+        if i == 50:
+            lim.attempt("admin"), lim.attempt("admin")      # blocked from here on
+    assert len(lim._state) == 100 and "old" not in lim._state
+    assert lim.attempt("admin") > 0
+    # failures are forgotten once the last of them is old enough
+    lim = auth.LoginLimiter(threshold=2, forget=60)
+    lim._state["k"] = (7, time.monotonic() - 61)
+    assert lim.attempt("k") == 0 and lim._state["k"][0] == 1
+    lim._state["k"] = (7, time.monotonic() - 59)
+    assert lim.attempt("k") == 0 and lim._state["k"][0] == 8 and lim.attempt("k") > 0
+
+
+def test_management_password_is_read_when_connecting():
+    answers = iter([None, "secret"])
+    m = mgmt.Management("127.0.0.1", 1, lambda: next(answers))
+    assert m.password is None and m.password == "secret"       # the file appeared after the UI started
+    assert mgmt.Management("127.0.0.1", 1, "fixed").password == "fixed"
+
+
+def test_a_failed_commit_does_not_leave_the_connection_in_a_transaction(tmp_path):
+    import sqlite3
+    db = Database(tmp_path / "t.db")
+    conn = db._conn()
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
+    conn.execute("CREATE TABLE child (p INTEGER REFERENCES parent (id) DEFERRABLE INITIALLY DEFERRED)")
+    try:
+        with db.tx() as c:
+            c.execute("INSERT INTO child (p) VALUES (1)")      # checked at COMMIT, which then fails
+        raise AssertionError("the commit should have failed")
+    except sqlite3.IntegrityError:
+        pass
+    db.set_setting("k", "v")                                    # the next transaction starts normally
+    assert db.get_setting("k") == "v" and db.one("SELECT COUNT(*) AS n FROM child")["n"] == 0
+
+
+def test_watchdog_ends_an_unresponsive_process():
+    import threading
+    from app.watchdog import Watchdog
+    died = threading.Event()
+    answers = iter([True, False, False, True, False, False, False])
+    dog = Watchdog(lambda: next(answers, False), interval=0.01, failures=3, grace=0, die=died.set)
+    dog.start()
+    assert died.wait(5)                     # three failures in a row, not two
+    assert next(answers, None) is None
+    healthy = Watchdog(lambda: True, interval=0.01, failures=1, grace=0, die=died.clear)
+    healthy.start()
+    time.sleep(0.1)
+    healthy.stop()
+    assert died.is_set()
 
 
 def test_traffic_aggregation_and_rollup(tmp_path):
@@ -103,6 +179,22 @@ def test_sessions_lifecycle(tmp_path):
     assert row["disconnected_at"] == 200
     stats = db.session_stats_by_client()
     assert stats["alice"]["sessions"] == 1 and stats["alice"]["online_seconds"] == 100
+
+
+def test_name_with_a_trailing_newline_is_refused():
+    import pytest
+    for name in ("alice\n", "alice\nbob", " alice"):
+        with pytest.raises(pki.PkiError):
+            pki.validate_name(name)
+    assert not mgmt.NAME_RE.match("alice\n") and mgmt.NAME_RE.match("alice")
+
+
+def test_option_name_is_read_like_openvpn_reads_it():
+    for line, name in (("up /x", "up"), ("  --up /x", "up"), ('"up"/x', "up"), ("'up'/x", "up"), ("u\\p /x", "up"),
+                       ("\\ up /x", "up"), ('u"p" /x', 'u"p"'), ("<ca>", "ca"), ("# up /x", ""), ("; up", ""), ("", ""),
+                       ('push "route 10.0.0.0 255.0.0.0"', "push"), ("-up", "-up"), ("--", "--"),
+                       ("\xa0up /x", "\xa0up"), ("'a b' c", "a b"), ('"a\\"b" c', 'a"b')):
+        assert pki.option_name(line) == name, line
 
 
 def test_name_validation():

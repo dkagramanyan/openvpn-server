@@ -17,17 +17,20 @@ from .mgmt import Management, ManagementError, read_status_file
 log = logging.getLogger("openvpn-ui.collector")
 
 _TS = r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) "
-_REJECTS = (
+_REJECTS = (    # pattern, then (client, reason, source address) of a match
     # a certificate the server refused: revoked, expired, not from this CA, ...
     (re.compile(_TS + r"[\w-]+:([0-9a-fA-F.:]+?):\d+ VERIFY ERROR: depth=0, error=([^:]+):.*?\bCN=([^,/]+)"),
-     lambda m: (m[4], m[3])),
+     lambda m: (m[4], m[3], m[2])),
     # control channel key mismatch: a profile from another server, or a scanner
     (re.compile(_TS + r"TLS Error: (?:(?:tls-crypt unwrapping|incoming packet authentication) failed|"
                 r"could not determine wrapping) from \[AF_INET6?\]([0-9a-fA-F.:]+?):\d+"),
-     lambda m: ("", "unknown control channel key")),
+     lambda m: ("", "unknown control channel key", m[2])),
     # 2FA (log/oath.log, written by bin/oath.sh)
     (re.compile(_TS + r"2FA FAIL user='[^']*' cn='([^']*)' from='([^']*)' reason=(\S+)"),
-     lambda m: (m[2], "2FA: " + m[4].replace("-", " "))),
+     lambda m: (m[2], "2FA: " + m[4].replace("-", " "), m[3])),
+    # one certificate on too many devices, or the guest range is full (bin/client-access.sh)
+    (re.compile(_TS + r"client-access: refused cn='([^']*)' from='([^']*)' reason=(\S+)"),
+     lambda m: (m[2], m[4].replace("-", " "), m[3])),
 )
 
 
@@ -36,8 +39,7 @@ def parse_rejection(line: str) -> tuple[int, str, str, str] | None:
     for rx, fields in _REJECTS:
         m = rx.match(line)
         if m:
-            client, reason = fields(m)
-            address = m[3] if rx is _REJECTS[2][0] else m[2]
+            client, reason, address = fields(m)
             return int(time.mktime(time.strptime(m[1], "%Y-%m-%d %H:%M:%S"))), client, reason, address
     return None
 
@@ -87,11 +89,13 @@ class Collector(threading.Thread):
         self._status_time: int | None = None
         self._stop = threading.Event()
         self._lock = threading.Lock()
+        self.heartbeat = time.monotonic()       # the last turn of run(): /healthz reports a stuck or dead collector
         self._subscribers: list[tuple[asyncio.AbstractEventLoop, asyncio.Queue]] = []
         # key -> {session_id, bytes_in, bytes_out, ts, rate_in, rate_out}
         self._active: dict[tuple[int, int, str], dict[str, Any]] = {}
         # Handshakes read from the log whose session row has no device yet: address -> {ts, cn, PLAT, ...}
         self._pending: dict[str, dict[str, Any]] = {}
+        self._resync = False        # after a failed write: _active may not match the database
         self.live: dict[str, Any] = {
             "connected": False,
             "error": None,
@@ -138,26 +142,40 @@ class Collector(threading.Thread):
         self._stop.set()
 
     def run(self) -> None:
-        closed = self.db.close_stale_sessions()
-        if closed:
-            log.info("closed %d VPN sessions left open by a previous run", closed)
+        try:
+            closed = self.db.close_stale_sessions()
+            if closed:
+                log.info("closed %d VPN sessions left open by a previous run", closed)
+        except Exception:
+            log.exception("could not close the sessions of a previous run")
         backoff = 2.0
         while not self._stop.is_set():
+            self.heartbeat = time.monotonic()
             delay = self.interval
-            try:
-                self.poll()
-                backoff = 2.0
-            except (ManagementError, OSError) as exc:
-                self._handle_down(str(exc))
-                delay = backoff
-                backoff = min(backoff * 1.5, 15.0)
-            except Exception:   # never let the thread die
+            try:    # never let the thread die
+                try:
+                    self.poll()
+                    backoff = 2.0
+                except (ManagementError, OSError) as exc:
+                    delay = backoff
+                    backoff = min(backoff * 1.5, 15.0)
+                    self._handle_down(str(exc))
+            except Exception:
+                # Most likely a failed database write, rolled back: forget what this thread
+                # believes is stored and take it from the database on the next turn.
                 log.exception("collector error")
+                self._active.clear()
+                self._status_time = None
+                self._resync = True
             try:
                 self.read_logs()    # after poll(): a session has its row before the log describes it
             except Exception:
                 log.exception("reading the OpenVPN logs failed")
             self._stop.wait(delay)
+
+    def alive(self) -> bool:
+        """Running, and its last turn began no longer ago than a slow turn plus the pause takes."""
+        return self.is_alive() and time.monotonic() - self.heartbeat < 180 + 2 * self.interval
 
     def read_logs(self, max_bytes: int = 4 << 20) -> None:
         """Take from the lines appended to the logs since the last call: rejected connection attempts,
@@ -320,6 +338,11 @@ class Collector(threading.Thread):
                                      "rate_in": entry["rate_in"], "rate_out": entry["rate_out"]})
 
             self._close_sessions(conn, [k for k in self._active if k not in seen], now)
+            if self._resync:        # sessions that ended while _active was lost
+                ids = [e["session_id"] for e in self._active.values()]
+                conn.execute("UPDATE vpn_sessions SET disconnected_at = last_seen WHERE disconnected_at IS NULL "
+                             f"AND id NOT IN ({', '.join('?' * len(ids))})", ids)
+        self._resync = False
 
         live_clients.sort(key=lambda c: (c["cn"], c["connected_since"]))
         with self._lock:

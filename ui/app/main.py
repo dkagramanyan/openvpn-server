@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import html
 import json
 import logging
 import secrets
@@ -16,7 +19,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Str
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import __version__, auth, backup, pki
+from . import __version__, auth, backup, pki, watchdog
 from .collector import Collector, Maintenance
 from .db import Database
 from .mgmt import Management, ManagementError
@@ -31,11 +34,13 @@ STATIC_DIR = Path(__file__).parent / "static"
 EXPIRING_DAYS = 30
 BACKUP_WARN_DAYS = 3
 STARTED = time.time()
+IP_ATTEMPTS = 20        # failed logins from one address, whatever the user name, before it has to wait
+SESSION_RECHECK = 60    # seconds between two looks at the session of an open live stream
 RANGES = {"today": None, "24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400, "90d": 90 * 86400, "all": None}
 
 db = Database(settings.db_path)
 _mgmt_host, _mgmt_port, _ = settings.management_endpoint()
-mgmt = Management(_mgmt_host, _mgmt_port, settings.management_password())
+mgmt = Management(_mgmt_host, _mgmt_port, settings.management_password)
 collector = Collector(db, mgmt, settings.poll_interval, settings.status_file,
                       (settings.log_dir / "openvpn.log", settings.log_dir / "oath.log"))
 maintenance = Maintenance(db, [lambda: pki.ensure_crl_fresh(), backup.ensure_recent])
@@ -97,7 +102,10 @@ async def lifespan(_: FastAPI):
                     settings.management_endpoint()[2])
     collector.start()
     maintenance.start()
+    dog = watchdog.start()
     yield
+    if dog:
+        dog.stop()
     collector.stop()
     maintenance.stop()
     mgmt.close()
@@ -331,16 +339,21 @@ def event(kind: str, user: dict[str, Any] | None, client: str | None = None, det
 # -- auth endpoints -------------------------------------------------------------
 @app.post("/api/login", dependencies=[Csrf])
 def login(body: LoginBody, request: Request, response: Response):
-    key = f"{client_ip(request)}|{body.username.lower()}"
-    wait = limiter.retry_after(key)
+    ip = client_ip(request)
+    key = f"{ip}|{body.username.lower()}"
+    wait = limiter.attempt({ip: IP_ATTEMPTS, key: limiter.threshold})
     if wait:
         raise HTTPException(429, f"Too many attempts, try again in {wait}s", headers={"Retry-After": str(wait)})
     row = db.one("SELECT * FROM users WHERE username = ?", (body.username,))
+    if row is None:
+        auth.verify_unknown_user(body.password)
     if row is None or not auth.verify_password(body.password, row["password_hash"]):
-        limiter.record_failure(key)
-        db.add_event("login_failed", None, body.username[:64], client_ip(request))
+        db.add_event("login_failed", None, body.username[:64], ip)
         raise HTTPException(401, "Invalid username or password")
-    limiter.record_success(key)
+    limiter.success(ip)
+    limiter.success(key)
+    if auth.needs_rehash(row["password_hash"]):
+        db.execute("UPDATE users SET password_hash = ? WHERE id = ?", (auth.hash_password(body.password), row["id"]))
     token = auth.create_session(db, row["id"], settings.session_ttl, client_ip(request),
                                 request.headers.get("user-agent"))
     db.execute("UPDATE users SET last_login = ? WHERE id = ?", (int(time.time()), row["id"]))
@@ -451,14 +464,22 @@ def overview(range: str = "today", tz: int = 0, user: dict[str, Any] = Authed):
 
 
 @app.get("/api/stream")
-async def stream(user: dict[str, Any] = Authed):
+async def stream(request: Request, user: dict[str, Any] = Authed):
+    token = request.cookies.get(COOKIE)
+
     # Async on purpose: a sync generator would hold one of the 40 worker threads for as long as
     # the stream is open, and enough open tabs (or proxy connections) would stall every endpoint.
     async def gen() -> AsyncIterator[str]:
         q = collector.subscribe()
+        checked = time.monotonic()
         try:
             yield "data: " + json.dumps(collector.snapshot()) + "\n\n"
             while True:
+                if time.monotonic() - checked > SESSION_RECHECK:
+                    # A stream opened before a sign-out or a password change ends with the session.
+                    if auth.get_session_user(db, token, settings.session_ttl, extend=False) is None:
+                        return
+                    checked = time.monotonic()
                 try:
                     item = await asyncio.wait_for(q.get(), 15)
                     yield "data: " + json.dumps(item) + "\n\n"
@@ -479,6 +500,11 @@ def list_clients(range: str = "today", tz: int = 0, user: dict[str, Any] = Authe
 
 @app.post("/api/clients", status_code=201, dependencies=[Csrf])
 def create_client(body: NewClientBody, user: dict[str, Any] = Authed):
+    with pki.lock:      # a second click waits here and then finds the client created
+        return _create_client(body, user)
+
+
+def _create_client(body: NewClientBody, user: dict[str, Any]) -> dict[str, Any]:
     name = pki.validate_name(body.name.strip())
     existing = pki.list_clients(set()).get(name)
     if existing and existing["cert"]["state"] == "valid":
@@ -640,33 +666,72 @@ def share_profile(name: str, body: ShareBody, request: Request, user: dict[str, 
     now = int(time.time())
     db.execute("INSERT INTO share_tokens (token_hash, client_name, created_at, expires_at, created_by) "
                "VALUES (?, ?, ?, ?, ?)", (auth.token_hash(token), name, now, now + body.hours * 3600, user["username"]))
-    base = settings.profile_base_url or str(request.base_url).rstrip("/")
-    url = f"{base}/p/{token}"
+    url = f"{share_base(request)}/p/{token}"
+    import_url = f"openvpn://import-profile/{url}/download"
     event("profile_link_created", user, name, f"valid {body.hours} h")
-    return {"url": url, "import_url": "openvpn://import-profile/" + url, "expires_at": now + body.hours * 3600,
-            "public": bool(settings.profile_base_url),
-            "qr_svg": pki.qr_svg("openvpn://import-profile/" + url)}
+    return {"url": url, "import_url": import_url, "expires_at": now + body.hours * 3600,
+            "public": bool(settings.profile_base_url), "qr_svg": pki.qr_svg(import_url)}
+
+
+def share_base(request: Request) -> str:
+    return settings.profile_base_url or str(request.base_url).rstrip("/")
+
+
+def shared_client(token: str, request: Request) -> str:
+    """The client a one-time link belongs to. Wrong links from one address are slowed down."""
+    key = f"share|{client_ip(request)}"
+    wait = limiter.attempt(key)
+    if wait:
+        raise HTTPException(429, f"Too many attempts, try again in {wait}s", headers={"Retry-After": str(wait)})
+    row = db.one("SELECT client_name FROM share_tokens WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?",
+                 (auth.token_hash(token), int(time.time())))
+    if row is None or not (settings.pki_dir / "issued" / f"{row['client_name']}.crt").exists():
+        raise HTTPException(404, "This link is invalid, expired or already used")
+    limiter.success(key)
+    return row["client_name"]
+
+
+SHARE_CSS = ("body{font:17px/1.5 system-ui,sans-serif;max-width:26rem;margin:12vh auto;padding:0 20px;"
+             "color:#16181d;background:#fff}h1{font-size:1.4rem}a{display:block;margin:14px 0;padding:13px 16px;"
+             "border-radius:8px;text-align:center;text-decoration:none;font-weight:600;color:#fff;background:#1f6feb}"
+             "a+a{color:#1f6feb;background:none;border:1px solid}"
+             "@media(prefers-color-scheme:dark){body{color:#e6e8eb;background:#111418}}")
+SHARE_PAGE = ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
+              '<meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex">'
+              "<title>OpenVPN profile</title><style>" + SHARE_CSS + "</style></head><body><h1>OpenVPN profile</h1>"
+              "<p>Open this page on the device that will use the VPN. The profile can be fetched once.</p>"
+              '<a href="IMPORT_URL">Open in OpenVPN Connect</a><a href="DOWNLOAD_URL">Download the .ovpn file</a>'
+              "</body></html>")
+SHARE_CSP = ("default-src 'none'; style-src 'sha256-" + base64.b64encode(hashlib.sha256(SHARE_CSS.encode()).digest()).decode()
+             + "'; frame-ancestors 'none'; base-uri 'none'")
 
 
 @app.get("/p/{token}")
+def shared_profile_page(token: str, request: Request):
+    """Public: the page behind a one-time link. It only offers the profile, so that a messenger
+    fetching the link for a preview does not use the link up. /p/ is the only path meant to be
+    exposed by a proxy."""
+    shared_client(token, request)
+    url = f"{share_base(request)}/p/{token}/download"
+    page = SHARE_PAGE.replace("IMPORT_URL", html.escape("openvpn://import-profile/" + url, quote=True)).replace(
+        "DOWNLOAD_URL", html.escape(url, quote=True))
+    return HTMLResponse(page, headers={"Content-Security-Policy": SHARE_CSP})
+
+
+@app.get("/p/{token}/download")
 def shared_profile(token: str, request: Request):
-    """Public: the profile behind a one-time link. The only route meant to be exposed by a proxy."""
-    ip = client_ip(request)
-    wait = limiter.retry_after(f"share|{ip}")
-    if wait:
-        raise HTTPException(429, f"Too many attempts, try again in {wait}s", headers={"Retry-After": str(wait)})
+    """Public: the profile itself, once."""
+    name = shared_client(token, request)
+    content = pki.build_profile(name)       # before the link is spent: a failure here leaves it usable
     now = int(time.time())
     with db.tx() as conn:
-        row = conn.execute("SELECT client_name FROM share_tokens WHERE token_hash = ? AND used_at IS NULL "
-                           "AND expires_at > ?", (auth.token_hash(token), now)).fetchone()
-        if row is not None:
-            conn.execute("UPDATE share_tokens SET used_at = ? WHERE token_hash = ?", (now, auth.token_hash(token)))
-    if row is None or not (settings.pki_dir / "issued" / f"{row['client_name']}.crt").exists():
-        limiter.record_failure(f"share|{ip}")
+        spent = conn.execute("UPDATE share_tokens SET used_at = ? WHERE token_hash = ? AND used_at IS NULL",
+                             (now, auth.token_hash(token))).rowcount
+        if spent:           # in the same transaction: a link is never spent without a trace
+            db.add_event("profile_link_used", name, None, client_ip(request), conn=conn)
+    if not spent:       # two requests at once: the other one got it
         raise HTTPException(404, "This link is invalid, expired or already used")
-    name = row["client_name"]
-    db.add_event("profile_link_used", name, None, ip)
-    return PlainTextResponse(pki.build_profile(name), media_type="application/x-openvpn-profile",
+    return PlainTextResponse(content, media_type="application/x-openvpn-profile",
                              headers={"Content-Disposition": f'attachment; filename="{name}.ovpn"'})
 
 
@@ -750,7 +815,9 @@ def get_config(which: str, user: dict[str, Any] = Authed):
 
 @app.put("/api/server/config/{which}", dependencies=[Csrf])
 def put_config(which: str, body: ConfigBody, user: dict[str, Any] = Authed):
-    pki.write_config(which, body.content)
+    with pki.lock:
+        pki.check_edit(which, body.content)
+        pki.write_config(which, body.content)
     event("config_saved", user, None, which)
     if which == "client":
         pki.regenerate_profiles()
@@ -785,7 +852,10 @@ def regenerate_crl(user: dict[str, Any] = Authed):
 
 @app.post("/api/server/backup", dependencies=[Csrf])
 def backup_now(user: dict[str, Any] = Authed):
-    path = backup.create()
+    try:
+        path = backup.create()
+    except (OSError, ValueError) as exc:
+        raise HTTPException(500, f"The backup failed: {exc}")
     event("backup_created", user, None, path.name)
     return {"backup": backup.status()}
 
@@ -828,6 +898,8 @@ def put_settings(body: RemoteBody, user: dict[str, Any] = Authed):
 # -- misc -----------------------------------------------------------------------
 @app.get("/healthz")
 def healthz():
+    if not collector.alive():       # the thread died or hangs: no statistics are being recorded
+        raise HTTPException(503, "The collector is not running")
     return {"ok": True, "openvpn": collector.snapshot()["connected"]}
 
 

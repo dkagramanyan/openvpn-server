@@ -7,8 +7,9 @@
 #   OVPN_CERT_DAYS       certificate validity in days (default: EASYRSA_CERT_EXPIRE from pki/vars)
 #   OVPN_KEY_PASSPHRASE  encrypt the private key with this passphrase
 #
-# A static IP is written to staticclients/<name> (ifconfig-push). Use an
-# address from the guest subnet to restrict the client to internet-only access.
+# A static IP is written to staticclients/<name> (ifconfig-push). It has to be
+# outside the dynamic pool and outside the guest range. To restrict a client
+# to internet-only access, make it a guest instead: touch guests/<name>.
 set -euo pipefail
 
 OPENVPN_DIR=${OPENVPN_DIR:-/etc/openvpn}

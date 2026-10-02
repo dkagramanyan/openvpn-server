@@ -13,6 +13,6 @@ NAME=${1:-}
 if [[ -f $OATH_SECRETS ]]; then
     { grep -v "^${NAME//./\\.}:" "$OATH_SECRETS" || true; } > "$OATH_SECRETS.tmp"
     mv -f "$OATH_SECRETS.tmp" "$OATH_SECRETS"
-    chmod 644 "$OATH_SECRETS"
+    chown nobody "$OATH_SECRETS" 2>/dev/null && chmod 600 "$OATH_SECRETS" || chmod 644 "$OATH_SECRETS"
 fi
 rm -f "$OPENVPN_DIR/clients/$NAME-2fa.png"

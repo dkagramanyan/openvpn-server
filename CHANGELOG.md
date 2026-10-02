@@ -1,5 +1,117 @@
 # Changelog
 
+## 1.6.0 - 2026-10-02
+
+A security and reliability release, from a review of the whole service.
+
+### Security
+* **Guests could reach a network the server pushes a route to.** The guest
+  rules covered `HOME_SUB` and the private ranges, but not `171.134.51.0/24`
+  from `server.conf`. Guests are now blocked from every pushed route.
+* **IPv6 from VPN clients was not filtered.** All firewall rules were IPv4.
+  With kernel offload (DCO) a client that ignores the pushed `block-ipv6`
+  could reach the server host over the tunnel's IPv6 network, guests
+  included. `ip6tables` now drops what arrives from that network.
+* **The admin login throttle could be reset and raced.** 5,001 attempts with
+  made-up user names wiped all counters, and requests sent in parallel all
+  passed before the first failure was counted. An attempt is now counted
+  before it is checked, the oldest counters are dropped instead of all of
+  them, and an address is limited as a whole (20 failures), whatever names it
+  tries. An unknown user name takes as long to refuse as a wrong password.
+* **An admin session could become root.** The configuration editors accepted
+  any OpenVPN directive, including the ones that run a program (`up`,
+  `plugin`, ...) or write to another file (`log-append`), and the easy-rsa
+  variables are a shell script. The editors now refuse to add or change such
+  lines, reading each line the way OpenVPN's own parser does; lines already
+  in the file stay. See *Security notes* in the README
+  for what the UI container can still do.
+* **One certificate could fill the server.** A certificate now gets at most
+  `OVPN_MAX_DEVICES` (10) connections at a time; a device over the limit is
+  refused (and has to be reconnected by hand) and listed under the rejected
+  attempts.
+* **Guests could run out of addresses.** A client that OpenVPN turned away
+  after its address was reserved kept the reservation until the next restart.
+  Reservations without a connected client are now released within two
+  minutes.
+* The connect script refuses clients when its settings file is missing,
+  instead of handing guests a full-access address.
+* 2FA for VPN clients: the secrets file is readable only by the user OpenVPN
+  runs as (it was world-readable), five wrong codes in a row cost a five
+  minute wait, and a used code is remembered for its whole validity.
+* Password hashes use scrypt with N=2^15, r=8, p=3 (one of the parameter sets
+  OWASP lists); an existing hash is replaced at the next login. At most two
+  hashes are computed at a time, so a flood of logins cannot exhaust memory.
+* A client name with a trailing newline passed validation.
+
+### Added
+* **Encrypted backups.** With an [age](https://github.com/FiloSottile/age)
+  public key in `OVPN_BACKUP_RECIPIENT`, the daily archives are written as
+  `.tar.gz.age`; only the private key, kept off the server, opens them.
+  `backup.sh -i <key file> -r ...` restores from one.
+* **One-time links open a page.** A link now shows a page with *Open in
+  OpenVPN Connect* and *Download*, and the profile is behind
+  `/p/<token>/download`. A messenger that fetches the link for a preview no
+  longer uses it up, and a link is spent only when the profile was delivered.
+* **Self-repair.** The UI exits when it stops answering its own health check
+  and Docker starts a fresh one (Docker alone only marks a container
+  unhealthy; this is what kept the UI hung for hours before 1.4.1). The
+  health check also fails when the thread that records sessions has stopped.
+  The entrypoint restarts an OpenVPN that no longer writes its status file.
+* The end-to-end test covers guests and the firewall, two devices on one
+  certificate, the device limit, revocation, the UI-triggered restart,
+  firewall repair, encrypted backups and an interrupted first start.
+* The weekly upstream check also covers the Python packages.
+
+### Changed
+* The firewall rules are rebuilt every time OpenVPN starts, not only when the
+  container starts: changing the pushed DNS server in the UI and pressing
+  **Restart** used to leave the guest DNS rule pointing at the old server.
+  They are also checked once a minute and installed again if a firewall
+  reload on the host removed them.
+* `OVPN_STRICT_FORWARD=0` now accepts traffic to and from the tunnel instead
+  of installing no rule at all (which blocked the VPN under Docker's `DROP`
+  policy).
+* Python packages are pinned with file hashes (`ui/requirements.txt`,
+  generated from `requirements.in`). FastAPI 0.142.2.
+* The audit log keeps one year.
+
+### Fixed
+* A failed log rotation (full disk) ended the entrypoint and with it the
+  container, which then restarted into the same failure.
+* A stop signal during the pause before an OpenVPN restart started OpenVPN
+  again and Docker had to kill the container; a stop signal during the first
+  start could leave a CA without a server certificate, after which OpenVPN
+  never started. Both are handled, and a missing server certificate is built.
+* The collector thread could die on a database error and leave a UI that
+  looked healthy and recorded nothing; after a failed write it now reloads
+  its state from the database.
+* A failed `COMMIT` left the database connection in a transaction, and every
+  later write on it failed.
+* The live stream of a signed-out session kept running.
+* Two PKI operations at once (a double click on **Create**, a backup during a
+  renewal) could collide; they now run one after the other.
+* A static IP such as `10.0.70.07`, or a mistyped network in `server.conf`,
+  made pages fail with a server error.
+* The UI read the management password once, at start; on a first start it
+  could come up before the server had written it.
+* Backups failed on a network share that does not take `chmod`.
+* The egress interface was taken from the fifth word of the default route,
+  which is wrong for a route without a gateway.
+* README and `genclient.sh` still described guests as "a static IP in the
+  guest range".
+
+### Upgrade notes
+* `git pull && docker compose up -d --build`.
+* One-time links made before the upgrade no longer import by QR code or
+  `openvpn://` link (they now open the page); make new ones.
+* If some certificate is in use on more than 10 devices at once, raise
+  `OVPN_MAX_DEVICES` in `docker-compose.yml`.
+* If you added a `GUEST_BLOCK` line for `171.134.51.0/24`, it is no longer
+  needed (and does no harm).
+* Not changed: kernel offload (DCO) stays on. OpenVPN 2.7.7 has an open bug
+  in it that can end the server process (it restarts within seconds); the
+  README says when to turn DCO off.
+
 ## 1.5.0 - 2026-10-02
 
 ### Added

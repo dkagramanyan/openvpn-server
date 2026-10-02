@@ -125,6 +125,7 @@ _HISTORY = (("vpn_sessions", "connected_at"), ("traffic_minute", "ts"), ("traffi
 
 MINUTE_RETENTION = 2 * 86400      # minute buckets are kept for two days
 HOUR_RETENTION = 90 * 86400       # hourly buckets for 90 days, daily forever
+EVENT_RETENTION = 365 * 86400     # the audit log
 # A phone drops the tunnel whenever it sleeps and reconnects on wake, hundreds of times a day.
 # Sessions of one client from one address that follow each other within this gap are one visit.
 MERGE_GAP = 15 * 60
@@ -187,11 +188,18 @@ class Database:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 yield conn
-            except BaseException:
-                conn.execute("ROLLBACK")
-                raise
-            else:
                 conn.execute("COMMIT")
+            except BaseException:
+                # Also after a failed COMMIT (disk full): left open, the transaction would make
+                # every later BEGIN on this connection fail. If even the rollback fails, the
+                # next transaction of this thread gets a new connection.
+                try:
+                    if conn.in_transaction:
+                        conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    conn.close()
+                    self._local.conn = None
+                raise
 
     def execute(self, sql: str, params: tuple | list = ()) -> sqlite3.Cursor:
         with self.tx() as conn:
@@ -305,6 +313,7 @@ class Database:
             conn.execute("DELETE FROM web_sessions WHERE expires_at < ?", (now,))
             conn.execute("DELETE FROM rejections WHERE day < ?", (now - HOUR_RETENTION,))
             conn.execute("DELETE FROM share_tokens WHERE expires_at < ?", (now,))
+            conn.execute("DELETE FROM events WHERE ts < ?", (now - EVENT_RETENTION,))
 
     # -- client history ------------------------------------------------------
     def archive_client_history(self, name: str, before: int | None = None) -> str | None:

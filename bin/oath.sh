@@ -14,7 +14,8 @@
 #     another user's token);
 #   * users without an enrolled secret are rejected (never fail open);
 #   * the code is checked with a +/-1 step window for clock drift;
-#   * a code that was already accepted cannot be replayed.
+#   * a code that was already accepted cannot be replayed;
+#   * after 5 wrong codes in a row the client waits 5 minutes.
 
 PASSFILE=$1
 OPENVPN_DIR=${OPENVPN_DIR:-/etc/openvpn}
@@ -37,15 +38,28 @@ fail() { log "2FA FAIL user='$user' cn='$cn' from='${untrusted_ip:-?}' reason=$1
 secret=$(awk -F: -v u="$user" '$1 == u { print $2; exit }' "$OATH_SECRETS")
 [[ -n $secret ]] || fail no-secret-enrolled
 
-oathtool --totp -w 1 "$secret" "$code" >/dev/null 2>&1 || fail wrong-code
-
-# Replay protection: the same code may not be used twice.
+# The state of one client: codes accepted lately ("time code" lines) and the
+# wrong codes in a row ("count time-of-the-last").
 mkdir -p "$USED_DIR" 2>/dev/null
-used_file=$USED_DIR/$(printf '%s' "$user" | sha256sum | cut -c1-32)
-if [[ -f $used_file ]] && [[ $(cat "$used_file" 2>/dev/null) = "$code" ]]; then
+state=$USED_DIR/$(printf '%s' "$user" | sha256sum | cut -c1-32)
+now=$(date +%s)
+fails=0 last=0
+[[ -f $state.fail ]] && read -r fails last < "$state.fail"
+[[ $fails =~ ^[0-9]+$ && $last =~ ^[0-9]+$ ]] || { fails=0; last=0; }
+(( now - last >= 300 )) && fails=0
+(( fails >= 5 )) && fail too-many-wrong-codes
+
+if ! oathtool --totp -w 1 "$secret" "$code" >/dev/null 2>&1; then
+    echo "$(( fails + 1 )) $now" > "$state.fail" 2>/dev/null || true
+    fail wrong-code
+fi
+
+# Replay protection: a code stays valid for up to 90 s, and may be used once.
+if awk -v c="$code" -v t="$(( now - 120 ))" '$1 >= t && $2 == c { found = 1 } END { exit !found }' "$state" 2>/dev/null; then
     fail code-already-used
 fi
-printf '%s' "$code" > "$used_file" 2>/dev/null || true
+{ tail -n 4 "$state" 2>/dev/null; echo "$now $code"; } > "$state.new" 2>/dev/null && mv -f "$state.new" "$state"
+rm -f "$state.fail"
 
 log "2FA OK user='$user' from='${untrusted_ip:-?}'"
 exit 0

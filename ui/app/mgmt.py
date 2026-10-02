@@ -6,9 +6,9 @@ import socket
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
-NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@-]{0,63}$")
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@-]{0,63}\Z")
 
 
 class ManagementError(Exception):
@@ -16,14 +16,21 @@ class ManagementError(Exception):
 
 
 class Management:
-    def __init__(self, host: str, port: int, password: str | None = None, timeout: float = 10.0) -> None:
-        self.host, self.port, self.password, self.timeout = host, port, password, timeout
+    def __init__(self, host: str, port: int, password: str | Callable[[], str | None] | None = None,
+                 timeout: float = 10.0) -> None:
+        self.host, self.port, self._password, self.timeout = host, port, password, timeout
         self._lock = threading.RLock()
         self._sock: socket.socket | None = None
         self._buf = b""
         self.connected_since: float | None = None
 
     # -- low level -------------------------------------------------------------
+    @property
+    def password(self) -> str | None:
+        # A callable is asked on every connection: on a first start the server writes its
+        # password file only after the UI has come up.
+        return self._password() if callable(self._password) else self._password
+
     @property
     def connected(self) -> bool:
         return self._sock is not None
@@ -55,10 +62,11 @@ class Management:
             self._buf += data
         if b"ENTER PASSWORD:" in self._buf:
             self._buf = self._buf.split(b"ENTER PASSWORD:", 1)[1]
-            if not self.password:
+            password = self.password
+            if not password:
                 self.close()
                 raise ManagementError("management interface requires a password but none is configured")
-            sock.sendall((self.password + "\n").encode())
+            sock.sendall((password + "\n").encode())
             line = self._readline()
             while line.startswith(">"):
                 line = self._readline()

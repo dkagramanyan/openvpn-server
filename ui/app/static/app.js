@@ -654,9 +654,9 @@ function shareDialog(name) {
     try { r = await api(`/api/clients/${encodeURIComponent(name)}/share`, { method: 'POST', body: { hours: Number(hours.value) } }); } catch (e) { toast(e.message, 'err'); return; }
     out.replaceChildren(h('div', { class: 'qr' }, h('div', { class: 'code' }, h('img', { src: 'data:image/svg+xml;base64,' + btoa(r.qr_svg), alt: 'QR code of the import link' })),
       h('div', { class: 'stack', style: 'flex:1;min-width:220px;gap:8px' },
-        h('p', { style: 'margin:0' }, `Scan it with the phone camera, or open the link on the device: OpenVPN Connect imports the profile. The link works once and expires ${fmtDateTime(r.expires_at)}.`),
+        h('p', { style: 'margin:0' }, `Scan it with the phone camera: OpenVPN Connect imports the profile. Or send the link: it opens a page that offers the profile, so a messenger's link preview does not use it up. The profile can be fetched once; the link expires ${fmtDateTime(r.expires_at)}.`),
         h('div', { class: 'uri mono muted' }, r.url),
-        h('div', { class: 'row' }, h('button', { class: 'btn sm', onClick: () => copy(r.import_url, 'Import link') }, 'Copy import link'), h('button', { class: 'btn sm', onClick: () => copy(r.url, 'Download link') }, 'Copy download link')))),
+        h('div', { class: 'row' }, h('button', { class: 'btn sm', onClick: () => copy(r.url, 'Link') }, 'Copy link'), h('button', { class: 'btn sm', onClick: () => copy(r.import_url, 'Import link') }, 'Copy import link')))),
       r.public ? '' : warnings(['OVPN_PROFILE_BASE_URL is not set, so the link uses this admin address and only works where that is reachable.']));
   };
   dialog({ title: `Share profile · ${name}`, wide: true, body: h('div', { class: 'stack' },
@@ -665,7 +665,7 @@ function shareDialog(name) {
 }
 function staticIpDialog(c, after) {
   const ip = h('input', { class: 'input', value: c.static_ip || '', placeholder: 'leave empty for a dynamic address' });
-  dialog({ title: 'Static IP · ' + c.name, body: h('div', { class: 'form' }, field('IPv4 address', ip, `An address from the guest range ${state.user.guest_sub} restricts this client to internet access only. Applies on the next connection.`)),
+  dialog({ title: 'Static IP · ' + c.name, body: h('div', { class: 'form' }, field('IPv4 address', ip, `An address of the VPN subnet outside the dynamic pool and outside the guest range ${state.user.guest_sub}. The first device of this client to connect gets it. Applies on the next connection.`)),
     buttons: [{ label: 'Cancel', value: null }, { label: 'Save', cls: 'primary', onClick: async () => { try { await api(`/api/clients/${encodeURIComponent(c.name)}/static-ip`, { method: 'PUT', body: { ip: ip.value.trim() || null } }); toast('Static IP saved', 'ok'); after(); return true; } catch (e) { toast(e.message, 'err'); return false; } } }] });
 }
 function sessionsTable(list, withName) {
@@ -763,7 +763,7 @@ function serverView(el) {
           ['Client profiles point to', h('span', { class: socks(info.remote.remotes, true) !== socks(info.listen, true) ? 'badge expiring' : '' },
             `${info.remote.host || '(not set)'} · ${socks(info.remote.remotes)}`)],
           ['UI version', info.ui_version],
-          ['Backups', !info.backup.enabled ? 'off (OVPN_BACKUP_KEEP=0)' : info.backup.last ? h('span', null, `${fmtAgo(info.backup.last)} · ${fmtBytes(info.backup.size)} · ${info.backup.count} kept in `, h('span', { class: 'mono small' }, info.backup.dir)) : 'none yet - the first one is written a minute after the start'],
+          ['Backups', !info.backup.enabled ? 'off (OVPN_BACKUP_KEEP=0)' : info.backup.last ? h('span', null, `${fmtAgo(info.backup.last)} · ${fmtBytes(info.backup.size)} · ${info.backup.count} kept in `, h('span', { class: 'mono small' }, info.backup.dir), info.backup.encrypted ? ' · encrypted' : h('span', { class: 'muted', title: 'The archives hold the CA key. Set OVPN_BACKUP_RECIPIENT to an age public key to encrypt them.' }, ' · not encrypted')) : 'none yet - the first one is written a minute after the start'],
         ]), h('button', { class: 'btn sm', onClick: () => withToast(api('/api/server/backup', { method: 'POST' }), 'Backup written').then(load) }, 'Back up now')),
         card('PKI', kv([
           ['Certificate authority', h('span', null, p.ca ? p.ca.cn : '—', ' · expires ', expiry(p.ca, 90))],

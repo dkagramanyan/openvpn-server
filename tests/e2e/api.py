@@ -4,6 +4,8 @@ import http.cookiejar
 import json
 import re
 import sys
+import time
+import urllib.error
 import urllib.request
 
 BASE = "http://127.0.0.1:8080"
@@ -11,8 +13,8 @@ LOG = "/var/log/openvpn/openvpn.log"
 opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
 
 
-def call(path, body=None):
-    req = urllib.request.Request(BASE + path, data=None if body is None else json.dumps(body).encode(),
+def call(path, body=None, method=None):
+    req = urllib.request.Request(BASE + path, data=None if body is None else json.dumps(body).encode(), method=method,
                                  headers={"X-Requested-With": "fetch", "Content-Type": "application/json"})
     with opener.open(req, timeout=30) as res:
         data = res.read().decode()
@@ -67,11 +69,51 @@ def check():
     print("    sessions, endings, devices, visits and statistics match the log")
 
 
+def until(what, test, seconds=40):
+    """The collector reads the status file and the log every few seconds: wait for it."""
+    deadline = time.time() + seconds
+    while True:
+        value = test()
+        if value or time.time() > deadline:
+            assert value, what
+            return value
+        time.sleep(1)
+
+
+def refused(path, body, method=None):
+    try:
+        call(path, body, method)
+    except urllib.error.HTTPError as exc:
+        return exc.code
+    return 200
+
+
 def main():
     cmd, args = sys.argv[1], sys.argv[2:]
     call("/api/login", {"username": "admin", "password": "e2e-password"})
     if cmd == "create":
-        call("/api/clients", {"name": args[0]})
+        call("/api/clients", {"name": args[0], "guest": args[1:] == ["guest"]})
+    elif cmd == "static":
+        call(f"/api/clients/{args[0]}/static-ip", {"ip": args[1]}, "PUT")
+    elif cmd == "revoke":
+        call(f"/api/clients/{args[0]}/revoke", {})
+    elif cmd == "live":         # live NAME COUNT: that many devices connected, each with its own address
+        def devices():
+            ips = sorted(c["vpn_ip"] for c in call("/api/overview")["live"]["clients"] if c["cn"] == args[0])
+            return ips if len(set(ips)) == int(args[1]) == len(ips) else None
+        print("    " + args[0] + ": " + ", ".join(until(f"{args[0]} should have {args[1]} live devices", devices)))
+    elif cmd == "rejected":     # rejected NAME REASON: the attempt shows up on the client's page
+        until(f"no '{args[1]}' rejection for {args[0]}",
+              lambda: any(args[1] in r["reason"] for r in call(f"/api/clients/{args[0]}")["rejections"]))
+    elif cmd == "dns":          # dns OLD NEW: edit server.conf in the UI, restart OpenVPN from the UI
+        conf = call("/api/server/config/server")["content"]
+        assert args[0] in conf
+        # the editor takes ordinary options and refuses the ones that run programs
+        assert refused("/api/server/config/server", {"content": conf + "up /tmp/x.sh\n"}, "PUT") == 400
+        call("/api/server/config/server", {"content": conf.replace(args[0], args[1])}, "PUT")
+        call("/api/server/restart", {})
+        time.sleep(3)
+        until("OpenVPN did not come back after the restart", lambda: call("/healthz")["openvpn"])
     elif cmd == "profile":
         sys.stdout.write(call(f"/api/clients/{args[0]}/ovpn"))
     elif cmd == "backup":
