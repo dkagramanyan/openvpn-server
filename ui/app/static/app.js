@@ -100,6 +100,19 @@ function fmtDays(days) {
   return `${(days / 365).toFixed(1)} y`;
 }
 
+// "udp4:203.0.113.5:1194" -> ["203.0.113.5:1194", "udp"]; addresses without a protocol stay as they are.
+function addrParts(a) { const m = /^(udp|tcp)[^:]*:(.*)$/.exec(a || ''); return m ? [m[2], m[1]] : [a || '', null]; }
+function fromCell(s) {
+  const [addr, proto] = addrParts(s.real_address), via = s.proto || proto;
+  return h('td', { class: 'mono small' }, addr || '—', via ? h('span', { class: 'muted', title: via === 'tcp' ? 'Over the TCP fallback' : 'Over UDP' }, ' ' + via) : null);
+}
+const PLATFORMS = { ios: 'iOS', android: 'Android', win: 'Windows', mac: 'macOS', linux: 'Linux' };
+function deviceCell(s) {
+  if (!s.platform && !s.client_ver) return h('td', { class: 'muted' }, '—');
+  const v = s.client_ver || '', m = /connect\.\w+_([\d.]+)/.exec(v);
+  return h('td', { class: 'small', title: v }, PLATFORMS[s.platform] || s.platform || '', h('span', { class: 'muted' }, ' ' + (m ? 'Connect ' + m[1] : v.replace(/_/g, ' '))));
+}
+
 /* --------------------------------------------------------------- toasts */
 function toast(msg, kind) {
   const el = h('div', { class: 'toast ' + (kind || '') }, msg);
@@ -303,7 +316,7 @@ function lineChart(container, opts) {
     const g = svg('g', { class: 'grid' });
     ticks.forEach(t => { g.append(svg('line', { x1: m.left, x2: W - m.right, y1: py(t), y2: py(t) })); s.append(svg('text', { x: m.left - 8, y: py(t) + 4, 'text-anchor': 'end' }, o.fmtY(t))); });
     s.append(g);
-    const xt = Math.min(6, n);
+    const xt = Math.min(6, n, Math.max(2, Math.floor((W - m.left - m.right) / 96)));
     for (let k = 0; k < xt; k++) { const i = Math.round(k * (n - 1) / Math.max(1, xt - 1)); s.append(svg('text', { x: px(i), y: H - 8, 'text-anchor': k === 0 ? 'start' : k === xt - 1 ? 'end' : 'middle' }, o.fmtX(o.ts[i]))); }
     s.append(svg('line', { class: 'axis', x1: m.left, x2: W - m.right, y1: py(0), y2: py(0), stroke: 'var(--axis)' }));
     for (const ser of o.series) {
@@ -392,7 +405,7 @@ function dashboardView(el) {
   const body = h('div', { class: 'stack' });
   el.append(topbar('Dashboard', sub, rangeControl(load)), body);
   const liveTable = h('div');
-  const throughputTile = h('div');
+  const throughputTile = h('div', { style: 'display:grid' });
   let hourChart, rangeChart;
 
   function renderLiveTable(live) {
@@ -404,7 +417,7 @@ function dashboardView(el) {
       h('thead', null, h('tr', null, h('th', null, 'Client'), h('th', null, 'From'), h('th', null, 'VPN IP'), h('th', null, 'Connected'), h('th', { class: 'r' }, 'Download'), h('th', { class: 'r' }, 'Upload'), h('th', { class: 'r' }, 'Rate ↓ / ↑'), h('th', null, 'Cipher'), h('th', null))),
       h('tbody', null, cls.map(c => h('tr', null,
         h('td', { class: 'name-cell' }, h('a', { href: '#/clients/' + encodeURIComponent(c.cn) }, h('span', { class: 'dot-live' }), c.cn)),
-        h('td', { class: 'mono small' }, c.real_address),
+        fromCell(c),
         h('td', { class: 'mono small' }, c.vpn_ip || '—'),
         h('td', null, fmtDur(now - c.connected_since), h('span', { class: 'muted small' }, ' · ' + fmtTime(c.connected_since))),
         h('td', { class: 'r num' }, fmtBytes(c.bytes_out)), h('td', { class: 'r num' }, fmtBytes(c.bytes_in)),
@@ -616,7 +629,7 @@ function clientDetailView(el) {
           ].filter(Boolean))),
           card('Note', h('div', { class: 'stack', style: 'gap:8px' }, noteIn, h('div', null, h('button', { class: 'btn sm', onClick: () => withToast(api(`/api/clients/${enc}/note`, { method: 'PUT', body: { note: noteIn.value } }), 'Note saved') }, 'Save note')))))),
       c.rejections.length ? card('Rejected connection attempts · last 30 days', rejectionsTable(c.rejections, false)) : '',
-      card('Sessions · last 100', sessionsTable(c.sessions, false)));
+      card('Visits · last 100', sessionsTable(c.sessions, false), h('a', { class: 'btn sm', href: '#/sessions/' + enc }, 'Every session')));
     lineChart(dailyEl, { ts: c.daily.map(p => p.ts), series: [{ label: 'Download', cls: 's1', values: c.daily.map(p => p.bytes_out) }, { label: 'Upload', cls: 's2', values: c.daily.map(p => p.bytes_in) }], fmtY: v => fmtBytes(v, 0), fmtX: fmtDate, fmtXFull: fmtDate, height: 220, aria: 'Daily traffic' });
     body.classList.remove('loading');
   }
@@ -658,31 +671,55 @@ function staticIpDialog(c, after) {
 function sessionsTable(list, withName) {
   if (!list.length) return h('div', { class: 'empty' }, 'No sessions recorded');
   return h('div', { class: 'table-wrap' }, h('table', { class: 'tbl' },
-    h('thead', null, h('tr', null, withName ? h('th', null, 'Client') : null, h('th', null, 'Connected'), h('th', null, 'Duration'), h('th', null, 'From'), h('th', null, 'VPN IP'), h('th', { class: 'r' }, 'Download'), h('th', { class: 'r' }, 'Upload'), h('th', null, 'Cipher'))),
+    h('thead', null, h('tr', null, withName ? h('th', null, 'Client') : null, h('th', null, 'Connected'), h('th', null, 'Duration'), h('th', null, 'From'), h('th', null, 'VPN IP'), h('th', null, 'Device'), h('th', { class: 'r' }, 'Download'), h('th', { class: 'r' }, 'Upload'), h('th', null, 'Cipher'))),
     h('tbody', null, list.map(s => h('tr', null,
       withName ? h('td', { class: 'name-cell' }, s.client_name.includes('#') ? h('span', { class: 'muted', title: 'An earlier certificate with this name' }, clientLabel(s.client_name)) : h('a', { href: '#/clients/' + encodeURIComponent(s.client_name) }, s.client_name)) : null,
       h('td', { class: 'num' }, fmtDateTime(s.connected_at)),
-      h('td', null, s.disconnected_at ? fmtDur(s.disconnected_at - s.connected_at) : h('span', { class: 'ink2' }, h('span', { class: 'dot-live' }), fmtDur(Date.now() / 1000 - s.connected_at))),
-      h('td', { class: 'mono small' }, s.real_address || '—'), h('td', { class: 'mono small' }, s.vpn_ip || '—'),
+      h('td', null, s.disconnected_at ? fmtDur(s.disconnected_at - s.connected_at) : h('span', { class: 'ink2' }, h('span', { class: 'dot-live' }), fmtDur(Date.now() / 1000 - s.connected_at)),
+        // a visit: several connections of one client from one address, merged
+        s.connections > 1 ? h('span', { class: 'muted small', title: 'Reconnects from the same address, at most 15 minutes apart' }, ` · ${fmtNum(s.connections)} connections, ${fmtDur(s.online_seconds)} online`) : null,
+        s.disconnected_at && s.end_reason ? h('span', { class: 'muted small' }, ' · ' + s.end_reason) : null),
+      fromCell(s), h('td', { class: 'mono small' }, s.vpn_ip || '—'), deviceCell(s),
       h('td', { class: 'r num' }, fmtBytes(s.bytes_out)), h('td', { class: 'r num' }, fmtBytes(s.bytes_in)),
       h('td', { class: 'small muted' }, s.cipher || ''))))));
 }
 
 /* ------------------------------------------------------------- sessions */
 function sessionsView(el) {
-  let offset = 0, total = 0, name = '', active = false;
+  let offset = 0, total = 0, name = state.route.param || '', active = false, merge = !name;
   const LIMIT = 100;
   const table = h('div');
   const pager = h('div', { class: 'row', style: 'justify-content:flex-end;padding:10px 16px' });
-  const nameIn = h('input', { class: 'input search', placeholder: 'Filter by client name', onChange: e => { name = e.target.value.trim(); offset = 0; load(); } });
+  const nameIn = h('input', { class: 'input search', value: name, placeholder: 'Filter by client name', onChange: e => { name = e.target.value.trim(); offset = 0; load(); } });
   const activeIn = h('label', { class: 'check' }, h('input', { type: 'checkbox', onChange: e => { active = e.target.checked; offset = 0; load(); } }), 'Active only');
+  const mergeIn = h('label', { class: 'check', title: 'Show the reconnects of one client from one address, at most 15 minutes apart, as one visit' }, h('input', { type: 'checkbox', checked: merge, onChange: e => { merge = e.target.checked; offset = 0; load(); } }), 'Merge reconnects');
   const count = h('span');
-  el.append(topbar('Sessions', count, nameIn, activeIn, h('button', { class: 'btn', onClick: load }, icon('refresh'), 'Refresh')), h('section', { class: 'card' }, table, pager));
+  const quality = h('div');
+  const qualityTitle = h('h2', null, 'Connection quality');
+  el.append(topbar('Sessions', count, nameIn, activeIn, mergeIn, h('button', { class: 'btn', onClick: () => { load(); loadQuality(); } }, icon('refresh'), 'Refresh')),
+    h('div', { class: 'stack' }, h('section', { class: 'card' }, h('div', { class: 'card-h' }, qualityTitle, rangeControl(loadQuality)), h('div', { class: 'card-b' }, quality)), h('section', { class: 'card' }, table, pager)));
+  async function loadQuality() {
+    qualityTitle.textContent = 'Connection quality · ' + rangeLabel(state.range);
+    let rows;
+    try { rows = (await api(`/api/connections?range=${state.range}&tz=${TZ}`)).clients; } catch (e) { toast(e.message, 'err'); return; }
+    if (!rows.length) { quality.replaceChildren(h('div', { class: 'empty' }, 'No sessions in this period')); return; }
+    const n = (v, of) => h('td', { class: 'r num' }, v ? fmtNum(v) : h('span', { class: 'muted' }, '0'), v && of ? h('span', { class: 'muted small' }, ` ${Math.round(v / of * 100)}%`) : null);
+    quality.replaceChildren(h('div', { class: 'table-wrap' }, h('table', { class: 'tbl' },
+      h('thead', null, h('tr', null, h('th', null, 'Client'), h('th', null, 'Device'), h('th', { class: 'r' }, 'Sessions'), h('th', { class: 'r', title: 'Half of the sessions were shorter than this' }, 'Median'), h('th', { class: 'r' }, 'Under 1 min'),
+        h('th', { class: 'r', title: 'The client said goodbye. A phone does this every time it goes to sleep.' }, 'Left'), h('th', { class: 'r', title: 'The client vanished: no keepalive arrived (lost signal, crashed, blocked)' }, 'Timed out'),
+        h('th', { class: 'r', title: 'A TCP connection was closed' }, 'Closed'), h('th', { class: 'r', title: 'Server restart, disconnected by an admin, or no reason in the log' }, 'Other'), h('th', { class: 'r', title: 'Sessions over the TCP fallback: UDP did not get through' }, 'Over TCP'))),
+      h('tbody', null, rows.map(r => h('tr', null,
+        h('td', { class: 'name-cell' }, r.name.includes('#') ? h('span', { class: 'muted' }, clientLabel(r.name)) : h('a', { href: '#/clients/' + encodeURIComponent(r.name) }, r.name)),
+        deviceCell(r), h('td', { class: 'r num' }, fmtNum(r.sessions)), h('td', { class: 'r num' }, r.median_seconds === null ? '—' : fmtDur(r.median_seconds)),
+        n(r.short, r.sessions), n(r.left), n(r.timed_out), n(r.closed), n(r.other), n(r.tcp, r.sessions)))))),
+      h('p', { class: 'small muted', style: 'margin:10px 0 0' }, 'Many short sessions that end with "left" are normal for phones: OpenVPN Connect drops the tunnel when the phone sleeps and reconnects when it wakes. Timeouts and sessions over TCP point at the network between the client and this server.'));
+  }
   async function load() {
     table.classList.add('loading');
     try {
-      const r = await api(`/api/sessions?limit=${LIMIT}&offset=${offset}&active=${active}${name ? '&name=' + encodeURIComponent(name) : ''}`);
-      total = r.total; count.textContent = `${fmtNum(total)} session${total === 1 ? '' : 's'}`;
+      const r = await api(`/api/sessions?limit=${LIMIT}&offset=${offset}&active=${active}&merge=${merge}${name ? '&name=' + encodeURIComponent(name) : ''}`);
+      const what = merge ? 'visit' : 'session';
+      total = r.total; count.textContent = `${fmtNum(total)} ${what}${total === 1 ? '' : 's'}`;
       table.replaceChildren(sessionsTable(r.sessions, true));
       pager.replaceChildren(h('span', { class: 'muted small' }, total ? `${offset + 1}–${Math.min(offset + LIMIT, total)} of ${fmtNum(total)}` : ''),
         h('button', { class: 'btn sm', disabled: offset === 0, onClick: () => { offset = Math.max(0, offset - LIMIT); load(); } }, 'Previous'),
@@ -690,7 +727,7 @@ function sessionsView(el) {
     } catch (e) { toast(e.message, 'err'); }
     table.classList.remove('loading');
   }
-  load();
+  load(); loadQuality();
   return null;
 }
 
@@ -726,7 +763,8 @@ function serverView(el) {
           ['Client profiles point to', h('span', { class: socks(info.remote.remotes, true) !== socks(info.listen, true) ? 'badge expiring' : '' },
             `${info.remote.host || '(not set)'} · ${socks(info.remote.remotes)}`)],
           ['UI version', info.ui_version],
-        ])),
+          ['Backups', !info.backup.enabled ? 'off (OVPN_BACKUP_KEEP=0)' : info.backup.last ? h('span', null, `${fmtAgo(info.backup.last)} · ${fmtBytes(info.backup.size)} · ${info.backup.count} kept in `, h('span', { class: 'mono small' }, info.backup.dir)) : 'none yet - the first one is written a minute after the start'],
+        ]), h('button', { class: 'btn sm', onClick: () => withToast(api('/api/server/backup', { method: 'POST' }), 'Backup written').then(load) }, 'Back up now')),
         card('PKI', kv([
           ['Certificate authority', h('span', null, p.ca ? p.ca.cn : '—', ' · expires ', expiry(p.ca, 90))],
           ['Server certificate', h('span', null, p.server ? p.server.cn : '—', ' · expires ', expiry(p.server, 30))],

@@ -23,6 +23,7 @@ OVPN_STRICT_FORWARD=${OVPN_STRICT_FORWARD:-1}
 OVPN_LOG_STDOUT=${OVPN_LOG_STDOUT:-1}
 OVPN_LOG_MAX_BYTES=${OVPN_LOG_MAX_BYTES:-10485760}
 OVPN_CRL_RENEW_DAYS=${OVPN_CRL_RENEW_DAYS:-30}
+OVPN_MSS=${OVPN_MSS:-1400}
 
 log()  { printf '%s [entrypoint] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
 warn() { printf '%s [entrypoint] WARNING: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >&2; }
@@ -186,8 +187,25 @@ if [[ $OVPN_STRICT_FORWARD = 1 ]]; then
     iptables -P FORWARD DROP
 fi
 
-for c in nat:OVPN-NAT filter:OVPN-INPUT filter:OVPN-FORWARD filter:OVPN-ACCEPT; do
-    iptables -t "${c%%:*}" -S "${c#*:}" | sed 's/^/    /'
+# TCP segment size. OpenVPN's mssfix lowers the MSS that TCP connections
+# negotiate through the tunnel, so that an encrypted packet still fits the
+# path. With kernel offload (DCO) on Linux the data packets never pass through
+# OpenVPN and nothing lowers it. Do it here instead: 1400 is what the default
+# "mssfix 1492" gives for IPv4 over UDP with AES-GCM. OVPN_MSS=0 turns it off.
+if chain mangle OVPN-MSS FORWARD -A 2>/dev/null; then
+    if (( OVPN_MSS > 0 )); then
+        for dir in -i -o; do
+            iptables -t mangle -A OVPN-MSS $dir 'tun+' -p tcp --tcp-flags SYN,RST SYN \
+                -m tcpmss --mss "$(( OVPN_MSS + 1 )):65535" -j TCPMSS --set-mss "$OVPN_MSS" \
+                || warn "Cannot clamp the TCP MSS (is xt_TCPMSS available on the host?) - continuing without it"
+        done
+    fi
+else
+    warn "No mangle table on this host - the TCP MSS is left alone"
+fi
+
+for c in nat:OVPN-NAT filter:OVPN-INPUT filter:OVPN-FORWARD filter:OVPN-ACCEPT mangle:OVPN-MSS; do
+    iptables -t "${c%%:*}" -S "${c#*:}" 2>/dev/null | sed 's/^/    /' || true
 done
 
 # --------------------------------------------------------------------------

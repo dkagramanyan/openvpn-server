@@ -12,11 +12,11 @@ from typing import Any, AsyncIterator
 from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import __version__, auth, pki
+from . import __version__, auth, backup, pki
 from .collector import Collector, Maintenance
 from .db import Database
 from .mgmt import Management, ManagementError
@@ -29,6 +29,8 @@ log = logging.getLogger("openvpn-ui")
 COOKIE = "ovpn_session"
 STATIC_DIR = Path(__file__).parent / "static"
 EXPIRING_DAYS = 30
+BACKUP_WARN_DAYS = 3
+STARTED = time.time()
 RANGES = {"today": None, "24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400, "90d": 90 * 86400, "all": None}
 
 db = Database(settings.db_path)
@@ -36,7 +38,7 @@ _mgmt_host, _mgmt_port, _ = settings.management_endpoint()
 mgmt = Management(_mgmt_host, _mgmt_port, settings.management_password())
 collector = Collector(db, mgmt, settings.poll_interval, settings.status_file,
                       (settings.log_dir / "openvpn.log", settings.log_dir / "oath.log"))
-maintenance = Maintenance(db, [lambda: pki.ensure_crl_fresh()])
+maintenance = Maintenance(db, [lambda: pki.ensure_crl_fresh(), backup.ensure_recent])
 limiter = auth.LoginLimiter()
 
 
@@ -80,6 +82,11 @@ def migrate() -> None:
             if start and db.archive_client_history(name, before=start):
                 log.info("history of an earlier '%s' archived", name)
         db.set_setting("migration:identities", "1")
+    grouped = db.group_sessions()
+    if grouped:
+        log.info("%d earlier sessions merged into visits", grouped)
+    # Up to 1.4 every VPN connection also wrote two audit events, which buried the admin's own.
+    db.execute("DELETE FROM events WHERE kind IN ('vpn_connect', 'vpn_disconnect')")
 
 
 @asynccontextmanager
@@ -411,6 +418,10 @@ def overview(range: str = "today", tz: int = 0, user: dict[str, Any] = Authed):
         warnings.append("The certificate authority expires within 90 days")
     if counts["expiring"]:
         warnings.append(f"{counts['expiring']} client certificate(s) expire within {EXPIRING_DAYS} days")
+    bak = backup.status()
+    # The first archive is written a minute after the start, so a missing one only counts later.
+    if bak["enabled"] and now - (bak["last"] or STARTED) > BACKUP_WARN_DAYS * 86400:
+        warnings.append(f"No backup for more than {BACKUP_WARN_DAYS} days - see the Server page and the UI log")
     bad_ips = [f"{n} ({ip})" for n, ip in sorted(pki.static_ips().items())
                if n in certs and certs[n]["cert"]["state"] == "valid" and pki.static_ip_problem(n, ip)]
     if bad_ips:
@@ -501,9 +512,7 @@ def client_detail(name: str, tz: int = 0, user: dict[str, Any] = Authed):
     row = find_client(name)
     now = int(time.time())
     start = now - 30 * 86400
-    sessions = db.query("SELECT * FROM vpn_sessions WHERE client_name = ? ORDER BY connected_at DESC LIMIT 100",
-                        (name,))
-    row["sessions"] = [dict(s) for s in sessions]
+    row["sessions"] = db.visits(" WHERE client_name = ?", [name], 100)[1]
     row["daily"] = fill_series(db.series(start, now + 1, 86400, name, tz), start, now + 1, 86400, tz)
     row["tfa_uri"] = pki.tfa_uri(name) if row["tfa"] else None
     row["rejections"] = db.rejections(now - 30 * 86400, name)
@@ -672,19 +681,30 @@ def set_note(name: str, body: NoteBody, user: dict[str, Any] = Authed):
 # -- sessions / traffic -----------------------------------------------------------
 @app.get("/api/sessions")
 def sessions(name: str | None = None, limit: int = 100, offset: int = 0, active: bool = False,
-             user: dict[str, Any] = Authed):
+             merge: bool = False, user: dict[str, Any] = Authed):
+    """Sessions, newest first; merge=true folds the reconnects of one client from one address into visits."""
     limit = max(1, min(limit, 500))
     where, params = [], []
     if name:
         pki.validate_name(name)
         where.append("client_name = ?")
         params.append(name)
+    if merge:
+        total, rows = db.visits(" WHERE " + " AND ".join(where) if where else "", params, limit, max(0, offset), active)
+        return {"total": total, "sessions": rows}
     if active:
         where.append("disconnected_at IS NULL")
     sql = "SELECT * FROM vpn_sessions" + (" WHERE " + " AND ".join(where) if where else "")
     total = db.one(f"SELECT COUNT(*) AS n FROM ({sql})", params)
     rows = db.query(sql + " ORDER BY connected_at DESC LIMIT ? OFFSET ?", params + [limit, max(0, offset)])
     return {"total": int(total["n"]) if total else 0, "sessions": [dict(r) for r in rows]}
+
+
+@app.get("/api/connections")
+def connections(range: str = "today", tz: int = 0, user: dict[str, Any] = Authed):
+    """How the sessions of each client went in a period: count, length, endings, share over TCP."""
+    start, end = range_bounds(range, tz)
+    return {"range": range, "clients": db.connection_stats(start, end)}
 
 
 @app.get("/api/traffic")
@@ -717,6 +737,7 @@ def server_info(user: dict[str, Any] = Authed):
         "listen": pki.server_listen(),
         "config_mtime": mtime,
         "dco": (live.get("stats") or {}).get("dco_enabled"),
+        "backup": backup.status(),
         "management": {"host": _mgmt_host, "port": _mgmt_port, "password": bool(mgmt.password)},
         "ui_version": __version__,
     }
@@ -762,6 +783,13 @@ def regenerate_crl(user: dict[str, Any] = Authed):
     return {"crl": pki.crl_info()}
 
 
+@app.post("/api/server/backup", dependencies=[Csrf])
+def backup_now(user: dict[str, Any] = Authed):
+    path = backup.create()
+    event("backup_created", user, None, path.name)
+    return {"backup": backup.status()}
+
+
 @app.put("/api/server/tfa", dependencies=[Csrf])
 def enforce_tfa(body: TfaEnforceBody, user: dict[str, Any] = Authed):
     pki.set_tfa_enforced(body.enforced)
@@ -805,7 +833,11 @@ def healthz():
 
 @app.get("/")
 def index():
-    return FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-cache"})
+    # The version in the asset URLs makes a browser fetch the new script and styles after an
+    # upgrade, instead of running the cached ones against the new API for hours.
+    html = (STATIC_DIR / "index.html").read_text().replace('.css"', f'.css?v={__version__}"').replace(
+        '.js"', f'.js?v={__version__}"')
+    return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
 
 
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")

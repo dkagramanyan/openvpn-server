@@ -320,3 +320,67 @@ def test_identity_start_tells_renewals_from_new_certificates(client):
     # bob: revoked earlier, then created again with a new key -> a new client from the new certificate on
     issue(p, "bob", "client", "20260701000000Z", "20360101000000Z")
     assert pki.identity_start("bob") == pki.parse_asn1_time("20260701000000Z")
+
+
+def test_visits_and_connection_quality(client):
+    from app.main import db
+    now = int(__import__("time").time())
+    with db.tx() as conn:
+        for i, (start, reason) in enumerate([(now - 300, "left"), (now - 200, "left"), (now - 100, "timed out")]):
+            db.insert_session(conn, "alice", f"udp4:203.0.113.5:{5000 + i}", start, last_seen=start + 30,
+                              disconnected_at=start + 30, end_reason=reason, platform="ios", client_ver="3.11.1")
+    raw = client.get("/api/sessions?name=alice").json()
+    assert raw["total"] == 3 and raw["sessions"][0]["end_reason"] == "timed out"
+    merged = client.get("/api/sessions?name=alice&merge=true").json()
+    assert merged["total"] == 1 and merged["sessions"][0]["connections"] == 3
+    assert merged["sessions"][0]["online_seconds"] == 90 and merged["sessions"][0]["platform"] == "ios"
+    assert client.get("/api/sessions?name=alice&merge=true&active=true").json()["total"] == 0
+    assert client.get("/api/clients/alice").json()["sessions"][0]["connections"] == 3
+    stats = {c["name"]: c for c in client.get("/api/connections?range=24h").json()["clients"]}
+    assert (stats["alice"]["sessions"], stats["alice"]["left"], stats["alice"]["timed_out"]) == (3, 2, 1)
+    assert stats["alice"]["median_seconds"] == 30 and stats["alice"]["short"] == 3
+    assert client.get("/api/connections?range=bogus").status_code == 400
+
+
+def test_backup_archive(client):
+    import sqlite3
+    import tarfile
+    from app import backup
+    from app.settings import settings
+    assert client.get("/api/server").json()["backup"]["last"] is None
+    r = client.post("/api/server/backup", headers=H)
+    assert r.status_code == 200, r.text
+    st = r.json()["backup"]
+    assert st["count"] == 1 and st["last"] and st["size"] > 1000 and st["enabled"] is True
+    archive = backup.archives()[0]
+    assert archive.stat().st_mode & 0o777 == 0o600 and archive.parent.stat().st_mode & 0o777 == 0o700
+    with tarfile.open(archive) as tar:
+        names = set(tar.getnames())
+        assert {"server.conf", "pki/ca.crt", "pki/private/ca.key", "clients/oath.secrets", "config/client.conf",
+                "db/openvpn-ui.db"} <= names
+        assert not any(n.startswith(("backups", "log")) or "-wal" in n for n in names)
+        tar.extract("db/openvpn-ui.db", TMP / "restored", filter="data")
+    copy = sqlite3.connect(TMP / "restored" / "db" / "openvpn-ui.db")
+    assert copy.execute("SELECT username FROM users").fetchone() == ("admin",)
+    assert copy.execute("SELECT COUNT(*) FROM vpn_sessions WHERE client_name = 'alice'").fetchone() == (3,)
+    copy.close()
+    assert backup.ensure_recent() is None                    # one a day is enough
+    assert list(archive.parent.glob(".*")) == []             # no snapshot or partial file left behind
+    # only the newest archives are kept
+    for stamp in ("20200101-000000", "20200102-000000", "20200103-000000"):
+        (archive.parent / f"openvpn-backup-{stamp}.tar.gz").write_bytes(b"old")
+    settings.backup_keep = 2
+    try:
+        archive.unlink()
+        new = backup.create()
+        assert [a.name for a in backup.archives()] == ["openvpn-backup-20200103-000000.tar.gz", new.name]
+    finally:
+        settings.backup_keep = 14
+    assert any(e["kind"] == "backup_created" for e in client.get("/api/events").json()["events"])
+
+
+def test_page_asks_for_the_assets_of_this_version(client):
+    from app import __version__
+    html = client.get("/").text
+    assert f'/static/app.js?v={__version__}"' in html and f'/static/app.css?v={__version__}"' in html
+    assert client.get(f"/static/app.js?v={__version__}").status_code == 200

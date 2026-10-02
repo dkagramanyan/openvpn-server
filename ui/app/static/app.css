@@ -105,17 +105,24 @@ h3 { font-size: 13px; font-weight: 600; margin: 0; color: var(--ink-2); text-tra
 
 @media (max-width: 860px) {
   .app { flex-direction: column; }
-  .sidebar { position: static; height: auto; width: auto; flex-direction: row; align-items: center; border-right: 0; border-bottom: 1px solid var(--border); overflow-x: auto; }
+  .sidebar { position: static; height: auto; width: auto; flex-direction: row; align-items: center; border-right: 0; border-bottom: 1px solid var(--border); overflow-x: auto; scrollbar-width: none; }
   .nav { flex-direction: row; padding: 6px; }
   .nav a span.label { display: none; }
   .nav .pill { margin-left: 4px; }
-  .sidebar-foot { display: none; }
+  /* the theme and sign-out buttons stay reachable; the status text does not fit */
+  .sidebar-foot { margin: 0 6px 0 auto; padding: 0; border: 0; gap: 2px; flex: none; }
+  .sidebar-foot .grow { display: none; }
   .main { padding: 14px; }
+  .tbl td { white-space: nowrap; }      /* tables scroll sideways here: no cells wrapped into columns of words */
+}
+@media (max-width: 520px) {
+  .brand { font-size: 0; gap: 0; padding: 12px 4px 12px 12px; }      /* logo only */
+  .nav a { padding: 9px 10px; }
 }
 
 /* ---- cards / grid ---------------------------------------------------- */
 .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); }
-.card-h { display: flex; align-items: center; gap: 10px; padding: 14px 16px 0; }
+.card-h { display: flex; align-items: center; gap: 10px; padding: 14px 16px 0; flex-wrap: wrap; }
 .card-h h2 { flex: 1; }
 .card-b { padding: 14px 16px 16px; }
 .grid { display: grid; gap: 14px; }
@@ -152,8 +159,8 @@ h3 { font-size: 13px; font-weight: 600; margin: 0; color: var(--ink-2); text-tra
 .btn.ghost { border-color: transparent; background: transparent; }
 .btn.ghost:hover { background: var(--surface-2); }
 .btn svg { width: 15px; height: 15px; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
-.seg { display: inline-flex; border: 1px solid var(--border-strong); border-radius: 8px; overflow: hidden; }
-.seg button { border: 0; background: transparent; padding: 6px 11px; cursor: pointer; color: var(--ink-2); font-weight: 500; }
+.seg { display: inline-flex; border: 1px solid var(--border-strong); border-radius: 8px; overflow: hidden; max-width: 100%; overflow-x: auto; scrollbar-width: none; }
+.seg button { border: 0; background: transparent; padding: 6px 11px; cursor: pointer; color: var(--ink-2); font-weight: 500; white-space: nowrap; }
 .seg button + button { border-left: 1px solid var(--border); }
 .seg button.active { background: var(--accent); color: var(--accent-ink); }
 .input, textarea.input, select.input {

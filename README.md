@@ -6,7 +6,8 @@ per-client traffic statistics.
 * **OpenVPN 2.7.7** and **easy-rsa 3.2.7**, built from the signed upstream
   release tarballs on Alpine 3.24 (38 MB image).
 * **Web UI** (`ui/`): dashboard with live throughput and connected clients,
-  per-client traffic history (minute/hour/day roll-ups), session history,
+  per-client traffic history (minute/hour/day roll-ups), session history with
+  the device, protocol and ending of every connection, daily backups,
   certificate lifecycle (create, download, renew, revoke, delete), static IPs,
   TOTP two-factor authentication with QR enrolment, config editors, log viewer,
   audit log. No JavaScript dependencies, works offline, light and dark theme.
@@ -63,11 +64,13 @@ clients/             generated .ovpn profiles, 2FA secrets and QR codes
 staticclients/       per-client "ifconfig-push" files (static IPs)
 guests/              one empty file per guest client
 db/                  UI database (sessions, traffic, audit log)
+backups/             daily backup archives written by the UI (git-ignored)
 log/                 openvpn.log, openvpn-status.log, oath.log
 bin/                 CLI scripts (also used by the UI)
 ui/                  web UI (Python/FastAPI)
 fw-rules.sh          your additional iptables rules, applied at start
 backup.sh            backup / restore helper
+tests/e2e/           end-to-end test in Docker-in-Docker
 ```
 
 ## Host networking
@@ -151,6 +154,7 @@ Environment variables of the `openvpn` service:
 | `GUEST_BLOCK` | RFC 1918, CGNAT, link-local | further ranges hidden from guests |
 | `OVPN_EGRESS_IFACE` | default-route interface | interface used for MASQUERADE |
 | `OVPN_STRICT_FORWARD` | `1` | only VPN-originated traffic and replies are forwarded |
+| `OVPN_MSS` | `1400` | TCP MSS clamp for tunnel traffic; `0` = off |
 | `OVPN_LOG_STDOUT` | `1` | mirror openvpn.log to `docker logs` |
 | `OVPN_LOG_MAX_BYTES` | 10 MiB | rotate openvpn.log (checked every 5 min) above this size |
 | `OVPN_CRL_RENEW_DAYS` | `30` | regenerate the CRL when it expires within this many days |
@@ -158,6 +162,10 @@ Environment variables of the `openvpn` service:
 `.env` (see `.env.example`): `OPENVPN_ADMIN_USERNAME`, `OPENVPN_ADMIN_PASSWORD`,
 `OVPN_PUBLIC_HOST`, `OVPN_UI_SECURE_COOKIES`, `OVPN_UI_BIND`,
 `OVPN_UI_TRUSTED_PROXIES`.
+
+Environment variables of the `openvpn-ui` service for backups:
+`OVPN_BACKUP_KEEP` (14 archives; `0` = no backups) and `OVPN_BACKUP_DIR`
+(`/etc/openvpn/backups`).
 
 ## Web UI
 
@@ -173,13 +181,21 @@ Environment variables of the `openvpn` service:
   template) or share it with a one-time link and QR code, switch between full
   access and guest, show the 2FA QR code and rejected connection attempts,
   disconnect, renew, revoke, delete.
-* **Sessions** - every connection with duration, source address, VPN IP and
-  bytes, filterable by client.
+* **Sessions** - every connection with duration, source address, protocol
+  (UDP or the TCP fallback), device (platform and client version), VPN IP,
+  bytes and how it ended: *left* (the client said goodbye), *timed out* (it
+  vanished), *closed* (a TCP connection ended). Reconnects of one client from
+  one address at most 15 minutes apart are shown as one *visit*; untick
+  **Merge reconnects** to see every connection. **Connection quality** sums it
+  up per client for the selected range: sessions, median length, share under a
+  minute, endings, share over TCP. See [Phones](#phones-many-short-sessions).
 * **Server** - OpenVPN version, management status, PKI expiry dates, CRL
   regeneration, 2FA enforcement switch, control channel key (shared or per
   client), editors for `server.conf`,
   `client.conf` and easy-rsa vars (a `.bak` is kept), restart button, log
-  viewer (openvpn.log, 2FA log, status file) and audit log.
+  viewer (openvpn.log, 2FA log, status file), backup status with a **Back up
+  now** button, and the audit log (what admins did; VPN connections are
+  sessions, not audit events).
 * **Settings** - public address for profiles (host and a port per protocol;
   the protocols follow `server.conf`), admin password, theme.
 
@@ -201,6 +217,29 @@ as "name (earlier)". Renewing keeps the history (same key). Connection
 attempts OpenVPN rejects (revoked or expired certificate, unknown control
 channel key, wrong 2FA code) are read from `log/openvpn.log` and
 `log/oath.log` and counted per day, client, reason and source address.
+
+The device, protocol and ending of a session come from `log/openvpn.log` too
+(`peer info: IV_PLAT`, `IV_GUI_VER`, and the `SIGTERM[...]` / `SIGUSR1[...]`
+line that ends a client instance). A connection shorter than the 5 s between
+two status files is recorded from the log alone, without traffic.
+
+### Phones: many short sessions
+
+OpenVPN Connect on iOS and Android drops the tunnel whenever the phone sleeps
+and connects again when it wakes, also for the brief wake-ups a locked phone
+makes on its own. A phone therefore shows hundreds of sessions a day, most of
+them under a minute, ending with *left*. That is the app's behaviour, not a
+fault of the server. Two settings in the app change it (OpenVPN Connect >
+Settings):
+
+| Setting | Effect |
+|---|---|
+| **Battery Saver** on | the app does not reconnect while the phone is locked: far fewer sessions, but a locked phone's traffic goes around the VPN |
+| **Seamless Tunnel** on | the internet is blocked while the VPN is paused or reconnecting: nothing goes around the VPN, but with Battery Saver on a locked phone is offline |
+
+*Timed out* sessions and sessions over TCP are the ones worth a look: the
+first means the client lost the network without saying so, the second that
+UDP did not get through on the client's network within 10 s.
 
 ### One-time profile links
 
@@ -271,6 +310,13 @@ firewall, else the top of `FORWARD`) and `OVPN-ACCEPT` (end of `FORWARD`). They
 are flushed and rebuilt on every start. `fw-rules.sh` runs in between; append
 your own rules to `OVPN-FORWARD` there.
 
+`OVPN-MSS` (table `mangle`) lowers the TCP segment size of connections through
+the tunnel to `OVPN_MSS` (1400), so that an encrypted packet fits networks
+with an MTU below 1500. OpenVPN's own `mssfix` does this only without kernel
+offload: with DCO on Linux the data packets never pass through OpenVPN.
+OpenVPN Connect and the Windows client clamp on their side as well; the rule
+covers the clients that do not. `OVPN_MSS=0` turns it off.
+
 Clients get the DNS server both as `dns server` (OpenVPN 2.6+, Connect 3) and
 as `dhcp-option DNS` (older clients). IPv6 is routed into the tunnel as well
 (a private `fd00:70::/64` exists only for that) and answered there with "no
@@ -325,9 +371,24 @@ keeps working; `pki/vars` inside the PKI is what easy-rsa reads.
 
 ## Backup
 
+The UI writes an archive once a day to `backups/openvpn-backup-<time>.tar.gz`
+and keeps the newest 14: `server.conf`, `config/`, the PKI, the profiles and
+2FA secrets, static IPs, guests, `fw-rules.sh`, `docker-compose.yml`, `.env`
+and a consistent snapshot of the database. The Server page shows the last one
+and has **Back up now**; the dashboard warns when there has been none for
+three days.
+
+An archive contains the CA key, so it is readable by root only, and it sits
+on the same disk as the server. Keep a copy on another machine: mount one
+there (`- /mnt/nas/openvpn-backups:/etc/openvpn/backups` in
+`docker-compose.yml`), or copy the directory with `rsync` from cron.
+
 ```shell
-sudo ./backup.sh -b ~/openvpn-server ~/backup/openvpn-$(date +%F)
-sudo ./backup.sh -r ~/openvpn-server ~/backup/openvpn-2026-09-05
+sudo ./backup.sh -b ~/openvpn-server ~/backup/openvpn-$(date +%F)     # a copy by hand (-y: no question)
+docker compose down
+sudo ./backup.sh -r ~/openvpn-server ~/backup/openvpn-2026-09-05      # restore that copy
+sudo ./backup.sh -r ~/openvpn-server backups/openvpn-backup-20261002-080139.tar.gz   # or an archive
+docker compose up -d
 ```
 
 ## Development
@@ -335,4 +396,17 @@ sudo ./backup.sh -r ~/openvpn-server ~/backup/openvpn-2026-09-05
 ```shell
 cd ui && python -m pytest tests          # unit tests (parsers, DB roll-ups, auth)
 docker compose build                     # rebuild both images
+tests/e2e/run.sh                         # end-to-end test (needs Docker)
 ```
+
+The end-to-end test builds both images and runs them inside one
+Docker-in-Docker container, so its networks, tun devices and firewall rules
+never touch the machine it runs on. Real clients connect over UDP and TCP,
+leave, vanish and reconnect; the test then compares the UI with the log,
+checks the MSS clamp, and restores the server from a backup archive.
+`E2E_KEEP=1` keeps the container for a look at the UI.
+
+GitHub Actions runs both on every push (`.github/workflows/ci.yml`). A weekly
+job (`upstream.yml`) compares the OpenVPN, easy-rsa and Alpine versions
+pinned in the Dockerfiles with the newest releases and opens an issue when
+one is behind.

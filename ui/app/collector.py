@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from .db import Database
+from .db import Database, split_address
 from .mgmt import Management, ManagementError, read_status_file
 
 log = logging.getLogger("openvpn-ui.collector")
@@ -42,6 +42,34 @@ def parse_rejection(line: str) -> tuple[int, str, str, str] | None:
     return None
 
 
+# A connection in openvpn.log. Before the certificate is accepted a line starts with the address
+# ("udp4:203.0.113.5:1194 ..."), afterwards with "name/address".
+_PEER_INFO = re.compile(_TS + r"([^/\s]+) peer info: IV_(PLAT|VER|GUI_VER)=(\S*)")
+_PEER_OPEN = re.compile(_TS + r"([^/\s]+) \[([^\]]+)\] Peer Connection Initiated with ")
+_PEER_END = re.compile(_TS + r"(?:([^/\s]+)/)?(\S+) SIG[A-Z0-9]+\[\w+,([^\]]*)\] received, client-instance ")
+_END_REASONS = {
+    "delayed-exit": "left", "remote-exit": "left",                      # the client said goodbye
+    "ping-restart": "timed out", "ovpn-dco: ping expired": "timed out",  # it vanished: no keepalive
+    "connection-reset": "closed", "ovpn-dco: transport disconnected": "closed",   # TCP connection ended
+}
+PENDING_MAX_AGE = 600       # a handshake seen in the log whose session never showed up in the status
+
+
+def parse_connection(line: str) -> tuple | None:
+    """("info", time, address, key, value), ("open", time, address, name) or
+    ("end", time, address, name or None, reason) for a log line about a client connection."""
+    for kind, rx in (("info", _PEER_INFO), ("open", _PEER_OPEN), ("end", _PEER_END)):
+        m = rx.match(line)
+        if m:
+            ts = int(time.mktime(time.strptime(m[1], "%Y-%m-%d %H:%M:%S")))
+            if kind == "info":
+                return kind, ts, m[2], m[3], m[4]
+            if kind == "open":
+                return kind, ts, m[2], m[3]
+            return kind, ts, m[3], m[2], _END_REASONS.get(m[4], m[4] or "ended")
+    return None
+
+
 def _offer(q: asyncio.Queue, item: dict[str, Any]) -> None:
     try:
         q.put_nowait(item)
@@ -62,6 +90,8 @@ class Collector(threading.Thread):
         self._subscribers: list[tuple[asyncio.AbstractEventLoop, asyncio.Queue]] = []
         # key -> {session_id, bytes_in, bytes_out, ts, rate_in, rate_out}
         self._active: dict[tuple[int, int, str], dict[str, Any]] = {}
+        # Handshakes read from the log whose session row has no device yet: address -> {ts, cn, PLAT, ...}
+        self._pending: dict[str, dict[str, Any]] = {}
         self.live: dict[str, Any] = {
             "connected": False,
             "error": None,
@@ -113,24 +143,25 @@ class Collector(threading.Thread):
             log.info("closed %d VPN sessions left open by a previous run", closed)
         backoff = 2.0
         while not self._stop.is_set():
-            try:
-                self.read_logs()
-            except Exception:
-                log.exception("reading the OpenVPN logs failed")
+            delay = self.interval
             try:
                 self.poll()
                 backoff = 2.0
-                self._stop.wait(self.interval)
             except (ManagementError, OSError) as exc:
                 self._handle_down(str(exc))
-                self._stop.wait(backoff)
+                delay = backoff
                 backoff = min(backoff * 1.5, 15.0)
             except Exception:   # never let the thread die
                 log.exception("collector error")
-                self._stop.wait(self.interval)
+            try:
+                self.read_logs()    # after poll(): a session has its row before the log describes it
+            except Exception:
+                log.exception("reading the OpenVPN logs failed")
+            self._stop.wait(delay)
 
     def read_logs(self, max_bytes: int = 4 << 20) -> None:
-        """Count rejected connection attempts in the lines appended to the logs since the last call.
+        """Take from the lines appended to the logs since the last call: rejected connection attempts,
+        and for every session its device, protocol and the way it ended.
         The position survives restarts; a rotated (truncated or replaced) file is read from the start."""
         for path in self.logs:
             try:
@@ -151,8 +182,51 @@ class Collector(threading.Thread):
                     hit = parse_rejection(line)
                     if hit:
                         self.db.add_rejection(conn, *hit)
+                        continue
+                    hit = parse_connection(line)
+                    if hit:
+                        self._connection_line(conn, *hit)
                 conn.execute("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET "
                              "value = excluded.value", (key, f"{st.st_ino}:{pos + end}"))
+        if self._pending:
+            with self.db.tx() as conn:
+                self._describe_sessions(conn)
+
+    def _connection_line(self, conn, kind: str, ts: int, address: str, *rest: Any) -> None:
+        if kind == "info":
+            self._pending.setdefault(address, {"ts": ts})[rest[0]] = rest[1]
+        elif kind == "open":
+            self._pending.setdefault(address, {}).update(ts=ts, cn=rest[0])
+        else:
+            cn, reason = rest
+            peer = self._pending.pop(address, None)
+            if cn is None:
+                return                  # never got as far as a certificate: not a session
+            row = self.db.latest_session(conn, cn, address, peer["ts"] - 30 if peer else 0)
+            if row is not None:
+                conn.execute("UPDATE vpn_sessions SET end_reason = ? WHERE id = ?", (reason, row["id"]))
+                if peer:
+                    self._set_device(conn, row["id"], address, peer)
+            elif peer and peer.get("cn") == cn:
+                # Shorter than the status interval, so poll() never saw it: the log is its only trace.
+                sid = self.db.insert_session(conn, cn, address, peer["ts"], last_seen=ts, disconnected_at=ts,
+                                             end_reason=reason)
+                self._set_device(conn, sid, address, peer)
+
+    @staticmethod
+    def _set_device(conn, session_id: int, address: str, peer: dict[str, Any]) -> None:
+        conn.execute("UPDATE vpn_sessions SET platform = ?, client_ver = ?, proto = COALESCE(?, proto) WHERE id = ?",
+                     (peer.get("PLAT"), peer.get("GUI_VER") or peer.get("VER"), split_address(address)[0], session_id))
+
+    def _describe_sessions(self, conn) -> None:
+        """Give the sessions poll() has created since their handshake the device read from the log."""
+        now = time.time()
+        for address, peer in list(self._pending.items()):
+            row = self.db.latest_session(conn, peer["cn"], address, peer["ts"] - 30) if peer.get("cn") else None
+            if row is not None:
+                self._set_device(conn, row["id"], address, peer)
+            if row is not None or now - peer["ts"] > PENDING_MAX_AGE:
+                del self._pending[address]
 
     def _status(self) -> dict[str, Any]:
         """Client list from the status file when server.conf writes a fresh one, else from the
@@ -212,16 +286,11 @@ class Collector(threading.Thread):
                             "WHERE id = ?", (now, cl["bytes_in"], cl["bytes_out"], session_id),
                         )
                     else:
-                        cur = conn.execute(
-                            """INSERT INTO vpn_sessions (client_name, cid, real_address, vpn_ip, username, cipher,
-                                                         connected_at, last_seen, bytes_in, bytes_out)
-                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                            (cl["cn"], cl["cid"], cl["real_address"], cl["vpn_ip"], cl["username"], cl["cipher"],
-                             connected_at, now, cl["bytes_in"], cl["bytes_out"]),
-                        )
-                        session_id = cur.lastrowid
+                        session_id = self.db.insert_session(
+                            conn, cl["cn"], cl["real_address"], connected_at, cid=cl["cid"], vpn_ip=cl["vpn_ip"],
+                            username=cl["username"], cipher=cl["cipher"], last_seen=now,
+                            bytes_in=cl["bytes_in"], bytes_out=cl["bytes_out"])
                         d_in, d_out = cl["bytes_in"], cl["bytes_out"]
-                        self.db.add_event("vpn_connect", cl["cn"], None, cl["real_address"], conn=conn)
                     entry = {"session_id": session_id, "bytes_in": cl["bytes_in"], "bytes_out": cl["bytes_out"],
                              "ts": server_now, "rate_in": 0.0, "rate_out": 0.0}
                     self._active[key] = entry
@@ -261,18 +330,17 @@ class Collector(threading.Thread):
             )
         self._publish()
 
-    def _close_sessions(self, conn, keys: list, now: int, detail: str | None = None) -> None:
+    def _close_sessions(self, conn, keys: list, now: int, reason: str | None = None) -> None:
         for key in keys:
             entry = self._active.pop(key)
-            conn.execute("UPDATE vpn_sessions SET disconnected_at = ? WHERE id = ? AND disconnected_at IS NULL",
-                         (now, entry["session_id"]))
-            self.db.add_event("vpn_disconnect", key[2], None, detail, conn=conn)
+            conn.execute("UPDATE vpn_sessions SET disconnected_at = ?, end_reason = COALESCE(end_reason, ?) "
+                         "WHERE id = ? AND disconnected_at IS NULL", (now, reason, entry["session_id"]))
 
     def _handle_down(self, error: str) -> None:
         self._status_time = None
         if self._active:
             with self.db.tx() as conn:
-                self._close_sessions(conn, list(self._active), int(time.time()), "server unreachable")
+                self._close_sessions(conn, list(self._active), int(time.time()), "server down")
         with self._lock:
             changed = self.live["connected"] or self.live["error"] != error
             self.live.update(connected=False, error=error, clients=[], load={}, rate_in=0.0, rate_out=0.0,

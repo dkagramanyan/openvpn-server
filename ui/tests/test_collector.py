@@ -6,8 +6,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 os.environ.setdefault("OPENVPN_DIR", "/nonexistent")
 
-from app.collector import Collector  # noqa: E402
-from app.db import Database  # noqa: E402
+from app.collector import Collector, parse_connection  # noqa: E402
+from app.db import MERGE_GAP, Database  # noqa: E402
+from app.mgmt import ManagementError  # noqa: E402
 
 
 class FakeMgmt:
@@ -51,7 +52,7 @@ def test_restart_reopens_session_without_recounting_traffic(tmp_path):
     assert len(rows) == 1 and rows[0]["disconnected_at"] is None
     assert rows[0]["bytes_in"] == 170 and rows[0]["bytes_out"] == 300
     assert db.totals(0, int(time.time()) + 1, "alice") == (170, 300)
-    assert db.one("SELECT COUNT(*) AS n FROM events WHERE kind = 'vpn_connect'")["n"] == 1
+    assert db.one("SELECT COUNT(*) AS n FROM events")["n"] == 0     # connections are sessions, not audit events
 
     # a genuinely new connection gets its own row
     mgmt.clients = [client("alice", 1, since + 50, 10, 20)]
@@ -118,3 +119,153 @@ def test_live_updates_reach_async_subscribers_from_the_collector_thread(tmp_path
 
     assert asyncio.run(main())["connected"] is True
     assert c._subscribers == []
+
+
+def stamp(ts):
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+
+
+def handshake(ts, address, cn, plat, ver, gui=None):
+    lines = [f"{stamp(ts)} {address} VERIFY OK: depth=0, CN={cn}", f"{stamp(ts)} {address} peer info: IV_VER={ver}",
+             f"{stamp(ts)} {address} peer info: IV_PLAT={plat}", f"{stamp(ts)} {address} peer info: IV_PROTO=8094"]
+    if gui:
+        lines.append(f"{stamp(ts)} {address} peer info: IV_GUI_VER={gui}")
+    lines.append(f"{stamp(ts)} {address} [{cn}] Peer Connection Initiated with [AF_INET]{address.split(':', 1)[1]}")
+    return "\n".join(lines) + "\n"
+
+
+def test_parse_connection_lines():
+    t = "2026-10-02 07:20:46"
+    ts = int(time.mktime(time.strptime(t, "%Y-%m-%d %H:%M:%S")))
+    p = parse_connection
+    assert p(f"{t} udp4:203.0.113.40:52447 peer info: IV_PLAT=ios") == ("info", ts, "udp4:203.0.113.40:52447", "PLAT", "ios")
+    assert p(f"{t} udp4:203.0.113.40:52447 peer info: IV_GUI_VER=net.openvpn.connect.ios_3.7.3-7004")[3:] == (
+        "GUI_VER", "net.openvpn.connect.ios_3.7.3-7004")
+    assert p(f"{t} udp4:203.0.113.40:52447 peer info: IV_CIPHERS=AES-256-GCM") is None
+    # a renegotiation repeats the peer info under the client's name: not a new connection
+    assert p(f"{t} bob/udp4:203.0.113.40:52447 peer info: IV_PLAT=ios") is None
+    assert p(f"{t} udp4:203.0.113.40:52447 [bob] Peer Connection Initiated with [AF_INET]203.0.113.40:52447") == (
+        "open", ts, "udp4:203.0.113.40:52447", "bob")
+    end = lambda line: p(f"{t} {line}")[2:]     # noqa: E731
+    assert end("bob/udp4:203.0.113.40:52447 SIGTERM[soft,delayed-exit] received, client-instance exiting") == (
+        "udp4:203.0.113.40:52447", "bob", "left")
+    assert end("bob/udp4:203.0.113.40:52447 SIGTERM[soft,ovpn-dco: ping expired] received, client-instance exiting")[2] == "timed out"
+    assert end("bob/udp4:203.0.113.40:52447 SIGUSR1[soft,ping-restart] received, client-instance restarting")[2] == "timed out"
+    assert end("bob/tcp4-server:203.0.113.40:40112 SIGUSR1[soft,connection-reset] received, client-instance restarting") == (
+        "tcp4-server:203.0.113.40:40112", "bob", "closed")
+    # a handshake that failed before any certificate was accepted has no name
+    assert end("udp4:203.0.113.40:52447 SIGUSR1[soft,tls-error] received, client-instance restarting") == (
+        "udp4:203.0.113.40:52447", None, "tls-error")
+    assert p(f"{t} bob/udp4:203.0.113.40:52447 CC-EEN exit message received by peer") is None
+    assert p(f"{t} SIGTERM[hard,] received, process exiting") is None
+
+
+def test_log_gives_sessions_their_device_and_ending(tmp_path):
+    db = Database(tmp_path / "l.db")
+    mgmt = FakeMgmt()
+    logfile = tmp_path / "openvpn.log"
+    c = Collector(db, mgmt, 5, logs=(logfile,))
+    t0 = int(time.time()) - 100
+    alice = client("alice", 0, t0, 10, 20)
+    alice["real_address"] = "udp4:203.0.113.5:40000"
+
+    # the handshake is in the log before the status file lists the client
+    logfile.write_text(handshake(t0, "udp4:203.0.113.5:40000", "alice", "ios", "3.11.1", "net.openvpn.connect.ios_3.7.3-7004"))
+    c.read_logs()
+    assert db.query("SELECT 1 FROM vpn_sessions") == []
+    mgmt.clients = [alice]
+    c.poll()
+    c.read_logs()
+    row = db.one("SELECT * FROM vpn_sessions")
+    assert (row["proto"], row["platform"], row["client_ver"]) == ("udp", "ios", "net.openvpn.connect.ios_3.7.3-7004")
+    assert row["end_reason"] is None and c._pending == {}
+
+    with logfile.open("a") as fh:
+        fh.write(f"{stamp(t0 + 40)} alice/udp4:203.0.113.5:40000 SIGTERM[soft,delayed-exit] received, client-instance exiting\n")
+        # bob came and went between two status files; his client has no GUI version
+        fh.write(handshake(t0 + 50, "tcp4-server:203.0.113.9:40112", "bob", "android", "2.7.7"))
+        fh.write(f"{stamp(t0 + 53)} bob/tcp4-server:203.0.113.9:40112 SIGUSR1[soft,connection-reset] received, client-instance restarting\n")
+        # a handshake that never completed leaves nothing behind
+        fh.write(f"{stamp(t0 + 60)} udp4:203.0.113.77:1 peer info: IV_PLAT=win\n")
+        fh.write(f"{stamp(t0 + 61)} udp4:203.0.113.77:1 SIGUSR1[soft,tls-error] received, client-instance restarting\n")
+    c.read_logs()
+    mgmt.clients = []
+    c.poll()
+    rows = {r["client_name"]: r for r in db.query("SELECT * FROM vpn_sessions")}
+    assert set(rows) == {"alice", "bob"} and c._pending == {}
+    assert rows["alice"]["end_reason"] == "left" and rows["alice"]["disconnected_at"] is not None
+    bob = rows["bob"]
+    assert (bob["proto"], bob["platform"], bob["client_ver"], bob["end_reason"]) == ("tcp", "android", "2.7.7", "closed")
+    assert (bob["connected_at"], bob["disconnected_at"], bob["grp"]) == (t0 + 50, t0 + 53, bob["id"])
+    c.read_logs()                                # nothing new: nothing written twice
+    assert db.one("SELECT COUNT(*) AS n FROM vpn_sessions")["n"] == 2
+
+
+def test_sessions_open_when_the_server_goes_away_say_so(tmp_path):
+    db = Database(tmp_path / "d.db")
+    mgmt = FakeMgmt()
+    mgmt.clients = [client("alice", 0, int(time.time()) - 10, 1, 1)]
+    c = Collector(db, mgmt, 5)
+    c.poll()
+    c._handle_down(str(ManagementError("connection refused")))
+    row = db.one("SELECT * FROM vpn_sessions")
+    assert row["disconnected_at"] is not None and row["end_reason"] == "server down"
+    assert c.live["connected"] is False
+
+
+def test_reconnects_merge_into_visits(tmp_path):
+    db = Database(tmp_path / "v.db")
+    home, lte = "udp4:203.0.113.5", "tcp4-server:198.51.100.7"
+
+    def add(conn, name, address, start, seconds, reason="left", **kw):
+        return db.insert_session(conn, name, address, start, last_seen=start + seconds, disconnected_at=start + seconds,
+                                 bytes_in=1, bytes_out=2, end_reason=reason, **kw)
+
+    with db.tx() as conn:
+        a1 = add(conn, "alice", home + ":1001", 1000, 35, platform="ios", client_ver="3.11.1")
+        b1 = add(conn, "alice", lte + ":2001", 1040, 10, "closed")                       # another network: its own visit
+        a2 = add(conn, "alice", home + ":1002", 1100, 35)                               # 65 s after a1: same visit
+        a3 = add(conn, "alice", home + ":1003", 1135 + MERGE_GAP, 100, "timed out")       # exactly the gap: still the same
+        a4 = add(conn, "alice", home + ":1004", 1235 + 2 * MERGE_GAP + 1, 5)            # later: a new visit
+        add(conn, "bob", home + ":1005", 1110, 7)                                       # same address, another client
+        db.insert_session(conn, "alice", home + ":1006", 1240 + 2 * MERGE_GAP + 10, last_seen=99999)   # still open
+    grp = {r["id"]: r["grp"] for r in db.query("SELECT id, grp FROM vpn_sessions")}
+    assert grp[a1] == grp[a2] == grp[a3] == a1 and grp[b1] == b1 and grp[a4] == a4
+
+    total, visits = db.visits(" WHERE client_name = ?", ["alice"], 10)
+    assert total == 3 and [v["connections"] for v in visits] == [2, 1, 3]
+    newest, _, oldest = visits
+    assert newest["disconnected_at"] is None and newest["real_address"] == home + ":1006"
+    assert (oldest["connected_at"], oldest["disconnected_at"], oldest["online_seconds"]) == (1000, 1235 + MERGE_GAP, 170)
+    assert (oldest["bytes_in"], oldest["bytes_out"], oldest["end_reason"], oldest["tcp"]) == (3, 6, "timed out", 0)
+    assert db.visits("", [], 10)[0] == 4
+    assert db.visits("", [], 1, 3)[1][0]["connected_at"] == 1000         # paging counts visits, not sessions
+    total, active = db.visits("", [], 10, 0, active=True)
+    assert total == 1 and active[0]["connections"] == 2
+
+    stats = {s["name"]: s for s in db.connection_stats(0, 10**6)}
+    a = stats["alice"]
+    assert (a["sessions"], a["short"], a["tcp"], a["left"], a["timed_out"], a["closed"], a["other"]) == (6, 4, 1, 3, 1, 1, 0)
+    assert a["median_seconds"] == 35 and (a["platform"], a["client_ver"]) == ("ios", "3.11.1")
+    assert stats["bob"]["sessions"] == 1 and list(stats)[0] == "alice"
+    assert db.connection_stats(1100, 1101)[0]["sessions"] == 1
+
+
+def test_a_database_from_1_4_gets_the_new_columns_and_visits(tmp_path):
+    import sqlite3
+    path = tmp_path / "old.db"
+    old = sqlite3.connect(path)
+    old.execute("""CREATE TABLE vpn_sessions (id INTEGER PRIMARY KEY, client_name TEXT NOT NULL, cid INTEGER,
+                   real_address TEXT, vpn_ip TEXT, username TEXT, cipher TEXT, connected_at INTEGER NOT NULL,
+                   last_seen INTEGER NOT NULL, disconnected_at INTEGER, bytes_in INTEGER NOT NULL DEFAULT 0,
+                   bytes_out INTEGER NOT NULL DEFAULT 0)""")
+    rows = [("alice", "udp4:203.0.113.5:1", 100, 135), ("alice", "tcp4-server:203.0.113.5:2", 140, 150),
+            ("alice", "203.0.113.5:3", 150 + MERGE_GAP + 1, 5000), ("bob", None, 120, 130)]
+    old.executemany("INSERT INTO vpn_sessions (client_name, real_address, connected_at, last_seen, disconnected_at) "
+                    "VALUES (?, ?, ?, ?, ?)", [(n, a, s, e, e) for n, a, s, e in rows])
+    old.commit()
+    old.close()
+    db = Database(path)
+    assert db.group_sessions() == 4 and db.group_sessions() == 0
+    got = [(r["grp"], r["proto"]) for r in db.query("SELECT grp, proto FROM vpn_sessions ORDER BY id")]
+    assert got == [(1, "udp"), (1, "tcp"), (3, None), (4, None)]

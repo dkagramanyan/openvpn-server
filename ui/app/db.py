@@ -50,7 +50,12 @@ CREATE TABLE IF NOT EXISTS vpn_sessions (
     last_seen       INTEGER NOT NULL,
     disconnected_at INTEGER,
     bytes_in        INTEGER NOT NULL DEFAULT 0,
-    bytes_out       INTEGER NOT NULL DEFAULT 0
+    bytes_out       INTEGER NOT NULL DEFAULT 0,
+    proto           TEXT,       -- "udp" or "tcp"
+    platform        TEXT,       -- the client's IV_PLAT: ios, android, win, mac, linux
+    client_ver      TEXT,       -- IV_GUI_VER, else IV_VER
+    end_reason      TEXT,       -- how it ended: "left", "timed out", "closed", or OpenVPN's own word
+    grp             INTEGER     -- id of the first session of this visit (see session_group)
 );
 CREATE INDEX IF NOT EXISTS vpn_sessions_client ON vpn_sessions (client_name, connected_at);
 CREATE INDEX IF NOT EXISTS vpn_sessions_open   ON vpn_sessions (disconnected_at);
@@ -112,10 +117,18 @@ CREATE TABLE IF NOT EXISTS share_tokens (
 );
 """
 
+# Columns added to vpn_sessions after 1.4: an existing database gets them on start.
+_SESSION_COLUMNS = (("proto", "TEXT"), ("platform", "TEXT"), ("client_ver", "TEXT"), ("end_reason", "TEXT"),
+                    ("grp", "INTEGER"))
+
 _HISTORY = (("vpn_sessions", "connected_at"), ("traffic_minute", "ts"), ("traffic_hour", "ts"), ("traffic_day", "ts"))
 
 MINUTE_RETENTION = 2 * 86400      # minute buckets are kept for two days
 HOUR_RETENTION = 90 * 86400       # hourly buckets for 90 days, daily forever
+# A phone drops the tunnel whenever it sleeps and reconnects on wake, hundreds of times a day.
+# Sessions of one client from one address that follow each other within this gap are one visit.
+MERGE_GAP = 15 * 60
+SHORT_SESSION = 60                # "short" in the connection statistics: under a minute
 
 _TRAFFIC_UNION = """
     SELECT ts, client_name, bytes_in, bytes_out FROM traffic_minute WHERE ts >= ? AND ts < ?
@@ -126,6 +139,20 @@ _TRAFFIC_UNION = """
 """
 
 
+def split_address(address: str | None) -> tuple[str | None, str]:
+    """("udp" | "tcp" | None, "ip:port") of a real address as OpenVPN prints it:
+    "udp4:203.0.113.5:1194", "tcp4-server:203.0.113.5:40112", or just "203.0.113.5:1194" before 2.7."""
+    address = address or ""
+    head, sep, rest = address.partition(":")
+    if sep and head[:3] in ("udp", "tcp"):
+        return head[:3], rest
+    return None, address
+
+
+def real_ip(address: str | None) -> str:
+    return split_address(address)[1].rpartition(":")[0]
+
+
 class Database:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -134,6 +161,11 @@ class Database:
         path.parent.mkdir(parents=True, exist_ok=True)
         conn = self._conn()
         conn.executescript(SCHEMA)
+        have = {r["name"] for r in conn.execute("PRAGMA table_info(vpn_sessions)")}
+        for col, kind in _SESSION_COLUMNS:
+            if col not in have:
+                conn.execute(f"ALTER TABLE vpn_sessions ADD COLUMN {col} {kind}")
+        conn.execute("CREATE INDEX IF NOT EXISTS vpn_sessions_grp ON vpn_sessions (grp)")
 
     # -- connection handling -------------------------------------------------
     def _conn(self) -> sqlite3.Connection:
@@ -338,6 +370,109 @@ class Database:
             "ORDER BY id DESC LIMIT 1",
             (client_name, cid, connected_at),
         ).fetchone()
+
+    @staticmethod
+    def latest_session(conn: sqlite3.Connection, client_name: str, address: str,
+                       since: int = 0) -> sqlite3.Row | None:
+        """The newest session of a client from this address (compared without the protocol prefix):
+        one that is still open, or that started at or after <since>."""
+        want = split_address(address)[1]
+        for row in conn.execute(
+                "SELECT * FROM vpn_sessions WHERE client_name = ? AND (connected_at >= ? OR disconnected_at IS NULL) "
+                "ORDER BY connected_at DESC, id DESC LIMIT 20", (client_name, since)):
+            if split_address(row["real_address"])[1] == want:
+                return row
+        return None
+
+    @staticmethod
+    def session_group(conn: sqlite3.Connection, client_name: str, address: str, connected_at: int) -> int | None:
+        """The visit a new connection continues: the client's previous session from the same IP
+        ended at most MERGE_GAP ago. None starts a new visit."""
+        ip = real_ip(address)
+        for row in conn.execute(
+                "SELECT grp, real_address, COALESCE(disconnected_at, last_seen) AS ended FROM vpn_sessions "
+                "WHERE client_name = ? ORDER BY connected_at DESC, id DESC LIMIT 20", (client_name,)):
+            if real_ip(row["real_address"]) == ip:
+                return row["grp"] if connected_at - row["ended"] <= MERGE_GAP else None
+        return None
+
+    def insert_session(self, conn: sqlite3.Connection, client_name: str, real_address: str, connected_at: int,
+                       **fields: Any) -> int:
+        fields = {"proto": split_address(real_address)[0], **fields, "client_name": client_name,
+                  "real_address": real_address, "connected_at": connected_at,
+                  "grp": self.session_group(conn, client_name, real_address, connected_at)}
+        fields.setdefault("last_seen", connected_at)
+        cur = conn.execute(f"INSERT INTO vpn_sessions ({', '.join(fields)}) VALUES ({', '.join('?' * len(fields))})",
+                           list(fields.values()))
+        if fields["grp"] is None:
+            conn.execute("UPDATE vpn_sessions SET grp = id WHERE id = ?", (cur.lastrowid,))
+        return int(cur.lastrowid)
+
+    def group_sessions(self) -> int:
+        """Assign a visit to every session that has none (rows written before 1.5)."""
+        last: dict[tuple[str, str], tuple[int, int]] = {}     # (client, ip) -> (grp, end of its latest session)
+        with self.tx() as conn:
+            rows = conn.execute("SELECT id, client_name, real_address, connected_at, "
+                                "COALESCE(disconnected_at, last_seen) AS ended FROM vpn_sessions "
+                                "WHERE grp IS NULL ORDER BY connected_at, id").fetchall()
+            for r in rows:
+                key = (r["client_name"], real_ip(r["real_address"]))
+                grp, ended = last.get(key, (r["id"], None))
+                if ended is None or r["connected_at"] - ended > MERGE_GAP:
+                    grp = r["id"]
+                last[key] = (grp, max(ended or 0, r["ended"]))
+                conn.execute("UPDATE vpn_sessions SET grp = ?, proto = COALESCE(proto, ?) WHERE id = ?",
+                             (grp, split_address(r["real_address"])[0], r["id"]))
+            return len(rows)
+
+    def visits(self, where: str, params: list[Any], limit: int, offset: int = 0,
+               active: bool = False) -> tuple[int, list[dict[str, Any]]]:
+        """Sessions merged into visits, newest first: (number of visits, one page of them). A visit
+        carries the address, device and end of its latest session."""
+        having = " HAVING SUM(disconnected_at IS NULL) > 0" if active else ""
+        grouped = f"""SELECT grp, MIN(connected_at) AS connected_at, MAX(id) AS last_id, COUNT(*) AS connections,
+                             MAX(COALESCE(disconnected_at, last_seen)) AS ended,
+                             SUM(disconnected_at IS NULL) AS open, SUM(proto = 'tcp') AS tcp,
+                             SUM(COALESCE(disconnected_at, last_seen) - connected_at) AS online_seconds,
+                             SUM(bytes_in) AS bytes_in, SUM(bytes_out) AS bytes_out
+                      FROM vpn_sessions{where} GROUP BY grp{having}"""
+        total = self.one(f"SELECT COUNT(*) AS n FROM ({grouped})", params)
+        rows = self.query(
+            f"""SELECT g.*, l.client_name, l.real_address, l.vpn_ip, l.cipher, l.proto, l.platform, l.client_ver,
+                       l.end_reason
+                FROM ({grouped}) g JOIN vpn_sessions l ON l.id = g.last_id
+                ORDER BY g.connected_at DESC, g.grp DESC LIMIT ? OFFSET ?""", params + [limit, offset])
+        out = []
+        for r in rows:
+            v = dict(r)
+            v["disconnected_at"] = None if v.pop("open") else v.pop("ended")
+            v.pop("ended", None)
+            out.append(v)
+        return (int(total["n"]) if total else 0), out
+
+    def connection_stats(self, start: int, end: int) -> list[dict[str, Any]]:
+        """Per client, for the sessions that started in [start, end): how many, how long, how they
+        ended, how many came over TCP, and the device seen last."""
+        stats: dict[str, dict[str, Any]] = {}
+        for r in self.query(
+                "SELECT client_name, COALESCE(disconnected_at, last_seen) - connected_at AS seconds, disconnected_at, "
+                "end_reason, proto, platform, client_ver FROM vpn_sessions WHERE connected_at >= ? AND connected_at < ? "
+                "ORDER BY connected_at", (start, end)):
+            s = stats.setdefault(r["client_name"], {
+                "name": r["client_name"], "sessions": 0, "short": 0, "tcp": 0, "left": 0, "timed_out": 0,
+                "closed": 0, "other": 0, "durations": [], "platform": None, "client_ver": None})
+            s["sessions"] += 1
+            s["tcp"] += r["proto"] == "tcp"
+            if r["disconnected_at"] is not None:
+                s["durations"].append(max(r["seconds"], 0))
+                s["short"] += r["seconds"] < SHORT_SESSION
+                s[{"left": "left", "timed out": "timed_out", "closed": "closed"}.get(r["end_reason"], "other")] += 1
+            if r["platform"]:
+                s["platform"], s["client_ver"] = r["platform"], r["client_ver"]
+        for s in stats.values():
+            d = sorted(s.pop("durations"))
+            s["median_seconds"] = d[(len(d) - 1) // 2] if d else None
+        return sorted(stats.values(), key=lambda s: -s["sessions"])
 
     def session_stats_by_client(self) -> dict[str, dict[str, int]]:
         rows = self.query(

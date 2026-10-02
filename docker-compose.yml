@@ -25,6 +25,7 @@ services:
       # GUEST_BLOCK: "10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16"
       # OVPN_EGRESS_IFACE: eth0     # auto-detected from the default route
       # OVPN_STRICT_FORWARD: "1"    # set to 0 to allow unsolicited inbound to VPN clients
+      # OVPN_MSS: "1400"            # TCP MSS clamp for tunnel traffic (kernel offload has no mssfix); 0 = off
     volumes:
       - ./:/etc/openvpn
       - ./log:/var/log/openvpn
@@ -49,9 +50,11 @@ services:
       FORWARDED_ALLOW_IPS: ${OVPN_UI_TRUSTED_PROXIES:-127.0.0.1} # proxies whose X-Forwarded-For is believed
       OVPN_PROFILE_BASE_URL: ${OVPN_PROFILE_BASE_URL:-}     # public base of one-time profile links (/p/...)
       GUEST_SUB: *guest_sub
+      # OVPN_BACKUP_KEEP: "14"      # daily backup archives to keep in ./backups; 0 = no backups
     volumes:
       - ./:/etc/openvpn
       - ./log:/var/log/openvpn:ro
+      # - /mnt/nas/openvpn-backups:/etc/openvpn/backups   # keep the archives on another machine
     cap_drop: [ALL]
     cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
     security_opt: [no-new-privileges:true]

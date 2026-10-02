@@ -5,3 +5,4 @@ bin/oath-orig.sh
 ui/__pycache__/
 ui/**/__pycache__/
 ui/.pytest_cache/
+backups/

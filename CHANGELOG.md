@@ -1,5 +1,72 @@
 # Changelog
 
+## 1.5.0 - 2026-10-02
+
+### Added
+* **How every session went.** A session now records the device (platform and
+  client version), the protocol (UDP or the TCP fallback) and how it ended:
+  *left* (the client said goodbye), *timed out* (it vanished), *closed* (a TCP
+  connection ended). The UI reads this from `openvpn.log`; a connection shorter
+  than the 5 s between two status files, which was not recorded at all before,
+  is recorded from the log.
+* **Connection quality** on the Sessions page: per client and time range, the
+  number of sessions, their median length, the share under a minute, the
+  endings and the share over TCP.
+* **Visits.** A phone reconnects hundreds of times a day, so 100 sessions
+  covered only a few hours. Reconnects of one client from one address at most
+  15 minutes apart are now shown as one visit, on the Sessions page (**Merge
+  reconnects**, on by default) and on the client page; **Every session** shows
+  them one by one.
+* **Daily backups.** The UI writes `backups/openvpn-backup-<time>.tar.gz` once
+  a day and keeps 14 (`OVPN_BACKUP_KEEP`): configuration, PKI, profiles, 2FA
+  secrets, static IPs, guests, `.env` and a consistent snapshot of the
+  database. The Server page shows the last one and has **Back up now**; the
+  dashboard warns after three days without one.
+* **TCP segment size clamp** (`OVPN_MSS`, default 1400, `0` = off) in the
+  firewall. With kernel offload (DCO) on Linux the data packets never pass
+  through OpenVPN, so its `mssfix` did nothing on the server side.
+* README: why phones make many short sessions, and the two OpenVPN Connect
+  settings that change it.
+* An end-to-end test (`tests/e2e/run.sh`) that runs the server, the UI and real
+  clients inside one Docker-in-Docker container; GitHub Actions runs it and
+  the unit tests on every push. A weekly job opens an issue when a newer
+  OpenVPN, easy-rsa or Alpine release exists.
+
+### Changed
+* VPN connections are no longer written to the audit log, where they buried
+  what admins did (about 2,000 lines a day against 100 shown). They are
+  sessions. The connection lines already in the audit log are removed on the
+  first start.
+* `backup.sh`: `-y` skips the question (for cron), `-r` also restores from an
+  archive written by the UI, and refuses to run while the service is up or
+  when the backup does not exist.
+
+### Fixed
+* `backup.sh` left out `guests/`: after a restore every guest had full access.
+* `backup.sh` copied the database as files while the UI was writing to it; such
+  a copy can be torn. It now takes a snapshot.
+* After an upgrade a browser could keep running the previous release's script
+  against the new API for hours. The page now asks for the script and styles
+  of its own version.
+* Phone-width layout: the sign-out and theme buttons were missing, chart labels
+  overlapped, the range buttons broke into two lines, the navigation showed a
+  scrollbar and cut off its last icon, and table cells wrapped into columns of
+  single words. On the dashboard the throughput tile was shorter than its
+  neighbours.
+* `server.conf` said the OpenVPN defaults size TCP segments to fit the path;
+  with DCO they do not (comment corrected, see the clamp above).
+
+### Upgrade notes
+* `git pull && docker compose up -d --build`. The database is upgraded on the
+  first start. Sessions recorded before this release have no device or ending.
+* `server.conf` changed in a comment only.
+* `backups/` appears next to `server.conf`, the first archive a minute after
+  the start. The archives contain the CA key (readable by root only) and sit
+  on the same disk as the server: keep a copy on another machine, see the
+  README.
+* The MSS clamp is on. OpenVPN Connect and the Windows client already lower
+  the segment size on their side, so for them nothing changes.
+
 ## 1.4.2 - 2026-09-27
 
 ### Changed

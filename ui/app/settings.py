@@ -35,6 +35,9 @@ class Settings:
         self.secure_cookies = _env("OVPN_UI_SECURE_COOKIES", "auto").strip().lower()
         self.tfa_issuer = _env("OVPN_TFA_ISSUER", "OpenVPN").strip() or "OpenVPN"
         self.guest_sub = _env("GUEST_SUB", "10.0.70.128/25").strip()   # same value as the openvpn service
+        # Daily backup archives (PKI, profiles, configuration, database); keep 0 turns them off.
+        self.backup_dir = Path(_env("OVPN_BACKUP_DIR", str(self.openvpn_dir / "backups")))
+        self.backup_keep = max(0, int(_env("OVPN_BACKUP_KEEP", "14")))
         # Public base URL of the one-time profile links (a reverse proxy forwarding /p/ to the UI).
         self.profile_base_url = _env("OVPN_PROFILE_BASE_URL", "").strip().rstrip("/")
 
