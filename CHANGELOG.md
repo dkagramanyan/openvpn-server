@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+* Prefill new relay settings with `HOME_SUB` (`170.134.51.0/24` by default),
+  preserving saved destination networks.
 * Static asset URLs follow their content hashes, so rebuilt UI assets refresh
   even without a release-version bump. Static responses require revalidation.
 

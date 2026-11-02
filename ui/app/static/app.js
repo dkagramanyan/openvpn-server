@@ -859,7 +859,7 @@ function relaySettingsCard(s) {
   const enabled = h('input', { type: 'checkbox', checked: s.enabled });
   const url = h('input', { class: 'input', value: s.url, placeholder: 'https://relay.example.com:8443' });
   const domains = h('input', { class: 'input', value: s.match_domains.join(', '), placeholder: 'home.arpa' });
-  const networks = h('input', { class: 'input', value: s.allowed_cidrs.join(', '), placeholder: '192.168.1.0/24' });
+  const networks = h('input', { class: 'input', value: s.allowed_cidrs.join(', '), placeholder: '170.134.51.0/24' });
   const split = input => input.value.split(/[\s,]+/).filter(Boolean);
   return card('Apple Network Relay', h('div', { class: 'form' },
     h('label', { class: 'row' }, enabled, 'Enable Apple relay profiles'),

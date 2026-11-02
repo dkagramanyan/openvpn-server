@@ -26,7 +26,7 @@ class RelaySettings(BaseModel):
     enabled: bool = False
     url: str = Field(default="", max_length=2048)
     match_domains: list[str] = Field(default_factory=lambda: ["home.arpa"], max_length=100)
-    allowed_cidrs: list[str] = Field(default_factory=list, max_length=100)
+    allowed_cidrs: list[str] = Field(default_factory=lambda: [settings.home_sub], max_length=100)
 
 
 def get_settings(db) -> dict:
