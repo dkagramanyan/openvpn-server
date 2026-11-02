@@ -127,6 +127,8 @@ async def security_headers(request: Request, call_next):
                  "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
     if request.url.path.startswith(("/api/", "/p/")):
         h["Cache-Control"] = "no-store"
+    elif request.url.path.startswith("/static/"):
+        h["Cache-Control"] = "no-cache"
     return response
 
 
@@ -949,10 +951,12 @@ def healthz():
 
 @app.get("/")
 def index():
-    # The version in the asset URLs makes a browser fetch the new script and styles after an
-    # upgrade, instead of running the cached ones against the new API for hours.
-    html = (STATIC_DIR / "index.html").read_text().replace('.css"', f'.css?v={__version__}"').replace(
-        '.js"', f'.js?v={__version__}"')
+    # Deployments can change assets without changing the release version.
+    # Hash their contents so the browser cannot reuse a previous build's UI.
+    html = (STATIC_DIR / "index.html").read_text()
+    for asset in ("app.css", "app.js"):
+        digest = hashlib.sha256((STATIC_DIR / asset).read_bytes()).hexdigest()[:16]
+        html = html.replace(f'"/static/{asset}"', f'"/static/{asset}?v={digest}"')
     return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
 
 

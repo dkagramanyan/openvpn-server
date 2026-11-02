@@ -565,11 +565,32 @@ def test_health_reports_a_dead_collector(client, monkeypatch):
     assert client.get("/healthz").status_code == 503
 
 
-def test_page_asks_for_the_assets_of_this_version(client):
-    from app import __version__
-    html = client.get("/").text
-    assert f'/static/app.js?v={__version__}"' in html and f'/static/app.css?v={__version__}"' in html
-    assert client.get(f"/static/app.js?v={__version__}").status_code == 200
+def test_page_asks_for_assets_by_content_hash(client):
+    import hashlib
+    from app.main import STATIC_DIR
+    page = client.get("/")
+    assert page.headers["cache-control"] == "no-cache"
+    for asset in ("app.css", "app.js"):
+        digest = hashlib.sha256((STATIC_DIR / asset).read_bytes()).hexdigest()[:16]
+        url = f'/static/{asset}?v={digest}'
+        assert f'"{url}"' in page.text
+        response = client.get(url)
+        assert response.status_code == 200
+        assert response.headers["cache-control"] == "no-cache"
+
+
+def test_asset_change_invalidates_url_without_a_version_bump(client, monkeypatch, tmp_path):
+    from app import main
+    for asset in ("index.html", "app.css", "app.js"):
+        shutil.copy(main.STATIC_DIR / asset, tmp_path / asset)
+    monkeypatch.setattr(main, "STATIC_DIR", tmp_path)
+    before = client.get("/").text
+    script = tmp_path / "app.js"
+    script.write_text(script.read_text() + "\n// new deployment\n")
+    after = client.get("/").text
+    pattern = r'/static/app\.js\?v=[0-9a-f]+'
+    assert re.search(pattern, before).group() != re.search(pattern, after).group()
+    assert re.search(r'/static/app\.css\?v=[0-9a-f]+', before).group() in after
 
 
 # Relay API behavior, including identity lifecycle and credential boundaries.

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+* Static asset URLs follow their content hashes, so rebuilt UI assets refresh
+  even without a release-version bump. Static responses require revalidation.
+
 * Apple Network Relay support alongside OpenVPN: per-client `.mobileconfig`
   downloads in the existing client list and detail page, LAN domain/CIDR
   settings, and relay-only access revocation.
