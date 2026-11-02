@@ -506,7 +506,8 @@ function clientsView(el) {
         h('td', null, c.online ? h('span', { class: 'ink2' }, 'now') : fmtAgo(c.total.last_seen)),
         h('td', { class: 'r num' }, fmtBytes(c.traffic.bytes_out)), h('td', { class: 'r num' }, fmtBytes(c.traffic.bytes_in)),
         h('td', { class: 'r num' }, fmtNum(c.total.sessions)),
-        h('td', { class: 'actions' }, c.state === 'valid' ? h('a', { class: 'btn sm', href: `/api/clients/${encodeURIComponent(c.name)}/ovpn`, download: c.name + '.ovpn', title: 'Download profile' }, icon('download')) : null)))))));
+        h('td', { class: 'actions' }, c.state === 'valid' ? h('a', { class: 'btn sm', href: `/api/clients/${encodeURIComponent(c.name)}/ovpn`, download: c.name + '.ovpn', title: 'Download OpenVPN config' }, icon('download'), 'OpenVPN') : null,
+          c.state === 'valid' ? relayButton(c, true) : null)))))));
   }
   async function load() {
     table.classList.add('loading');
@@ -580,7 +581,9 @@ function clientDetailView(el) {
     try { c = await api(`/api/clients/${enc}?tz=${TZ}`); } catch (e) { toast(e.message, 'err'); body.replaceChildren(h('div', { class: 'empty' }, e.message)); return; }
     setChildren(badges, stateBadge(c), c.tfa ? h('span', { class: 'badge plain' }, '2FA') : null, c.guest ? h('span', { class: 'subnet' }, 'guest') : c.static_ip ? h('span', { class: 'subnet' }, 'static ' + c.static_ip) : null, c.previous ? h('span', { class: 'badge plain expiring' }, 'renewed · previous cert still valid') : null);
     setChildren(actions, 
-      c.state === 'valid' ? h('a', { class: 'btn primary', href: `/api/clients/${enc}/ovpn`, download: name + '.ovpn' }, icon('download'), 'Download profile') : null,
+      c.state === 'valid' ? h('a', { class: 'btn primary', href: `/api/clients/${enc}/ovpn`, download: name + '.ovpn' }, icon('download'), 'OpenVPN config') : null,
+      c.state === 'valid' ? relayButton(c) : null,
+      c.relay_available ? act('Revoke relay access', async () => { if (await confirmDialog('Revoke relay access', 'Installed Apple relay profiles will stop working. Download a new profile to enable access again.', 'Revoke', true)) { await withToast(api(`/api/clients/${enc}/relay`, { method: 'DELETE' }), 'Relay access revoked'); load(); } }, 'danger') : null,
       c.online ? act('Disconnect', async () => { if (await confirmDialog('Disconnect', `Disconnect all sessions of ${name}?`, 'Disconnect', true)) { await withToast(api(`/api/clients/${enc}/disconnect`, { method: 'POST', body: {} }), 'Disconnected'); } }) : null,
       c.state === 'valid' ? act(c.tfa ? 'Show 2FA code' : 'Enable 2FA', async () => {
         if (c.tfa) { tfaDialog(name, c.tfa_uri); return; }
@@ -600,7 +603,7 @@ function clientDetailView(el) {
       h('button', { class: c.guest === g ? 'active' : '', disabled: c.state !== 'valid', onClick: async () => {
         if (c.guest === g) return;
         const text = g ? `${name} will reach only the internet and DNS: not your LAN, this server or other VPN clients.` : `${name} will reach your LAN and this server.`;
-        if (await confirmDialog(g ? 'Make guest' : 'Give full access', text + ' Applies the next time a device connects.', g ? 'Make guest' : 'Give full access')) {
+        if (await confirmDialog(g ? 'Make guest' : 'Give full access', text + ' OpenVPN changes apply on reconnect. Download a new Apple relay profile after changing access type.', g ? 'Make guest' : 'Give full access')) {
           await withToast(api(`/api/clients/${enc}/access`, { method: 'PUT', body: { guest: g } }), 'Access changed'); load();
         } } }, label)));
     const kv = (pairs) => h('dl', { class: 'kv' }, pairs.map(([k, v]) => [h('dt', null, k), h('dd', null, v)]));
@@ -834,12 +837,49 @@ function serverView(el) {
 
 /* ------------------------------------------------------------- settings */
 function socks(list, sorted) { const s = list.map(x => `${x.port}/${x.proto}`); return (sorted ? s.sort() : s).join(', '); }
+function relayButton(c, small = false) {
+  return h('button', { class: 'btn' + (small ? ' sm' : ''), disabled: !c.relay_available,
+    title: !c.relay_available ? 'Enable Apple Network Relay in Settings' : c.guest ? 'Download internet-only guest relay profile' : 'Download LAN relay profile',
+    onClick: async e => {
+      const button = e.currentTarget;
+      button.disabled = true;
+      try {
+        const response = await fetch(`/api/clients/${encodeURIComponent(c.name)}/relay.mobileconfig`, { method: 'POST', headers: { 'X-Requested-With': 'fetch' } });
+        if (!response.ok) { const error = await response.json(); throw new Error(error.detail || 'Profile download failed'); }
+        const url = URL.createObjectURL(await response.blob());
+        const link = h('a', { href: url, download: c.name + '-relay.mobileconfig' });
+        document.body.append(link); link.click(); link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 60000);
+      } catch (error) { toast(error.message, 'err'); }
+      finally { button.disabled = false; }
+    } }, icon('download'), 'Apple relay');
+}
+
+function relaySettingsCard(s) {
+  const enabled = h('input', { type: 'checkbox', checked: s.enabled });
+  const url = h('input', { class: 'input', value: s.url, placeholder: 'https://relay.example.com:8443' });
+  const domains = h('input', { class: 'input', value: s.match_domains.join(', '), placeholder: 'home.arpa' });
+  const networks = h('input', { class: 'input', value: s.allowed_cidrs.join(', '), placeholder: '192.168.1.0/24' });
+  const split = input => input.value.split(/[\s,]+/).filter(Boolean);
+  return card('Apple Network Relay', h('div', { class: 'form' },
+    h('label', { class: 'row' }, enabled, 'Enable Apple relay profiles'),
+    field('Public relay URL', url, 'HTTPS hostname and port of the apple-relay service. A trusted TLS certificate and reachable UDP port are required.'),
+    field('LAN domains', domains, 'Comma-separated domains routed through the relay, such as home.arpa. Use names that resolve on the relay server.'),
+    field('Allowed destination networks', networks, 'Comma-separated IPv4 or IPv6 CIDRs. The relay blocks destinations outside these networks, including after DNS resolution.'),
+    h('p', { class: 'small muted' }, 'Each profile contains a separate access credential; OpenVPN passwords and 2FA do not apply. Guests get internet-only relay access; non-guests can reach the selected LAN domains. Changing access type or renewing a certificate requires a new relay profile.'),
+    h('p', { class: 'small muted' }, 'Start the optional apple-relay Compose service before enabling this setting. Non-guests use selected LAN domains; guests route internet traffic through the relay (IPv4 destinations). It does not provide a VPN address, ping or Bonjour discovery.'),
+    h('div', null, h('button', { class: 'btn primary', onClick: async () => {
+      await withToast(api('/api/relay/settings', { method: 'PUT', body: { enabled: enabled.checked, url: url.value.trim(), match_domains: split(domains), allowed_cidrs: split(networks) } }), 'Relay settings saved; download profiles again if domains or URL changed');
+    } }, 'Save relay settings'))));
+}
+
 function settingsView(el) {
   const body = h('div', { class: 'stack' });
   el.append(topbar('Settings'), body);
   (async () => {
     let s;
-    try { s = await api('/api/settings'); } catch (e) { toast(e.message, 'err'); return; }
+    let relay;
+    try { [s, relay] = await Promise.all([api('/api/settings'), api('/api/relay/settings')]); } catch (e) { toast(e.message, 'err'); return; }
     const host = h('input', { class: 'input', value: s.remote.host, placeholder: 'vpn.example.com or public IP' });
     const ports = s.listen.map(l => ({ l, input: h('input', { class: 'input', type: 'number', min: 1, max: 65535, value: (s.remote.remotes.find(r => r.proto === l.proto) || l).port, onInput: () => checkPort() }) }));
     const mismatch = h('div');
@@ -863,7 +903,7 @@ function settingsView(el) {
           h('div', null, h('button', { class: 'btn primary', onClick: async () => { if (nw.value !== nw2.value) { toast('Passwords do not match', 'err'); return; } await withToast(api('/api/me/password', { method: 'POST', body: { current: cur.value, new: nw.value } }), 'Password changed'); cur.value = nw.value = nw2.value = ''; } }, 'Change password'))))),
       h('div', { class: 'grid two' },
         card('Appearance', h('div', { class: 'row' }, theme)),
-        card('About', h('dl', { class: 'kv' }, h('dt', null, 'UI version'), h('dd', null, s.version), h('dt', null, 'Signed in as'), h('dd', null, state.user.username), h('dt', null, 'Poll interval'), h('dd', null, `${s.poll_interval} s`), h('dt', null, '2FA issuer'), h('dd', null, s.tfa_issuer)))));
+        card('About', h('dl', { class: 'kv' }, h('dt', null, 'UI version'), h('dd', null, s.version), h('dt', null, 'Signed in as'), h('dd', null, state.user.username), h('dt', null, 'Poll interval'), h('dd', null, `${s.poll_interval} s`), h('dt', null, '2FA issuer'), h('dd', null, s.tfa_issuer)))), relaySettingsCard(relay));
   })();
   return null;
 }

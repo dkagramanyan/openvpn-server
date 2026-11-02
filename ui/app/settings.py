@@ -35,6 +35,8 @@ class Settings:
         self.secure_cookies = _env("OVPN_UI_SECURE_COOKIES", "auto").strip().lower()
         self.tfa_issuer = _env("OVPN_TFA_ISSUER", "OpenVPN").strip() or "OpenVPN"
         self.guest_sub = _env("GUEST_SUB", "10.0.70.128/25").strip()   # same value as the openvpn service
+        self.home_sub = _env("HOME_SUB", "170.134.51.0/24").strip()
+        self.guest_block = _env("GUEST_BLOCK", "10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16").strip()
         # Daily backup archives (PKI, profiles, configuration, database); keep 0 turns them off.
         self.backup_dir = Path(_env("OVPN_BACKUP_DIR", str(self.openvpn_dir / "backups")))
         self.backup_keep = max(0, int(_env("OVPN_BACKUP_KEEP", "14")))

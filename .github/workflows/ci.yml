@@ -5,6 +5,21 @@ on:
   pull_request:
 
 jobs:
+  relay:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: relay
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: relay/go.mod
+          cache-dependency-path: relay/go.sum
+      - run: go test -race ./...
+      - run: go vet ./...
+      - run: docker build -f Dockerfile -t openvpn-apple-relay:ci ..
+
   unit:
     runs-on: ubuntu-latest
     steps:

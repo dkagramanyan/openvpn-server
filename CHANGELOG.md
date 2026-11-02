@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+* Apple Network Relay support alongside OpenVPN: per-client `.mobileconfig`
+  downloads in the existing client list and detail page, LAN domain/CIDR
+  settings, and relay-only access revocation.
+* Optional unprivileged HTTP/3 relay service for TCP CONNECT and CONNECT-UDP.
+  Destination IPs are checked after DNS resolution. Guests receive internet-only
+  profiles, non-guests receive LAN profiles, and expired or revoked clients are denied. Active tunnels periodically recheck access.
+* Relay API/profile tests and Go integration tests cover TCP/UDP forwarding,
+  guest isolation, authentication, access-type changes and live revocation.
+* Reduce authorization work by sharing concurrent checks and caching the PKI
+  index until it changes. TCP destinations have staggered address fallback;
+  QUIC connections use keepalives. Fix final-packet truncation on TCP half-close,
+  verified with concurrent bulk-transfer tests.
+
 ## 1.6.0 - 2026-10-02
 
 A security and reliability release, from a review of the whole service.

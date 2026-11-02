@@ -53,6 +53,111 @@ Put the UI behind an HTTPS reverse proxy for anything but a LAN; set
 `OVPN_UI_TRUSTED_PROXIES` to the proxy's address if it is not on the server
 itself. `OVPN_UI_BIND` limits the UI to one address (e.g. the LAN one).
 
+## Apple Network Relay
+
+The existing **Clients** list and client page have adjacent **OpenVPN** and
+**Apple relay** downloads. The Apple download is a per-client `.mobileconfig`
+profile for Apple's built-in Network Relay. An optional `apple-relay` service
+provides authenticated TCP CONNECT and MASQUE CONNECT-UDP over HTTP/3.
+
+To enable it:
+
+1. Choose a public DNS name, for example `relay.example.com`, pointing to this
+   server. Obtain a publicly trusted TLS certificate for it. Place the actual
+   certificate chain and key in `relay-tls/fullchain.pem` and
+   `relay-tls/privkey.pem` (or set `APPLE_RELAY_TLS_DIR` to another directory).
+   The container runs as UID/GID `65532`; give that identity read access to the
+   files and traversal access to their directory. Keep the private key private
+   (for example owner `65532`, directory mode `700`, key mode `600`). Copy files
+   rather than symlinks pointing outside the mounted directory.
+2. Forward/open **UDP 8443** to this server, or choose another unprivileged
+   listening port with `APPLE_RELAY_BIND`. The service must be directly reachable
+   over QUIC; a conventional HTTP reverse proxy does not forward it. This version
+   does not offer an HTTP/2 fallback on networks that block UDP.
+3. Start the services:
+
+   ```shell
+   docker compose --profile apple-relay up -d --build
+   ```
+
+4. In the existing UI, open **Settings → Apple Network Relay**. Set the public
+   URL (e.g. `https://relay.example.com:8443`), the LAN domains you want to access
+   (e.g. `home.arpa`), and the allowed destination CIDRs (e.g. `192.168.1.0/24`).
+   Enable and save. Names such as `nas.home.arpa` must resolve to the intended
+   LAN addresses **from the relay container**; configure its DNS in Compose if
+   your Docker DNS does not resolve your LAN names.
+5. Under **Clients**, download **Apple relay** beside that client's OpenVPN
+   config. Transfer the file privately to the iPhone, iPad or Mac and install it
+   in system Settings. On iOS/iPadOS, open the downloaded profile and complete
+   installation under **General → VPN & Device Management**; on macOS use
+   **Device Management / Profiles** in System Settings.
+
+The profile uses Apple's `com.apple.relay.managed` payload (introduced in
+iOS/iPadOS 17 and macOS 14). See the
+[Apple payload schema](https://github.com/apple/device-management/blob/release/mdm/profiles/com.apple.relay.managed.yaml)
+and [Apple's network relay overview](https://support.apple.com/guide/deployment/dep91a6e427d/web).
+Manual installation is supported; Apple marks this payload deprecated starting
+with OS 27 in favor of declarative device management. Device interoperability
+still needs to be verified on your target Apple OS version.
+
+For non-guests, only the selected LAN domain names and their subdomains use the
+relay; other traffic continues normally. Guest profiles route all domains
+through the relay, allowing public IPv4 internet destinations only. IPv6 guest
+egress is blocked, consistent with the OpenVPN setup. This is domain-scoped TCP/UDP access, not an IP VPN: it does
+not assign a VPN address, carry ping, discover Bonjour services or route an
+entire subnet by IP. Use LAN DNS names with the relay, and the `.ovpn` profile
+when you need subnet routing. Do not use `.local` multicast names for remote
+access. OpenVPN statistics show OpenVPN traffic only.
+
+The server checks **resolved destination IPs**, then connects to those exact
+addresses to prevent DNS rebinding around the CIDR policy. Loopback, link-local,
+unspecified and multicast destinations are always blocked. Choose narrow LAN
+CIDRs: non-guests can reach any TCP/UDP service within them. Guests can download
+relay profiles too, but cannot reach private, VPN, configured LAN, directly
+attached or special-purpose networks. `HOME_SUB` and `GUEST_BLOCK` are shared
+between the OpenVPN and UI services; pushed routes and the relay's allowed LAN
+CIDRs are also excluded from guest egress. Include public NAT addresses that
+forward to protected LAN services in `GUEST_BLOCK` if needed.
+
+| Access type | OpenVPN | Apple relay |
+|---|---|---|
+| Guest | Internet and configured DNS; no LAN | Public IPv4 internet; no LAN |
+| Non-guest (Full access) | Internet and LAN | Selected LAN domains; other traffic stays direct |
+
+Each profile contains a separate random bearer credential. It does not use the
+OpenVPN key passphrase or TOTP challenge. Repeated downloads reuse the current
+credential. **Revoke relay access** on the client page invalidates installed
+relay profiles without touching OpenVPN; the next download creates a new
+credential. Revocation, expiry and deletion deny relay access. Changing between
+guest and non-guest access or renewing a certificate invalidates the old relay
+profile; download a new one. Active flows recheck access every five seconds
+(up to about nine seconds including the one-second policy cache and three-second
+authorization timeout), and fail closed if the UI becomes unavailable. OpenVPN
+access-type changes take effect when devices reconnect.
+
+Concurrent connections share authorization results for at most one second,
+without extending stale results on errors. The backend checks only that client's
+certificate and caches the PKI index until the file changes. TCP connections try
+validated destination addresses with a 200 ms stagger, so an unreachable first
+address does not block a reachable alternative. QUIC keepalives run every 20
+seconds, with a 90-second idle timeout. TCP half-close preserves the remaining
+response data, including the last queued QUIC packets.
+
+If quic-go reports a low UDP receive buffer, the host's socket buffer limits can
+limit throughput under load. Check the
+[upstream buffer guidance](https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes)
+before adjusting host settings. The application does not modify host sysctls.
+
+The relay authenticates against the UI over host loopback and has no access to
+the PKI or UI database. If `OVPN_UI_BIND` excludes loopback, set
+`APPLE_RELAY_AUTH_URL` to the UI's address on the same host. After renewing the
+relay TLS certificate, restart `apple-relay`. Changing the public URL or LAN
+domains requires redistributing profiles; CIDR changes and disabling relay
+access take effect on existing connections without redistributing them.
+
+Run relay checks with `cd relay && go test -race ./... && go vet ./...`; API and
+profile tests are included in `python -m pytest ui/tests -q`.
+
 ## Layout
 
 ```

@@ -1,4 +1,7 @@
 """End-to-end API tests against a throwaway PKI built with openssl (no easy-rsa needed)."""
+import copy
+import json
+import plistlib
 import os
 import re
 import shutil
@@ -95,7 +98,8 @@ build_env()
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-from app.main import app  # noqa: E402
+from app.main import app, db  # noqa: E402
+from app import pki, relay  # noqa: E402
 
 H = {"X-Requested-With": "fetch"}
 
@@ -172,7 +176,9 @@ def test_every_route_needs_a_session_and_every_change_the_csrf_header(client):
                     assert client.request(method, path, json={}).status_code == 403, (method, path)
                 client.cookies.clear()
                 r = client.request(method, path, json={}, headers=H)
-                if route.path in public or route.path == "/api/logout":
+                if route.path == "/api/relay/authorize":
+                    assert r.status_code == 403  # machine endpoint requires a relay bearer credential
+                elif route.path in public or route.path == "/api/logout":
                     assert r.status_code != 401, (method, path)
                 elif route.path == "/api/login":
                     assert r.status_code == 422, (method, path)      # an empty body
@@ -405,6 +411,9 @@ def test_share_link_is_single_use(client):
 
 def test_rejected_attempts_from_the_logs(client):
     from app.main import collector
+    from datetime import datetime, timedelta
+    # Keep log records inside the endpoint's rolling 30-day window.
+    day = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
     (TMP / "log" / "openvpn.log").write_text(
         "2026-09-26 17:04:27 udp4:194.55.141.10:54333 VERIFY ERROR: depth=0, error=certificate revoked: C=UA, "
         "CN=Ian_pile_experimental, emailAddress=sweet@home.net, serial=1656\n"
@@ -413,9 +422,9 @@ def test_rejected_attempts_from_the_logs(client):
         "2026-09-26 17:06:00 TLS Error: tls-crypt unwrapping failed from [AF_INET]45.1.2.3:1234\n"
         "2026-09-26 17:06:30 TLS Error: could not determine wrapping from [AF_INET]45.1.2.3:1235\n"
         "2026-09-26 17:06:40 client-access: refused cn='alice' from='5.6.7.9' reason=too-many-devices\n"
-        "2026-09-26 17:07:00 MANAGEMENT: CMD 'version'\npartial line without newline")
+        "2026-09-26 17:07:00 MANAGEMENT: CMD 'version'\npartial line without newline".replace("2026-09-26", day))
     (TMP / "log" / "oath.log").write_text(
-        "2026-09-26 17:08:00 2FA FAIL user='alice' cn='alice' from='5.6.7.8' reason=wrong-code\n")
+        "2026-09-26 17:08:00 2FA FAIL user='alice' cn='alice' from='5.6.7.8' reason=wrong-code\n".replace("2026-09-26", day))
     collector.read_logs()
     collector.read_logs()                        # nothing new: nothing counted twice
     rows = {(r["client"], r["reason"]): r for r in collector.db.rejections(0)}
@@ -561,3 +570,166 @@ def test_page_asks_for_the_assets_of_this_version(client):
     html = client.get("/").text
     assert f'/static/app.js?v={__version__}"' in html and f'/static/app.css?v={__version__}"' in html
     assert client.get(f"/static/app.js?v={__version__}").status_code == 200
+
+
+# Relay API behavior, including identity lifecycle and credential boundaries.
+
+
+@pytest.fixture
+def configured(client):
+    old = relay.get_settings(db)
+    body = {"enabled": True, "url": "https://relay.example.com:8443",
+            "match_domains": ["home.arpa"], "allowed_cidrs": ["192.168.1.0/24", "fd00::/64"]}
+    assert client.put("/api/relay/settings", json=body, headers=H).status_code == 200
+    yield body
+    db.set_setting("apple_relay", json.dumps(old))
+    relay.revoke(db, "alice")
+
+
+def download(client):
+    response = client.post("/api/clients/alice/relay.mobileconfig", headers=H)
+    assert response.status_code == 200, response.text
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["content-type"] == "application/x-apple-aspen-config"
+    assert 'alice-relay.mobileconfig' in response.headers["content-disposition"]
+    profile = plistlib.loads(response.content)
+    auth = profile["PayloadContent"][0]["Relays"][0]["AdditionalHTTPHeaderFields"]["Authorization"]
+    return profile, auth
+
+
+def test_profile_and_revoke(client, configured):
+    profile, token = download(client)
+    payload = profile["PayloadContent"][0]
+    assert payload["PayloadType"] == "com.apple.relay.managed"
+    assert payload["MatchDomains"] == ["home.arpa"]
+    assert payload["Relays"][0]["HTTP3RelayURL"].endswith("/{target_host}/{target_port}/")
+    assert download(client) == (profile, token)  # repeat downloads don't break installed profiles
+    auth = {"Authorization": token}
+    assert client.post("/api/relay/authorize", headers=auth).json()["allowed_cidrs"] == configured["allowed_cidrs"]
+    assert client.delete("/api/clients/alice/relay", headers=H).status_code == 200
+    assert client.post("/api/relay/authorize", headers=auth).status_code == 403
+    assert download(client)[1] != token
+    updated = {**configured, "url": "https://new-relay.example.com:8443"}
+    assert client.put("/api/relay/settings", json=updated, headers=H).status_code == 200
+    assert download(client)[0]["PayloadIdentifier"] == profile["PayloadIdentifier"]
+
+
+def test_auth_and_csrf(client, configured):
+    cookies = dict(client.cookies)
+    client.cookies.clear()
+    try:
+        assert client.get("/api/relay/settings").status_code == 401
+        assert client.post("/api/clients/alice/relay.mobileconfig", headers=H).status_code == 401
+        assert client.put("/api/relay/settings", json=configured, headers=H).status_code == 401
+    finally:
+        client.cookies.update(cookies)
+    assert client.post("/api/clients/alice/relay.mobileconfig").status_code == 403
+    assert client.put("/api/relay/settings", json=configured).status_code == 403
+    assert client.delete("/api/clients/alice/relay").status_code == 403
+    assert client.post("/api/relay/authorize").status_code == 403  # admin cookie is insufficient
+    _, token = download(client)
+    assert client.post("/api/relay/authorize", headers={"Authorization": token + "x"}).status_code == 403
+
+
+@pytest.mark.parametrize("change", ["expired", "revoked", "renewed", "guest", "missing", "disabled"])
+def test_lifecycle_denies_existing_credentials(client, configured, monkeypatch, change):
+    _, token = download(client)
+    from app.settings import settings
+    cert = copy.deepcopy(pki.cert_info(settings.pki_dir / "issued" / "alice.crt"))
+    if change == "expired":
+        cert["not_after"] = 1
+    elif change == "revoked":
+        monkeypatch.setattr(relay, "_index", lambda *args: {cert["serial"]: {"status": "R"}})
+    elif change == "renewed":
+        cert["serial"] = "NEW-SERIAL"
+    elif change == "missing":
+        cert = None
+    elif change == "guest":
+        monkeypatch.setattr(relay, "is_guest", lambda name: True)
+    elif change == "disabled":
+        client.put("/api/relay/settings", json={**configured, "enabled": False}, headers=H)
+    monkeypatch.setattr(pki, "cert_info", lambda _: cert)
+    assert client.post("/api/relay/authorize", headers={"Authorization": token}).status_code == 403
+    if change not in ("renewed", "missing", "guest"):
+        with pytest.raises(pki.PkiError):
+            relay.profile(db, "alice")
+
+
+
+@pytest.mark.parametrize("updates", [
+    {"url": "http://relay.example.com"}, {"url": "https://u:p@relay.example.com"},
+    {"url": "https://relay.example.com/path"}, {"url": "https://relay.example.com:70000"},
+    {"url": "https://relay.example.com?token=secret"}, {"url": ""},
+    {"match_domains": []}, {"match_domains": ["*.home.arpa"]},
+    {"allowed_cidrs": []}, {"allowed_cidrs": ["192.168.1.12/24"]},
+])
+def test_settings_validation(client, configured, updates):
+    response = client.put("/api/relay/settings", json={**configured, **updates}, headers=H)
+    assert response.status_code == 400
+    assert client.get("/api/relay/settings").json() == configured
+
+
+def test_no_credentials_in_client_list_or_audit(client, configured):
+    _, token = download(client)
+    assert token not in client.get("/api/clients").text
+    assert token not in client.get("/api/events").text
+    assert client.get("/api/clients/alice").json()["relay_available"]
+    assert client.post("/api/clients/old/relay.mobileconfig", headers=H).status_code == 400
+
+
+def test_relay_fails_closed_without_pki_index(client, configured, monkeypatch):
+    _, token = download(client)
+    monkeypatch.setattr(relay, "_index", lambda *args: {})
+    assert client.post("/api/relay/authorize", headers={"Authorization": token}).status_code == 403
+    assert client.post("/api/clients/alice/relay.mobileconfig", headers=H).status_code == 400
+
+
+def test_guest_and_non_guest_relay_profiles(client, configured):
+    _, full_token = download(client)
+    try:
+        assert client.put("/api/clients/alice/access", json={"guest": True}, headers=H).status_code == 200
+        assert client.post("/api/relay/authorize", headers={"Authorization": full_token}).status_code == 403
+        profile, guest_token = download(client)
+        assert profile["PayloadContent"][0]["MatchDomains"] == []
+        assert "Guest" in profile["PayloadDisplayName"]
+        policy = client.post("/api/relay/authorize", headers={"Authorization": guest_token}).json()
+        assert policy["guest"] is True and policy["allowed_cidrs"] == ["0.0.0.0/0"]
+        for network in ["170.134.51.0/24", "171.134.51.0/24", "10.0.60.0/24", "10.0.70.0/24", "192.168.1.0/24"]:
+            assert network in policy["blocked_cidrs"]
+        assert client.get("/api/clients/alice").json()["relay_available"]
+        # Saving the unchanged role must not invalidate a working profile.
+        client.put("/api/clients/alice/access", json={"guest": True}, headers=H)
+        assert client.post("/api/relay/authorize", headers={"Authorization": guest_token}).status_code == 200
+        client.put("/api/clients/alice/access", json={"guest": False}, headers=H)
+        assert client.post("/api/relay/authorize", headers={"Authorization": guest_token}).status_code == 403
+        assert download(client)[0]["PayloadContent"][0]["MatchDomains"] == ["home.arpa"]
+    finally:
+        pki.set_guest("alice", False)
+
+
+def test_guest_relay_denies_when_network_configuration_unreadable(client, configured, monkeypatch):
+    from app.settings import settings
+    monkeypatch.setattr(relay, "is_guest", lambda name: True)
+    _, token = download(client)
+    monkeypatch.setattr(settings, "server_conf", settings.openvpn_dir / "missing.conf")
+    assert client.post("/api/relay/authorize", headers={"Authorization": token}).status_code == 403
+
+
+def test_relay_authorization_does_not_scan_client_certificates(client, configured, monkeypatch):
+    _, token = download(client)
+    monkeypatch.setattr(pki, "list_clients", lambda _: pytest.fail("full client scan"))
+    monkeypatch.setattr(pki, "guests", lambda: pytest.fail("full guest scan"))
+    assert client.post("/api/relay/authorize", headers={"Authorization": token}).status_code == 200
+
+
+def test_relay_index_cache_observes_revocation_on_disk(client, configured):
+    from app.settings import settings
+    path = settings.pki_dir / "index.txt"
+    original = path.read_text()
+    _, token = download(client)
+    try:
+        rows = original.splitlines()
+        path.write_text("\n".join("R" + row[1:] if row.endswith("/CN=alice") else row for row in rows) + "\n")
+        assert client.post("/api/relay/authorize", headers={"Authorization": token}).status_code == 403
+    finally:
+        path.write_text(original)

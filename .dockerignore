@@ -5,6 +5,8 @@ staticclients/
 db/
 log/
 backups/
+relay-tls/
+*.mobileconfig
 .env
 config/management.pw
 config/*.bak

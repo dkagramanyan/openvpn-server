@@ -19,7 +19,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Str
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import __version__, auth, backup, pki, watchdog
+from . import __version__, auth, backup, pki, relay, watchdog
 from .collector import Collector, Maintenance
 from .db import Database
 from .mgmt import Management, ManagementError
@@ -282,6 +282,7 @@ def clients_payload(range_name: str, tz: int) -> list[dict[str, Any]]:
     certs = pki.list_clients(hidden_serials())
     statics = pki.static_ips()
     guests = pki.guests()
+    relay_enabled = relay.get_settings(db)["enabled"]
     tfa = pki.tfa_secrets()
     live = collector.snapshot()
     online: dict[str, list[dict[str, Any]]] = {}
@@ -306,6 +307,7 @@ def clients_payload(range_name: str, tz: int) -> list[dict[str, Any]]:
             "days_left": (cert["not_after"] - now) // 86400 if cert["not_after"] else None,
             "static_ip": statics.get(name),
             "guest": name in guests,
+            "relay_available": relay_enabled and cert["state"] == "valid",
             "tfa": name in tfa,
             "online": bool(online.get(name)),
             "sessions_live": online.get(name, []),
@@ -565,6 +567,44 @@ def tfa_qr(name: str, user: dict[str, Any] = Authed):
     return Response(pki.qr_svg(uri), media_type="image/svg+xml", headers={"Cache-Control": "no-store"})
 
 
+@app.get("/api/relay/settings")
+def get_relay_settings(user: dict[str, Any] = Authed):
+    return relay.get_settings(db)
+
+
+@app.put("/api/relay/settings", dependencies=[Csrf])
+def put_relay_settings(body: relay.RelaySettings, user: dict[str, Any] = Authed):
+    config = relay.save_settings(db, body)
+    event("relay_settings_changed", user)
+    return config
+
+
+@app.post("/api/clients/{name}/relay.mobileconfig", dependencies=[Csrf])
+def download_relay_profile(name: str, user: dict[str, Any] = Authed):
+    find_client(name)
+    content = relay.profile(db, name)
+    event("relay_profile_downloaded", user, name)
+    return Response(content, media_type="application/x-apple-aspen-config",
+                    headers={"Content-Disposition": f'attachment; filename="{name}-relay.mobileconfig"'})
+
+
+@app.delete("/api/clients/{name}/relay", dependencies=[Csrf])
+def revoke_relay(name: str, user: dict[str, Any] = Authed):
+    find_client(name)
+    relay.revoke(db, name)
+    event("relay_access_revoked", user, name)
+    return {"ok": True}
+
+
+@app.post("/api/relay/authorize")
+def authorize_relay(request: Request):
+    # Machine endpoint: a relay credential, never an admin cookie, authorizes it.
+    policy = relay.authorize(db, request.headers.get("authorization", ""))
+    if policy is None:
+        raise HTTPException(403, "Relay access denied")
+    return policy
+
+
 @app.post("/api/clients/{name}/tfa", dependencies=[Csrf])
 def set_tfa(name: str, body: TfaBody, user: dict[str, Any] = Authed):
     find_client(name)
@@ -583,6 +623,7 @@ def revoke(name: str, body: ReasonBody, user: dict[str, Any] = Authed):
     if row["state"] == "revoked":
         raise HTTPException(400, "Already revoked")
     pki.revoke_client(name, body.reason or None)
+    relay.revoke(db, name)
     drop_share_links(name)
     killed = ""
     try:
@@ -620,6 +661,7 @@ def delete_client(name: str, user: dict[str, Any] = Authed):
     if row["state"] != "revoked":
         raise HTTPException(400, "Revoke the certificate before deleting the client")
     pki.remove_client(name)
+    relay.revoke(db, name)
     drop_share_links(name)
     serials = [row["cert"]["serial"]] + [h["serial"] for h in row["history"]]
     with db.tx() as conn:
@@ -650,8 +692,10 @@ def static_ip(name: str, body: StaticIpBody, user: dict[str, Any] = Authed):
 
 @app.put("/api/clients/{name}/access", dependencies=[Csrf])
 def set_access(name: str, body: AccessBody, user: dict[str, Any] = Authed):
-    find_client(name)
+    previous = find_client(name)
     pki.set_guest(name, body.guest)
+    if previous["guest"] != body.guest:
+        relay.revoke(db, name)
     event("access_changed", user, name, "guest" if body.guest else "full")
     return {"guest": body.guest, "note": "Applies the next time a device connects"}
 
