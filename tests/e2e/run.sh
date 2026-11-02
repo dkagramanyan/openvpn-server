@@ -14,13 +14,14 @@ NAME=${E2E_NAME:-ovpn-e2e}
 
 docker build -q -t openvpn-server:e2e "$ROOT" >/dev/null
 docker build -q -t openvpn-ui:e2e -f "$ROOT/ui/Dockerfile" "$ROOT" >/dev/null
+docker build -q -t openvpn-apple-relay:e2e -f "$ROOT/relay/Dockerfile" "$ROOT" >/dev/null
 
 docker rm -f -v "$NAME" >/dev/null 2>&1 || true
 docker run -d --privileged --name "$NAME" -e DOCKER_TLS_CERTDIR= docker:dind >/dev/null
 [[ -n ${E2E_KEEP:-} ]] || trap 'docker rm -f -v "$NAME" >/dev/null' EXIT
 for _ in $(seq 60); do docker exec "$NAME" docker info >/dev/null 2>&1 && break; sleep 1; done
 
-docker save openvpn-server:e2e openvpn-ui:e2e | docker exec -i "$NAME" docker load >/dev/null
+docker save openvpn-server:e2e openvpn-ui:e2e openvpn-apple-relay:e2e | docker exec -i "$NAME" docker load >/dev/null
 # The repository as git sees it: none of a real deployment's keys, database or .env.
 git -C "$ROOT" ls-files -co --exclude-standard -z | tar -C "$ROOT" --null -T - -cf - \
     | docker exec -i "$NAME" sh -c 'mkdir -p /srv/openvpn && tar -C /srv/openvpn -xf -'

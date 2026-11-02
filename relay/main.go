@@ -1,4 +1,4 @@
-// LAN-scoped Apple Network Relay. Credentials and policy belong to the VPN UI;
+// Apple Network Relay. Credentials and destination policy belong to the VPN UI;
 // this process never needs the VPN CA key or write access to its state.
 package main
 
@@ -168,7 +168,7 @@ func env(key, fallback string) string {
 func main() {
 	cert, err := tls.LoadX509KeyPair("/tls/fullchain.pem", "/tls/privkey.pem")
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("Relay TLS setup required: put fullchain.pem and privkey.pem in APPLE_RELAY_TLS_DIR (default ./relay-tls), readable by UID 65532: %v", err)
 	}
 	handler := &relayServer{
 		api: env("RELAY_AUTH_URL", "http://127.0.0.1:8080/api/relay/authorize"),
@@ -182,6 +182,6 @@ func main() {
 		MaxHeaderBytes: 8192,
 		QUICConfig:     &quic.Config{KeepAlivePeriod: 20 * time.Second, MaxIdleTimeout: 90 * time.Second},
 	}
-	log.Printf("Apple LAN relay listening on %s/udp", server.Addr)
+	log.Printf("Apple Network Relay listening on %s/udp", server.Addr)
 	log.Fatal(server.ListenAndServe())
 }

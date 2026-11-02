@@ -599,7 +599,7 @@ def test_asset_change_invalidates_url_without_a_version_bump(client, monkeypatch
 @pytest.fixture
 def configured(client):
     old = relay.get_settings(db)
-    body = {"enabled": True, "url": "https://relay.example.com:8443",
+    body = {"enabled": True, "url": "https://relay.example.com:8443", "route_all": False,
             "match_domains": ["home.arpa"], "allowed_cidrs": ["192.168.1.0/24", "fd00::/64"]}
     assert client.put("/api/relay/settings", json=body, headers=H).status_code == 200
     yield body
@@ -633,6 +633,32 @@ def test_profile_and_revoke(client, configured):
     updated = {**configured, "url": "https://new-relay.example.com:8443"}
     assert client.put("/api/relay/settings", json=updated, headers=H).status_code == 200
     assert download(client)[0]["PayloadIdentifier"] == profile["PayloadIdentifier"]
+
+
+def test_full_access_relay_routes_internet_and_lan(client, configured):
+    lan_profile, token = download(client)
+    updated = {**configured, "route_all": True, "match_domains": []}
+    assert client.put("/api/relay/settings", json=updated, headers=H).status_code == 200
+    full_profile, full_token = download(client)
+    assert full_token == token
+    assert full_profile["PayloadIdentifier"] == lan_profile["PayloadIdentifier"]
+    assert full_profile["PayloadContent"][0]["MatchDomains"] == []
+    assert "Internet and LAN" in full_profile["PayloadDescription"]
+    policy = client.post("/api/relay/authorize", headers={"Authorization": token}).json()
+    assert policy == {"guest": False, "allowed_cidrs": ["0.0.0.0/0", "::/0"],
+                      "blocked_cidrs": [], "url": configured["url"]}
+    # Restoring LAN-only mode narrows server-side access for the existing grant.
+    assert client.put("/api/relay/settings", json=configured, headers=H).status_code == 200
+    assert client.post("/api/relay/authorize", headers={"Authorization": token}).json()["allowed_cidrs"] == configured["allowed_cidrs"]
+    assert download(client)[0] == lan_profile
+
+
+def test_relay_defaults_to_full_access_when_upgrading(client, configured):
+    legacy = {key: value for key, value in configured.items() if key != "route_all"}
+    db.set_setting("apple_relay", json.dumps(legacy))
+    result = client.get("/api/relay/settings").json()
+    assert result == {**legacy, "route_all": True}
+    assert download(client)[0]["PayloadContent"][0]["MatchDomains"] == []
 
 
 def test_auth_and_csrf(client, configured):
@@ -705,7 +731,9 @@ def test_relay_fails_closed_without_pki_index(client, configured, monkeypatch):
     assert client.post("/api/clients/alice/relay.mobileconfig", headers=H).status_code == 400
 
 
-def test_guest_and_non_guest_relay_profiles(client, configured):
+@pytest.mark.parametrize("route_all", [False, True])
+def test_guest_and_non_guest_relay_profiles(client, configured, route_all):
+    client.put("/api/relay/settings", json={**configured, "route_all": route_all}, headers=H)
     _, full_token = download(client)
     try:
         assert client.put("/api/clients/alice/access", json={"guest": True}, headers=H).status_code == 200
@@ -717,13 +745,14 @@ def test_guest_and_non_guest_relay_profiles(client, configured):
         assert policy["guest"] is True and policy["allowed_cidrs"] == ["0.0.0.0/0"]
         for network in ["170.134.51.0/24", "171.134.51.0/24", "10.0.60.0/24", "10.0.70.0/24", "192.168.1.0/24"]:
             assert network in policy["blocked_cidrs"]
+        assert "0.0.0.0/0" not in policy["blocked_cidrs"]
         assert client.get("/api/clients/alice").json()["relay_available"]
         # Saving the unchanged role must not invalidate a working profile.
         client.put("/api/clients/alice/access", json={"guest": True}, headers=H)
         assert client.post("/api/relay/authorize", headers={"Authorization": guest_token}).status_code == 200
         client.put("/api/clients/alice/access", json={"guest": False}, headers=H)
         assert client.post("/api/relay/authorize", headers={"Authorization": guest_token}).status_code == 403
-        assert download(client)[0]["PayloadContent"][0]["MatchDomains"] == ["home.arpa"]
+        assert download(client)[0]["PayloadContent"][0]["MatchDomains"] == ([] if route_all else ["home.arpa"])
     finally:
         pki.set_guest("alice", False)
 

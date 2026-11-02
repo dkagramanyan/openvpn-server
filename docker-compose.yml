@@ -4,7 +4,6 @@ x-logging: &logging
 
 services:
   apple-relay:
-    profiles: [apple-relay]
     image: openvpn-apple-relay:local
     build: { context: ., dockerfile: relay/Dockerfile }
     network_mode: host

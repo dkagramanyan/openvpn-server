@@ -25,6 +25,7 @@ from .settings import settings
 class RelaySettings(BaseModel):
     enabled: bool = False
     url: str = Field(default="", max_length=2048)
+    route_all: bool = True
     match_domains: list[str] = Field(default_factory=lambda: ["home.arpa"], max_length=100)
     allowed_cidrs: list[str] = Field(default_factory=lambda: [settings.home_sub], max_length=100)
 
@@ -59,8 +60,10 @@ def save_settings(db, body: RelaySettings) -> dict:
                                                     for c in body.allowed_cidrs))
     except ValueError:
         raise PkiError("Allowed networks must be valid CIDRs, e.g. 192.168.1.0/24")
-    if body.enabled and (not url or not domains or not config["allowed_cidrs"]):
-        raise PkiError("Enabling the LAN relay requires an HTTPS URL, LAN domains and allowed networks")
+    if body.enabled and (not url or not config["allowed_cidrs"]):
+        raise PkiError("Enabling the relay requires an HTTPS URL and LAN networks to block for guests")
+    if body.enabled and not body.route_all and not domains:
+        raise PkiError("LAN-only routing requires at least one LAN domain")
     db.set_setting("apple_relay", json.dumps(config))
     return config
 
@@ -150,14 +153,16 @@ def profile(db, name: str) -> bytes:
                 "PayloadUUID": str(uuid.uuid5(uuid.NAMESPACE_URL, identifier + suffix)).upper(),
                 "PayloadDisplayName": title}
 
-    title = ("Guest Relay · " if guest else "LAN Relay · ") + name
+    title = ("Guest Relay · " if guest else "Full Access Relay · " if config["route_all"] else "LAN Relay · ") + name
     relay = payload("com.apple.relay.managed", ".relay", title)
     relay.update({"Relays": [{"HTTP3RelayURL": config["url"] + "/.well-known/masque/udp/{target_host}/{target_port}/",
                               "AdditionalHTTPHeaderFields": {"Authorization": "Bearer " + token}}],
-                  "MatchDomains": [] if guest else config["match_domains"]})
+                  "MatchDomains": [] if guest or config["route_all"] else config["match_domains"]})
     result = payload("Configuration", "", title)
     result.update({"PayloadContent": [relay], "PayloadDescription":
-                   ("Internet-only guest access. " if guest else "Access selected LAN domains. ")
+                   ("Internet-only guest access. " if guest else
+                    "Internet and LAN access through your server. " if config["route_all"] else
+                    "Access selected LAN domains. ")
                    + "This profile contains a personal access credential."})
     return plistlib.dumps(result, sort_keys=False)
 
@@ -184,5 +189,8 @@ def authorize(db, authorization: str) -> dict | None:
         blocked = guest_blocks(config) if guest else []
     except (OSError, ValueError, IndexError):
         return None
-    return {"allowed_cidrs": ["0.0.0.0/0"] if guest else config["allowed_cidrs"],
+    # Full-access users may reach internet and LAN destinations. Keep the
+    # configured LAN list separate so guest exclusions never become 0.0.0.0/0.
+    allowed = ["0.0.0.0/0"] if guest else ["0.0.0.0/0", "::/0"] if config["route_all"] else config["allowed_cidrs"]
+    return {"allowed_cidrs": allowed,
             "blocked_cidrs": blocked, "guest": guest, "url": config["url"]}

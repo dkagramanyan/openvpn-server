@@ -4,14 +4,24 @@ set -euo pipefail
 cd /srv/openvpn
 
 say()  { printf '\n== %s\n' "$*"; }
-fail() { printf '\nFAILED: %s\n' "$*" >&2; docker logs --tail 40 openvpn 2>&1 | sed 's/^/    /' >&2; exit 1; }
+fail() { printf '\nFAILED: %s\n' "$*" >&2; docker compose logs --tail 40 2>&1 | sed 's/^/    /' >&2; exit 1; }
 api()  { docker exec openvpn-ui python /etc/openvpn/tests/e2e/api.py "$@"; }
 
 NET=172.30.0          # clients; the server is reached at its gateway
 [ -c /dev/net/tun ] || { mkdir -p /dev/net; mknod /dev/net/tun c 10 200; }
 docker tag openvpn-server:e2e openvpn-server:local
 docker tag openvpn-ui:e2e openvpn-ui:local
+docker tag openvpn-apple-relay:e2e openvpn-apple-relay:local
 docker network create --subnet $NET.0/24 e2e >/dev/null
+
+# Throwaway relay TLS files, readable only by the relay's unprivileged UID.
+# Production uses a publicly trusted certificate instead of this test identity.
+mkdir -p relay-tls
+docker run --rm -v /srv/openvpn/relay-tls:/tls --entrypoint sh openvpn-ui:local -c '
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -noenc -days 1 \
+        -subj /CN=relay.test -addext subjectAltName=DNS:relay.test \
+        -keyout /tls/privkey.pem -out /tls/fullchain.pem >/dev/null 2>&1
+    chown -R 65532:65532 /tls && chmod 700 /tls && chmod 600 /tls/privkey.pem'
 
 # Test settings: a short keepalive so a vanished client times out quickly, and
 # OpenVPN's own mssfix off so that the firewall's clamp is what gets measured.
@@ -22,10 +32,13 @@ printf 'OPENVPN_ADMIN_PASSWORD=e2e-password\nOVPN_PUBLIC_HOST=%s\n' "$NET.1" > .
 up() {
     docker compose up -d --no-build 2>&1 | sed 's/^/    /'
     for _ in $(seq 90); do
-        wget -qO- http://127.0.0.1:8080/healthz 2>/dev/null | grep -q '"openvpn":true' && return 0
+        if wget -qO- http://127.0.0.1:8080/healthz 2>/dev/null | grep -q '"openvpn":true' \
+            && docker compose exec -T apple-relay sh -c 'grep -q ":20FB " /proc/net/udp /proc/net/udp6' 2>/dev/null; then
+            return 0
+        fi
         sleep 1
     done
-    fail "the service did not come up"
+    fail "OpenVPN, UI or Apple relay did not come up"
 }
 
 # client NAME IP PROFILE [openvpn options]: an OpenVPN client in its own container

@@ -29,6 +29,10 @@ cp .env.example .env        # set the admin password and your public host name
 docker compose up -d --build
 ```
 
+This starts OpenVPN, the UI and Apple Network Relay together. The relay needs a
+publicly trusted certificate and key in `relay-tls/` before it can listen; see
+[Apple Network Relay](#apple-network-relay) for the one-time TLS and UDP port setup.
+
 First start takes a few seconds: the entrypoint creates the CA, the server
 certificate, the tls-crypt key and the CRL under `pki/`. Then:
 
@@ -57,8 +61,9 @@ itself. `OVPN_UI_BIND` limits the UI to one address (e.g. the LAN one).
 
 The existing **Clients** list and client page have adjacent **OpenVPN** and
 **Apple relay** downloads. The Apple download is a per-client `.mobileconfig`
-profile for Apple's built-in Network Relay. An optional `apple-relay` service
+profile for Apple's built-in Network Relay. The `apple-relay` service
 provides authenticated TCP CONNECT and MASQUE CONNECT-UDP over HTTP/3.
+It starts alongside OpenVPN and the UI with the same Compose command.
 
 To enable it:
 
@@ -77,12 +82,14 @@ To enable it:
 3. Start the services:
 
    ```shell
-   docker compose --profile apple-relay up -d --build
+   docker compose up -d --build
    ```
 
 4. In the existing UI, open **Settings → Apple Network Relay**. Set the public
-   URL (e.g. `https://relay.example.com:8443`), the LAN domains you want to access
-   (e.g. `home.arpa`), and the allowed destination CIDRs (e.g. `192.168.1.0/24`).
+   URL (e.g. `https://relay.example.com:8443`) and LAN CIDRs (e.g.
+   `170.134.51.0/24`) that guests must not reach. Leave **Route all domains for
+   non-guests (internet + LAN)** enabled for full access. To route only selected
+   LAN domains instead, turn it off and enter domains such as `home.arpa`.
    Enable and save. Names such as `nas.home.arpa` must resolve to the intended
    LAN addresses **from the relay container**; configure its DNS in Compose if
    your Docker DNS does not resolve your LAN names.
@@ -100,19 +107,25 @@ Manual installation is supported; Apple marks this payload deprecated starting
 with OS 27 in favor of declarative device management. Device interoperability
 still needs to be verified on your target Apple OS version.
 
-For non-guests, only the selected LAN domain names and their subdomains use the
-relay; other traffic continues normally. Guest profiles route all domains
+Non-guests route all domains through the relay by default, with access to both
+internet and LAN destinations. This also becomes the default for settings saved
+before the routing option existed; **download and reinstall existing non-guest
+profiles** to replace their old LAN-only domain selection. Turning off all-domain
+routing restores LAN-only access: only selected domain names and their subdomains
+use the relay, and the server restricts destinations to the configured LAN CIDRs.
+Guest profiles route all domains
 through the relay, allowing public IPv4 internet destinations only. IPv6 guest
-egress is blocked, consistent with the OpenVPN setup. This is domain-scoped TCP/UDP access, not an IP VPN: it does
-not assign a VPN address, carry ping, discover Bonjour services or route an
-entire subnet by IP. Use LAN DNS names with the relay, and the `.ovpn` profile
-when you need subnet routing. Do not use `.local` multicast names for remote
+egress is blocked, consistent with the OpenVPN setup. The relay proxies TCP/UDP
+connections. It does not assign a VPN address, carry ping, discover Bonjour
+services or install IP subnet routes. Use LAN DNS names with the relay, and the
+`.ovpn` profile when you need an IP VPN. Do not use `.local` multicast names for remote
 access. OpenVPN statistics show OpenVPN traffic only.
 
 The server checks **resolved destination IPs**, then connects to those exact
 addresses to prevent DNS rebinding around the CIDR policy. Loopback, link-local,
-unspecified and multicast destinations are always blocked. Choose narrow LAN
-CIDRs: non-guests can reach any TCP/UDP service within them. Guests can download
+unspecified and multicast destinations are always blocked. In full-access mode,
+non-guests can reach all other destinations; in LAN-only mode they can reach
+TCP/UDP services inside the configured CIDRs. Guests can download
 relay profiles too, but cannot reach private, VPN, configured LAN, directly
 attached or special-purpose networks. `HOME_SUB` and `GUEST_BLOCK` are shared
 between the OpenVPN and UI services; pushed routes and the relay's allowed LAN
@@ -122,7 +135,7 @@ forward to protected LAN services in `GUEST_BLOCK` if needed.
 | Access type | OpenVPN | Apple relay |
 |---|---|---|
 | Guest | Internet and configured DNS; no LAN | Public IPv4 internet; no LAN |
-| Non-guest (Full access) | Internet and LAN | Selected LAN domains; other traffic stays direct |
+| Non-guest (Full access) | Internet and LAN | Internet and LAN by default; optional LAN-only routing |
 
 Each profile contains a separate random bearer credential. It does not use the
 OpenVPN key passphrase or TOTP challenge. Repeated downloads reuse the current
@@ -151,9 +164,33 @@ before adjusting host settings. The application does not modify host sysctls.
 The relay authenticates against the UI over host loopback and has no access to
 the PKI or UI database. If `OVPN_UI_BIND` excludes loopback, set
 `APPLE_RELAY_AUTH_URL` to the UI's address on the same host. After renewing the
-relay TLS certificate, restart `apple-relay`. Changing the public URL or LAN
+relay TLS certificate, restart `apple-relay`. Changing the routing mode, public URL or LAN
 domains requires redistributing profiles; CIDR changes and disabling relay
 access take effect on existing connections without redistributing them.
+
+Installing a profile or enabling its download does **not** verify that the relay
+service is running. If a profile installs but no services open, check the service:
+
+```shell
+docker compose ps -a apple-relay
+docker compose logs --tail=50 apple-relay
+ss -lunp 'sport = :8443'
+```
+
+An empty container list means it has not been created. Older Compose files put
+the relay behind an optional profile; update the checkout, then run
+`docker compose up -d --build` to start all three services. With the TLS files in
+place, you can also start only the relay without restarting OpenVPN:
+
+```shell
+docker compose up -d --build --no-deps apple-relay
+```
+
+Missing or unreadable TLS files appear in the relay logs. Once it is listening,
+verify UDP 8443 is forwarded through the router/firewall. Zoraxy or another
+ordinary HTTPS reverse proxy on TCP 443 does not expose the relay's QUIC port.
+A successful profile download in the UI logs only confirms profile generation;
+`POST /api/relay/authorize` requests show that relay traffic is reaching the UI.
 
 Run relay checks with `cd relay && go test -race ./... && go vet ./...`; API and
 profile tests are included in `python -m pytest ui/tests -q`.
@@ -582,17 +619,17 @@ docker compose up -d
 
 ```shell
 cd ui && python -m pytest tests          # unit tests (parsers, DB roll-ups, auth, API)
-docker compose build                     # rebuild both images
+docker compose build                     # rebuild all three images
 tests/e2e/run.sh                         # end-to-end test (needs Docker)
 ```
 
-The end-to-end test starts the server, the UI and real OpenVPN clients inside
+The end-to-end test starts the server, the UI, Apple relay and real OpenVPN clients inside
 one Docker-in-Docker container, so it does not touch the network of the
 machine it runs on. It covers UDP and the TCP fallback, guests and the
 firewall, two devices on one certificate, the device limit, revocation,
 backups (plain and encrypted) and restore. It runs without kernel offload.
 
-The end-to-end test builds both images and runs them inside one
+The end-to-end test builds all three images and runs them inside one
 Docker-in-Docker container, so its networks, tun devices and firewall rules
 never touch the machine it runs on. Real clients connect over UDP and TCP,
 leave, vanish and reconnect; the test then compares the UI with the log,

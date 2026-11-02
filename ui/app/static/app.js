@@ -839,7 +839,7 @@ function serverView(el) {
 function socks(list, sorted) { const s = list.map(x => `${x.port}/${x.proto}`); return (sorted ? s.sort() : s).join(', '); }
 function relayButton(c, small = false) {
   return h('button', { class: 'btn' + (small ? ' sm' : ''), disabled: !c.relay_available,
-    title: !c.relay_available ? 'Enable Apple Network Relay in Settings' : c.guest ? 'Download internet-only guest relay profile' : 'Download LAN relay profile',
+    title: !c.relay_available ? 'Enable Apple Network Relay in Settings' : c.guest ? 'Download internet-only guest relay profile' : 'Download Apple relay profile',
     onClick: async e => {
       const button = e.currentTarget;
       button.disabled = true;
@@ -857,19 +857,21 @@ function relayButton(c, small = false) {
 
 function relaySettingsCard(s) {
   const enabled = h('input', { type: 'checkbox', checked: s.enabled });
+  const routeAll = h('input', { type: 'checkbox', checked: s.route_all, onChange: () => { domains.disabled = routeAll.checked; } });
   const url = h('input', { class: 'input', value: s.url, placeholder: 'https://relay.example.com:8443' });
-  const domains = h('input', { class: 'input', value: s.match_domains.join(', '), placeholder: 'home.arpa' });
+  const domains = h('input', { class: 'input', value: s.match_domains.join(', '), placeholder: 'home.arpa', disabled: s.route_all });
   const networks = h('input', { class: 'input', value: s.allowed_cidrs.join(', '), placeholder: '170.134.51.0/24' });
   const split = input => input.value.split(/[\s,]+/).filter(Boolean);
   return card('Apple Network Relay', h('div', { class: 'form' },
     h('label', { class: 'row' }, enabled, 'Enable Apple relay profiles'),
     field('Public relay URL', url, 'HTTPS hostname and port of the apple-relay service. A trusted TLS certificate and reachable UDP port are required.'),
-    field('LAN domains', domains, 'Comma-separated domains routed through the relay, such as home.arpa. Use names that resolve on the relay server.'),
-    field('Allowed destination networks', networks, 'Comma-separated IPv4 or IPv6 CIDRs. The relay blocks destinations outside these networks, including after DNS resolution.'),
-    h('p', { class: 'small muted' }, 'Each profile contains a separate access credential; OpenVPN passwords and 2FA do not apply. Guests get internet-only relay access; non-guests can reach the selected LAN domains. Changing access type or renewing a certificate requires a new relay profile.'),
-    h('p', { class: 'small muted' }, 'Start the optional apple-relay Compose service before enabling this setting. Non-guests use selected LAN domains; guests route internet traffic through the relay (IPv4 destinations). It does not provide a VPN address, ping or Bonjour discovery.'),
+    h('label', { class: 'row' }, routeAll, 'Route all domains for non-guests (internet + LAN)'),
+    field('LAN domains', domains, 'Used only when all-domain routing is off. Enter comma-separated domains, such as home.arpa. LAN service names must resolve on the relay server.'),
+    field('LAN networks', networks, 'Comma-separated IPv4 or IPv6 CIDRs blocked for guests. In LAN-only mode, non-guests can reach only these networks. With all-domain routing enabled, non-guests can reach internet and LAN destinations.'),
+    h('p', { class: 'small muted' }, 'Each profile contains a separate access credential; OpenVPN passwords and 2FA do not apply. Guests get internet-only relay access (IPv4 destinations). Changing access type or renewing a certificate requires a new relay profile.'),
+    h('p', { class: 'small muted' }, 'Start all services on the server with docker compose up -d --build. The relay needs its TLS certificate and an open UDP port before connections work; downloading a profile does not check connectivity. The relay does not provide a VPN address, ping or Bonjour discovery.'),
     h('div', null, h('button', { class: 'btn primary', onClick: async () => {
-      await withToast(api('/api/relay/settings', { method: 'PUT', body: { enabled: enabled.checked, url: url.value.trim(), match_domains: split(domains), allowed_cidrs: split(networks) } }), 'Relay settings saved; download profiles again if domains or URL changed');
+      await withToast(api('/api/relay/settings', { method: 'PUT', body: { enabled: enabled.checked, route_all: routeAll.checked, url: url.value.trim(), match_domains: split(domains), allowed_cidrs: split(networks) } }), 'Relay settings saved; download and reinstall profiles if routing, domains or URL changed');
     } }, 'Save relay settings'))));
 }
 
