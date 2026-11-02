@@ -1,0 +1,301 @@
+# Dynamic routing for dgkagramanyan.ru. Hot-reloaded, no restart needed.
+# Every hostname outside dgkagramanyan.ru is handed to Zoraxy (170.134.51.30):
+# raw TLS on 443 (tcp block at the bottom), plain HTTP on 80.
+#
+# Public:        status.dgkagramanyan.ru, the Kuma status pages
+# Public relay: dgkagramanyan.ru:8443 (authenticated by each Apple relay profile)
+# Trusted-only websites: everything else (LAN, WireGuard, OpenVPN full-access clients)
+#
+# Never put Go template braces in this file, not even in a comment:
+# Traefik renders it as a template before parsing the YAML.
+
+http:
+  routers:
+    # ---------------------------------------------------------------- public
+    status:
+      rule: "Host(`status.dgkagramanyan.ru`)"
+      entryPoints: [websecure]
+      service: kuma
+      tls: {}
+
+    # Status pages, their API and static files. The admin UI (socket.io,
+    # /dashboard, /settings) stays behind the kuma router below.
+    kuma-status:
+      rule: "Host(`kuma.dgkagramanyan.ru`) && (PathPrefix(`/status/`) || PathPrefix(`/assets/`) || PathPrefix(`/api/status-page/`) || PathPrefix(`/api/badge/`) || PathPrefix(`/upload/`) || Path(`/icon.svg`) || Path(`/favicon.ico`) || Path(`/apple-touch-icon.png`) || Path(`/manifest.json`))"
+      priority: 100
+      entryPoints: [websecure]
+      service: kuma
+      tls: {}
+
+    # Diagnostic: shows the source IP Traefik sees (RemoteAddr).
+    # Delete once the trusted-only ranges are confirmed.
+    whoami:
+      rule: "Host(`whoami.dgkagramanyan.ru`)"
+      entryPoints: [websecure]
+      service: whoami
+      tls: {}
+
+    # ---------------------------------------------------------- trusted-only
+    podkop:
+      rule: "Host(`podkop.dgkagramanyan.ru`)"
+      entryPoints: [websecure]
+      service: podkop
+      middlewares: [trusted-only]
+      tls: {}
+
+    kuma:
+      rule: "Host(`kuma.dgkagramanyan.ru`)"
+      entryPoints: [websecure]
+      service: kuma
+      middlewares: [trusted-only]
+      tls: {}
+
+    zoraxy:
+      rule: "Host(`zoraxy.dgkagramanyan.ru`)"
+      entryPoints: [websecure]
+      service: zoraxy
+      middlewares: [trusted-only]
+      tls: {}
+
+    transmission:
+      rule: "Host(`transmission.dgkagramanyan.ru`)"
+      entryPoints: [websecure]
+      service: transmission
+      middlewares: [trusted-only]
+      tls: {}
+
+    omada:
+      rule: "Host(`omada.dgkagramanyan.ru`)"
+      entryPoints: [websecure]
+      service: omada
+      middlewares: [trusted-only]
+      tls: {}
+
+    openvpn:
+      rule: "Host(`openvpn.dgkagramanyan.ru`)"
+      entryPoints: [websecure]
+      service: openvpn
+      middlewares: [trusted-only]
+      tls: {}
+
+    openvpn-legacy:
+      rule: "Host(`openvpn-legacy.dgkagramanyan.ru`)"
+      entryPoints: [websecure]
+      service: openvpn-legacy
+      middlewares: [trusted-only]
+      tls: {}
+
+    openvpn-orig:
+      rule: "Host(`openvpn-orig.dgkagramanyan.ru`)"
+      entryPoints: [websecure]
+      service: openvpn-orig
+      middlewares: [trusted-only]
+      tls:
+        certResolver: letsencrypt
+
+    luci-main:
+      rule: "Host(`luci-main.dgkagramanyan.ru`)"
+      entryPoints: [websecure]
+      service: luci-main
+      middlewares: [trusted-only]
+      tls: {}
+
+    luci-reserv:
+      rule: "Host(`luci-reserv.dgkagramanyan.ru`)"
+      entryPoints: [websecure]
+      service: luci-reserv
+      middlewares: [trusted-only]
+      tls: {}
+
+    plex:
+      rule: "Host(`plex.dgkagramanyan.ru`)"
+      entryPoints: [websecure]
+      service: plex
+      middlewares: [trusted-only]
+      tls: {}
+
+    proxmox:
+      rule: "Host(`proxmox.dgkagramanyan.ru`)"
+      entryPoints: [websecure]
+      service: proxmox
+      middlewares: [trusted-only]
+      tls: {}
+
+    grafana:
+      rule: "Host(`grafana.dgkagramanyan.ru`)"
+      entryPoints: [websecure]
+      service: grafana
+      middlewares: [trusted-only]
+      tls: {}
+
+    # ws-scrcpy has no authentication: full control of the phone.
+    tecno:
+      rule: "Host(`tecno.dgkagramanyan.ru`)"
+      entryPoints: [websecure]
+      service: tecno
+      middlewares: [trusted-only]
+      tls: {}
+
+    # ---------------------------------------------------------------- port 80
+    # Requires entryPoints.web in traefik.yml WITHOUT a global redirect.
+    # ACME HTTP-01 challenges are caught earlier by acme-http@internal.
+    redirect-dgk-http:
+      rule: "HostRegexp(`^(.+\\.)?dgkagramanyan\\.ru$`)"
+      priority: 2
+      entryPoints: [web]
+      service: noop@internal
+      middlewares: [https-redirect]
+
+    # priority 1 is mandatory: default priority is rule length, and this
+    # rule would otherwise outrank the local hosts. Carries Zoraxy's
+    # HTTP-01 challenges, so no trusted-only here.
+    fallback-zoraxy-http:
+      rule: "!HostRegexp(`^(.+\\.)?dgkagramanyan\\.ru$`)"
+      priority: 1
+      entryPoints: [web]
+      service: fallback-zoraxy-http
+
+  services:
+    podkop:
+      loadBalancer:
+        servers:
+          - url: "http://170.134.51.30:8081"
+
+    kuma:
+      loadBalancer:
+        servers:
+          - url: "http://raspberrypi:3001"
+
+    whoami:
+      loadBalancer:
+        servers:
+          - url: "http://whoami:80"
+
+    zoraxy:
+      loadBalancer:
+        servers:
+          - url: "http://170.134.51.30:8000"
+
+    fallback-zoraxy-http:
+      loadBalancer:
+        passHostHeader: true
+        servers:
+          - url: "http://170.134.51.30:80"
+
+    transmission:
+      loadBalancer:
+        servers:
+          - url: "http://homepc:9091"
+
+    omada:
+      loadBalancer:
+        serversTransport: insecure-backend
+        servers:
+          - url: "https://macbook:8043"
+
+    # Literal IPs for the Asahi box (.30 and .32): the "macbook" name may
+    # not resolve from inside the Traefik container.
+    openvpn:
+      loadBalancer:
+        servers:
+          - url: "http://170.134.51.30:8080"
+
+    tecno:
+      loadBalancer:
+        servers:
+          - url: "http://170.134.51.32:8000"
+
+    openvpn-legacy:
+      loadBalancer:
+        servers:
+          - url: "http://raspberrypi:8080"
+
+    openvpn-orig:
+      loadBalancer:
+        serversTransport: insecure-backend
+        servers:
+          - url: "https://raspberrypi:943"
+
+    luci-main:
+      loadBalancer:
+        servers:
+          - url: "http://openwrt-main"
+
+    luci-reserv:
+      loadBalancer:
+        servers:
+          - url: "http://openwrt-reserv"
+
+    plex:
+      loadBalancer:
+        servers:
+          - url: "http://homepc:32400"
+
+    proxmox:
+      loadBalancer:
+        serversTransport: insecure-backend
+        servers:
+          - url: "https://acserver:8006"
+
+    grafana:
+      loadBalancer:
+        servers:
+          - url: "http://grafana:3000"
+
+  serversTransports:
+    insecure-backend:
+      insecureSkipVerify: true
+
+  middlewares:
+    https-redirect:
+      redirectScheme:
+        scheme: https
+        permanent: true
+
+    # Matches the raw TCP source address, X-Forwarded-For is ignored.
+    trusted-only:
+      ipAllowList:
+        sourceRange:
+          - "170.134.51.0/24"   # LAN
+          - "10.10.10.0/24"     # WireGuard (MikroTik hEX S)
+          - "10.0.70.0/25"      # OpenVPN full-access clients (.128/25 = guests, excluded)
+
+# Non-dgkagramanyan.ru TLS goes to Zoraxy still encrypted. TCP routers are
+# matched before HTTP routers, so the negation protects everything above.
+# HTTP middlewares do not apply here; Zoraxy owns access control and certs.
+tcp:
+  routers:
+    # Dedicated TCP entryPoint; Traefik terminates TLS using its existing cert.
+    # The relay backend authenticates profile credentials and enforces access.
+    apple-relay:
+      entryPoints: [apple-relay]
+      rule: "HostSNI(`dgkagramanyan.ru`)"
+      service: apple-relay
+      tls:
+        options: apple-relay-http2
+
+    fallback-zoraxy:
+      entryPoints: [websecure]
+      rule: "!HostSNIRegexp(`^(.+\\.)?dgkagramanyan\\.ru$`)"
+      priority: 1
+      service: fallback-zoraxy
+      tls:
+        passthrough: true
+
+  services:
+    apple-relay:
+      loadBalancer:
+        servers:
+          - address: "170.134.51.30:8444"
+
+    fallback-zoraxy:
+      loadBalancer:
+        servers:
+          - address: "170.134.51.30:443"
+
+# Only the relay router selects this option; website TLS settings stay as-is.
+tls:
+  options:
+    apple-relay-http2:
+      minVersion: VersionTLS12
+      alpnProtocols: [h2]

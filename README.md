@@ -243,6 +243,15 @@ URL remains **`https://dgkagramanyan.ru:8443`**. Forward WAN **TCP 8443 to the P
 Existing website routers remain on port 443. Remove any older relay UDP router
 from Traefik's dynamic directory when switching to this setup.
 
+For this deployment, [the complete native-services.yml](config/traefik-native-services.yml)
+also includes all the existing website routes and the new relay. Use it as a
+replacement for `dynamic/native-services.yml` **instead of** adding the separate
+`dynamic/apple-relay.yml`; keep only one definition of the relay router/service.
+Back up the current file outside the watched `dynamic` directory before replacing
+it. The static entryPoint, Docker port mapping and WAN forwarding above are still
+required. This full example preserves the supplied `trusted-only` middleware,
+Zoraxy fallback and existing certificate resolver settings.
+
 This must be a **TCP router with TLS termination**, not an HTTP router or TLS
 passthrough. [Traefik's TCP TLS documentation](https://doc.traefik.io/traefik/reference/routing-configuration/tcp/tls/)
 describes termination; its [CONNECT guidance](https://doc.traefik.io/traefik/migrate/v3/#connect-requests)
