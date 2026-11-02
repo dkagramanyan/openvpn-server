@@ -242,7 +242,10 @@ func TestRelayTCPUDPAndRevocation(t *testing.T) {
 }
 
 func TestGuestPolicy(t *testing.T) {
-	p := policy{Guest: true, CIDRs: []string{"0.0.0.0/0"}, Blocked: []string{"170.134.51.0/24", "171.134.51.0/24"}}
+	p := policy{Guest: true, CIDRs: []string{"0.0.0.0/0"}, Blocked: []string{"170.134.51.0/24", "171.134.51.0/24", "93.123.161.4/32"}}
+	if p.allows(netip.MustParseAddr("93.123.161.4")) {
+		t.Fatal("guest can loop back through the public reverse proxy")
+	}
 	for _, ip := range []string{"8.8.8.8", "1.1.1.1", "::ffff:8.8.8.8"} {
 		if !p.allows(netip.MustParseAddr(ip)) {
 			t.Errorf("guest public destination denied: %s", ip)

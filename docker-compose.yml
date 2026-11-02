@@ -41,7 +41,9 @@ services:
       GUEST_SUB: &guest_sub "10.0.70.128/25"   # guests' addresses: internet and DNS only
       HOME_SUB: &home_sub "170.134.51.0/24"   # your LAN - guests are blocked from it
       # Guests are also blocked from every network server.conf pushes a route to, and from:
-      GUEST_BLOCK: &guest_block "10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16"
+      # Block our public ingress too: NAT back to Traefik would appear LAN-trusted.
+      # Update 93.123.161.4/32 if the public address changes.
+      GUEST_BLOCK: &guest_block "10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16 93.123.161.4/32"
       # OVPN_EGRESS_IFACE: eth0     # auto-detected from the default route
       # OVPN_STRICT_FORWARD: "1"    # set to 0 to allow unsolicited inbound to VPN clients
       # OVPN_MSS: "1400"            # TCP MSS clamp for tunnel traffic (kernel offload has no mssfix); 0 = off

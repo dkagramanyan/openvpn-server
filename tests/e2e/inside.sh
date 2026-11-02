@@ -77,6 +77,8 @@ fw()       { docker exec openvpn iptables "$@"; }
 say "Start the service"
 up
 docker exec openvpn iptables -t mangle -S OVPN-MSS | grep -q 'set-mss 1400' || fail "no MSS clamp in the firewall"
+docker exec openvpn iptables -S OVPN-FORWARD | grep -q -- '-d 93.123.161.4/32 -j DROP' \
+    || fail "guests can loop back through the public reverse proxy"
 
 say "Create clients"
 mkdir -p /srv/e2e

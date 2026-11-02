@@ -1,0 +1,14 @@
+# Copy into Traefik's dynamic configuration directory on the Raspberry Pi.
+# First add an apple-relay entryPoint at :8443/udp in its static configuration
+# and publish 8443:8443/udp if Traefik uses Docker bridge networking.
+# This forwards encrypted QUIC packets; the relay still needs its TLS files.
+udp:
+  routers:
+    apple-relay:
+      entryPoints: [apple-relay]
+      service: apple-relay
+  services:
+    apple-relay:
+      loadBalancer:
+        servers:
+          - address: "170.134.51.30:8443"

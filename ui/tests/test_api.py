@@ -765,6 +765,15 @@ def test_guest_relay_denies_when_network_configuration_unreadable(client, config
     assert client.post("/api/relay/authorize", headers={"Authorization": token}).status_code == 403
 
 
+def test_guest_relay_blocks_configured_public_ingress(client, configured, monkeypatch):
+    from app.settings import settings
+    monkeypatch.setattr(settings, "guest_block", settings.guest_block + " 93.123.161.4/32")
+    monkeypatch.setattr(relay, "is_guest", lambda name: True)
+    _, token = download(client)
+    policy = client.post("/api/relay/authorize", headers={"Authorization": token}).json()
+    assert "93.123.161.4/32" in policy["blocked_cidrs"]
+
+
 def test_relay_authorization_does_not_scan_client_certificates(client, configured, monkeypatch):
     _, token = download(client)
     monkeypatch.setattr(pki, "list_clients", lambda _: pytest.fail("full client scan"))

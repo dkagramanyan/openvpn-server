@@ -130,7 +130,12 @@ relay profiles too, but cannot reach private, VPN, configured LAN, directly
 attached or special-purpose networks. `HOME_SUB` and `GUEST_BLOCK` are shared
 between the OpenVPN and UI services; pushed routes and the relay's allowed LAN
 CIDRs are also excluded from guest egress. Include public NAT addresses that
-forward to protected LAN services in `GUEST_BLOCK` if needed.
+forward to protected LAN services in `GUEST_BLOCK`: otherwise a guest can loop
+back through the public address and appear LAN-trusted to a reverse proxy.
+The supplied Compose file includes this deployment's public ingress
+`93.123.161.4/32`; update it if the public address changes. This block applies
+to both OpenVPN guests and relay guests, including public services sharing
+that address.
 
 | Access type | OpenVPN | Apple relay |
 |---|---|---|
@@ -194,6 +199,74 @@ A successful profile download in the UI logs only confirms profile generation;
 
 Run relay checks with `cd relay && go test -race ./... && go vet ./...`; API and
 profile tests are included in `python -m pytest ui/tests -q`.
+
+### Reuse Traefik certificates and forward the relay port
+
+For the Raspberry Pi Traefik and OpenVPN host at `170.134.51.30`, Traefik can
+forward **UDP** packets to the relay. Its ordinary HTTP routing cannot proxy
+this connection: [Traefik rejects CONNECT requests](https://doc.traefik.io/traefik/migrate/v3/#connect-requests).
+UDP forwarding leaves TLS termination at the relay, so the OpenVPN host still
+needs the certificate and key. The public relay URL remains
+`https://dgkagramanyan.ru:8443`.
+
+On the Raspberry Pi, find the **host** path mounted as `/letsencrypt/acme.json`
+in Traefik. If the file lives inside `~/traefik`, list its location with:
+
+```shell
+sudo find "$HOME/traefik" -type f -name acme.json -print
+```
+
+Use the returned path below in place of `/HOST/PATH/acme.json`. Download the
+helper from this repository (or use `bin/export-relay-cert.py` from a checkout):
+
+```shell
+curl -fsSL https://raw.githubusercontent.com/dkagramanyan/openvpn-server/main/bin/export-relay-cert.py -o /tmp/export-relay-cert.py
+sudo python3 /tmp/export-relay-cert.py --acme /HOST/PATH/acme.json --hostname dgkagramanyan.ru --output "$HOME/relay-tls-export"
+scp -r "$HOME/relay-tls-export" david@170.134.51.30:
+```
+
+The helper requires Python 3 and OpenSSL. It selects a matching identity,
+checks its hostname, validity dates and matching private key, then writes
+only `fullchain.pem` and `privkey.pem` with private permissions. It leaves
+`acme.json` untouched and never prints key material. When run via sudo, the
+export belongs to the invoking user so their usual SSH credentials work for
+the transfer. Do not share the whole ACME store or the exported private key.
+
+On the OpenVPN host, install those two files and start all services:
+
+```shell
+cd ~/openvpn-server
+git pull
+sudo install -d -o 65532 -g 65532 -m 700 relay-tls
+sudo install -o 65532 -g 65532 -m 600 ~/relay-tls-export/fullchain.pem relay-tls/fullchain.pem
+sudo install -o 65532 -g 65532 -m 600 ~/relay-tls-export/privkey.pem relay-tls/privkey.pem
+sudo docker compose up -d --build
+sudo docker compose logs --tail=30 apple-relay
+```
+
+After a Traefik certificate renewal, repeat export/transfer/install and run
+`sudo docker compose restart apple-relay`. The relay does not automatically
+read the certificate store on the other machine. Downloads already installed
+on devices remain valid when the hostname stays the same.
+
+To forward through Traefik, merge this entry into the Raspberry Pi's existing
+`entryPoints` in `traefik.yml` (static configuration):
+
+```yaml
+entryPoints:
+  apple-relay:
+    address: ":8443/udp"
+    udp:
+      timeout: 90s
+```
+
+For Docker bridge networking, add `"8443:8443/udp"` to Traefik's existing
+`ports` list. Copy [config/traefik-relay.yml](config/traefik-relay.yml) into its
+dynamic configuration directory, then recreate/restart Traefik to load the
+new entry point. Forward WAN **UDP 8443 to the Raspberry Pi** and allow the Pi
+to reach `170.134.51.30:8443/udp`. Existing website routers keep using 443.
+Alternatively, forward UDP 8443 directly to the OpenVPN host and skip these
+Traefik routing changes. See [Traefik UDP routing](https://doc.traefik.io/traefik/reference/routing-configuration/udp/routing/router/).
 
 ## Layout
 
