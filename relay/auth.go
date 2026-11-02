@@ -55,16 +55,27 @@ func (s *relayServer) authorize(ctx context.Context, token string) (policy, erro
 	entry := &policyEntry{ready: make(chan struct{})}
 	s.policies[key] = entry
 	s.authMu.Unlock()
-	p, err := s.authorizeBackend(ctx, token)
-	s.authMu.Lock()
-	entry.policy, entry.err = p, err
-	entry.expires = time.Now().Add(s.policyTTL)
-	if err != nil {
-		delete(s.policies, key)
+	// A shared check belongs to all waiting flows. Closing its first caller
+	// must not cancel authorization for the other connections using this token.
+	go func() {
+		checkCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+		defer cancel()
+		p, err := s.authorizeBackend(checkCtx, token)
+		s.authMu.Lock()
+		entry.policy, entry.err = p, err
+		entry.expires = time.Now().Add(s.policyTTL)
+		if err != nil {
+			delete(s.policies, key)
+		}
+		close(entry.ready)
+		s.authMu.Unlock()
+	}()
+	select {
+	case <-ctx.Done():
+		return policy{}, ctx.Err()
+	case <-entry.ready:
+		return entry.policy, entry.err
 	}
-	close(entry.ready)
-	s.authMu.Unlock()
-	return p, err
 }
 
 func (s *relayServer) authorizeBackend(ctx context.Context, token string) (policy, error) {

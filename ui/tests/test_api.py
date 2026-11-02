@@ -601,8 +601,9 @@ def configured(client):
     old = relay.get_settings(db)
     body = {"enabled": True, "url": "https://relay.example.com:8443", "route_all": False,
             "match_domains": ["home.arpa"], "allowed_cidrs": ["192.168.1.0/24", "fd00::/64"]}
-    assert client.put("/api/relay/settings", json=body, headers=H).status_code == 200
-    yield body
+    response = client.put("/api/relay/settings", json=body, headers=H)
+    assert response.status_code == 200
+    yield response.json()
     db.set_setting("apple_relay", json.dumps(old))
     relay.revoke(db, "alice")
 
@@ -623,7 +624,8 @@ def test_profile_and_revoke(client, configured):
     payload = profile["PayloadContent"][0]
     assert payload["PayloadType"] == "com.apple.relay.managed"
     assert payload["MatchDomains"] == ["home.arpa"]
-    assert payload["Relays"][0]["HTTP3RelayURL"].endswith("/{target_host}/{target_port}/")
+    assert payload["Relays"][0]["HTTP2RelayURL"].endswith("/{target_host}/{target_port}/")
+    assert "HTTP3RelayURL" not in payload["Relays"][0]
     assert download(client) == (profile, token)  # repeat downloads don't break installed profiles
     auth = {"Authorization": token}
     assert client.post("/api/relay/authorize", headers=auth).json()["allowed_cidrs"] == configured["allowed_cidrs"]
@@ -659,6 +661,19 @@ def test_relay_defaults_to_full_access_when_upgrading(client, configured):
     result = client.get("/api/relay/settings").json()
     assert result == {**legacy, "route_all": True}
     assert download(client)[0]["PayloadContent"][0]["MatchDomains"] == []
+
+
+def test_profile_transport_follows_service_mode(client, configured, monkeypatch):
+    from app.settings import settings
+    original, token = download(client)
+    # UI requests cannot change the protocol independently of the service.
+    response = client.put("/api/relay/settings", json={**configured, "transport": "http3"}, headers=H)
+    assert response.json()["transport"] == "http2"
+    monkeypatch.setattr(settings, "relay_transport", "http3")
+    profile, new_token = download(client)
+    assert new_token == token and profile["PayloadIdentifier"] == original["PayloadIdentifier"]
+    endpoint = profile["PayloadContent"][0]["Relays"][0]
+    assert "HTTP3RelayURL" in endpoint and "HTTP2RelayURL" not in endpoint
 
 
 def test_auth_and_csrf(client, configured):

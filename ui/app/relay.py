@@ -31,7 +31,8 @@ class RelaySettings(BaseModel):
 
 
 def get_settings(db) -> dict:
-    return RelaySettings(**json.loads(db.get_setting("apple_relay", "{}"))).model_dump()
+    config = RelaySettings(**json.loads(db.get_setting("apple_relay", "{}"))).model_dump()
+    return {**config, "transport": settings.relay_transport}
 
 
 def save_settings(db, body: RelaySettings) -> dict:
@@ -65,7 +66,7 @@ def save_settings(db, body: RelaySettings) -> dict:
     if body.enabled and not body.route_all and not domains:
         raise PkiError("LAN-only routing requires at least one LAN domain")
     db.set_setting("apple_relay", json.dumps(config))
-    return config
+    return {**config, "transport": settings.relay_transport}
 
 
 @lru_cache(maxsize=8)
@@ -155,7 +156,8 @@ def profile(db, name: str) -> bytes:
 
     title = ("Guest Relay · " if guest else "Full Access Relay · " if config["route_all"] else "LAN Relay · ") + name
     relay = payload("com.apple.relay.managed", ".relay", title)
-    relay.update({"Relays": [{"HTTP3RelayURL": config["url"] + "/.well-known/masque/udp/{target_host}/{target_port}/",
+    url_key = "HTTP2RelayURL" if config["transport"] == "http2" else "HTTP3RelayURL"
+    relay.update({"Relays": [{url_key: config["url"] + "/.well-known/masque/udp/{target_host}/{target_port}/",
                               "AdditionalHTTPHeaderFields": {"Authorization": "Bearer " + token}}],
                   "MatchDomains": [] if guest or config["route_all"] else config["match_domains"]})
     result = payload("Configuration", "", title)

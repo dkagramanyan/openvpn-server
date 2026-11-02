@@ -29,9 +29,9 @@ cp .env.example .env        # set the admin password and your public host name
 docker compose up -d --build
 ```
 
-This starts OpenVPN, the UI and Apple Network Relay together. The relay needs a
-publicly trusted certificate and key in `relay-tls/` before it can listen; see
-[Apple Network Relay](#apple-network-relay) for the one-time TLS and UDP port setup.
+This starts OpenVPN, the UI and Apple Network Relay together. By default, the
+relay is an HTTP/2 backend for Traefik: certificates stay on the proxy machine.
+See [Apple Network Relay](#apple-network-relay) for the TCP routing setup.
 
 First start takes a few seconds: the entrypoint creates the CA, the server
 certificate, the tls-crypt key and the CRL under `pki/`. Then:
@@ -62,23 +62,25 @@ itself. `OVPN_UI_BIND` limits the UI to one address (e.g. the LAN one).
 The existing **Clients** list and client page have adjacent **OpenVPN** and
 **Apple relay** downloads. The Apple download is a per-client `.mobileconfig`
 profile for Apple's built-in Network Relay. The `apple-relay` service
-provides authenticated TCP CONNECT and MASQUE CONNECT-UDP over HTTP/3.
-It starts alongside OpenVPN and the UI with the same Compose command.
+provides authenticated TCP CONNECT and MASQUE CONNECT-UDP over HTTP/2, with
+optional direct HTTP/3 support. It starts alongside OpenVPN and the UI with
+the same Compose command. Both guest isolation and full internet/LAN access
+are enforced by the relay regardless of transport.
 
 To enable it:
 
-1. Choose a public DNS name, for example `relay.example.com`, pointing to this
-   server. Obtain a publicly trusted TLS certificate for it. Place the actual
-   certificate chain and key in `relay-tls/fullchain.pem` and
-   `relay-tls/privkey.pem` (or set `APPLE_RELAY_TLS_DIR` to another directory).
-   The container runs as UID/GID `65532`; give that identity read access to the
-   files and traversal access to their directory. Keep the private key private
-   (for example owner `65532`, directory mode `700`, key mode `600`). Copy files
-   rather than symlinks pointing outside the mounted directory.
-2. Forward/open **UDP 8443** to this server, or choose another unprivileged
-   listening port with `APPLE_RELAY_BIND`. The service must be directly reachable
-   over QUIC; a conventional HTTP reverse proxy does not forward it. This version
-   does not offer an HTTP/2 fallback on networks that block UDP.
+1. Keep `APPLE_RELAY_TRANSPORT=http2` (the default) and set
+   `APPLE_RELAY_TRUSTED_PROXIES` to the Traefik machine's LAN address as a `/32`.
+   The supplied Compose default is `170.134.51.13/32`, based on the existing
+   Raspberry Pi proxy logs, plus loopback for local diagnostics. Adjust it if
+   the Pi uses another address. The backend checks the actual TCP peer and
+   ignores forwarded headers for trust. It listens on **TCP 8444**, configurable
+   with `APPLE_RELAY_HTTP2_BIND`; only the proxy needs to reach this LAN port.
+2. Configure Traefik as described in [Traefik HTTP/2 setup](#traefik-http2-setup):
+   public **TCP 8443** terminates TLS at the Pi, then forwards the decrypted
+   HTTP/2 connection to `170.134.51.30:8444`. Traefik keeps obtaining and renewing
+   the certificate. No certificate, private key or ACME store needs to be copied
+   to the OpenVPN host. The Pi-to-server hop is unencrypted on the trusted LAN.
 3. Start the services:
 
    ```shell
@@ -98,6 +100,11 @@ To enable it:
    in system Settings. On iOS/iPadOS, open the downloaded profile and complete
    installation under **General → VPN & Device Management**; on macOS use
    **Device Management / Profiles** in System Settings.
+
+When upgrading from the earlier HTTP/3 version, **download and reinstall the
+profiles** even if the URL is unchanged. Profiles now contain `HTTP2RelayURL`.
+Compose sets the same transport for the relay and UI; Settings displays it.
+Do not overwrite an existing `.env` with `.env.example` when upgrading.
 
 The profile uses Apple's `com.apple.relay.managed` payload (introduced in
 iOS/iPadOS 17 and macOS 14). See the
@@ -154,12 +161,16 @@ authorization timeout), and fail closed if the UI becomes unavailable. OpenVPN
 access-type changes take effect when devices reconnect.
 
 Concurrent connections share authorization results for at most one second,
-without extending stale results on errors. The backend checks only that client's
+without extending stale results on errors. Closing one flow does not cancel
+the shared authorization check for other flows. The backend checks only that client's
 certificate and caches the PKI index until the file changes. TCP connections try
 validated destination addresses with a 200 ms stagger, so an unreachable first
-address does not block a reachable alternative. QUIC keepalives run every 20
-seconds, with a 90-second idle timeout. TCP half-close preserves the remaining
-response data, including the last queued QUIC packets.
+address does not block a reachable alternative. HTTP/2 checks idle connections
+with PING after 20 seconds and times them out after 10 more seconds without a
+reply. QUIC keepalives run every 20 seconds in direct HTTP/3 mode. Both modes
+use a 90-second idle-connection timeout and preserve responses after a client
+half-closes its TCP upload. HTTP/2 transports UDP as RFC 9297 datagram capsules;
+packet loss can stall its shared TCP connection, while HTTP/3 uses QUIC datagrams.
 
 If quic-go reports a low UDP receive buffer, the host's socket buffer limits can
 limit throughput under load. Check the
@@ -168,8 +179,8 @@ before adjusting host settings. The application does not modify host sysctls.
 
 The relay authenticates against the UI over host loopback and has no access to
 the PKI or UI database. If `OVPN_UI_BIND` excludes loopback, set
-`APPLE_RELAY_AUTH_URL` to the UI's address on the same host. After renewing the
-relay TLS certificate, restart `apple-relay`. Changing the routing mode, public URL or LAN
+`APPLE_RELAY_AUTH_URL` to the UI's address on the same host. Changing the
+transport, routing mode, public URL or LAN
 domains requires redistributing profiles; CIDR changes and disabling relay
 access take effect on existing connections without redistributing them.
 
@@ -179,35 +190,86 @@ service is running. If a profile installs but no services open, check the servic
 ```shell
 docker compose ps -a apple-relay
 docker compose logs --tail=50 apple-relay
-ss -lunp 'sport = :8443'
+ss -ltnp 'sport = :8444'
 ```
 
 An empty container list means it has not been created. Older Compose files put
 the relay behind an optional profile; update the checkout, then run
-`docker compose up -d --build` to start all three services. With the TLS files in
-place, you can also start only the relay without restarting OpenVPN:
+`docker compose up -d --build` to start all three services. You can also start
+only the relay without restarting OpenVPN:
 
 ```shell
 docker compose up -d --build --no-deps apple-relay
 ```
 
-Missing or unreadable TLS files appear in the relay logs. Once it is listening,
-verify UDP 8443 is forwarded through the router/firewall. Zoraxy or another
-ordinary HTTPS reverse proxy on TCP 443 does not expose the relay's QUIC port.
+For HTTP/2, verify WAN TCP 8443 reaches Traefik, its TCP router forwards to the
+backend's TCP 8444, and `APPLE_RELAY_TRUSTED_PROXIES` matches the Pi's source IP.
+An ordinary Traefik HTTP router rejects CONNECT; use the supplied TCP router.
 A successful profile download in the UI logs only confirms profile generation;
 `POST /api/relay/authorize` requests show that relay traffic is reaching the UI.
 
-Run relay checks with `cd relay && go test -race ./... && go vet ./...`; API and
-profile tests are included in `python -m pytest ui/tests -q`.
+Run relay checks with `cd relay && GODEBUG=http2xconnect=1 go test -race ./... && go vet ./...`.
+Set `TRAEFIK_BIN` to a Traefik executable to include real TLS-termination tests
+(CI downloads a checksum-verified binary and runs them). The Docker image sets
+`GODEBUG=http2xconnect=1` to enable extended CONNECT in Go's HTTP/2 implementation.
+API and profile tests are included in `python -m pytest ui/tests -q`.
 
-### Reuse Traefik certificates and forward the relay port
+### Traefik HTTP/2 setup
 
-For the Raspberry Pi Traefik and OpenVPN host at `170.134.51.30`, Traefik can
-forward **UDP** packets to the relay. Its ordinary HTTP routing cannot proxy
-this connection: [Traefik rejects CONNECT requests](https://doc.traefik.io/traefik/migrate/v3/#connect-requests).
-UDP forwarding leaves TLS termination at the relay, so the OpenVPN host still
-needs the certificate and key. The public relay URL remains
-`https://dgkagramanyan.ru:8443`.
+On the Raspberry Pi, merge the following into the existing `entryPoints` in
+`~/traefik/traefik.yml`:
+
+```yaml
+entryPoints:
+  apple-relay:
+    address: ":8443"
+```
+
+Add `"8443:8443/tcp"` to Traefik's existing Compose `ports` list if it uses
+bridge networking. Download the supplied dynamic configuration:
+
+```shell
+cd ~/traefik
+curl -fsSL https://raw.githubusercontent.com/dkagramanyan/openvpn-server/main/config/traefik-relay.yml -o dynamic/apple-relay.yml
+sudo docker compose up -d
+sudo docker compose restart traefik
+```
+
+Use the actual Compose service name if it differs from `traefik`. Recreating
+applies the port mapping and restarting loads changes to static `traefik.yml`.
+The dynamic file routes SNI `dgkagramanyan.ru` to `170.134.51.30:8444`, negotiates
+HTTP/2, and uses Traefik's existing certificate for that name. The public relay
+URL remains **`https://dgkagramanyan.ru:8443`**. Forward WAN **TCP 8443 to the Pi**.
+Existing website routers remain on port 443. Remove any older relay UDP router
+from Traefik's dynamic directory when switching to this setup.
+
+This must be a **TCP router with TLS termination**, not an HTTP router or TLS
+passthrough. [Traefik's TCP TLS documentation](https://doc.traefik.io/traefik/reference/routing-configuration/tcp/tls/)
+describes termination; its [CONNECT guidance](https://doc.traefik.io/traefik/migrate/v3/#connect-requests)
+directs forward-proxy tunnels through TCP routers.
+
+On the OpenVPN host:
+
+```shell
+cd ~/openvpn-server
+git pull
+sudo docker compose up -d --build
+sudo docker compose logs --tail=30 apple-relay
+```
+
+The log should report an HTTP/2 backend listening on TCP 8444. In the UI,
+save the relay URL and download fresh profiles. Traefik certificate renewals
+need no relay restart or new profile.
+
+### Direct HTTP/3 mode (optional)
+
+For direct QUIC access, set `APPLE_RELAY_TRANSPORT=http3` in `.env`, supply
+`relay-tls/fullchain.pem` and `relay-tls/privkey.pem` readable by UID 65532, and
+forward WAN **UDP 8443 directly to the OpenVPN host**. `APPLE_RELAY_BIND` controls
+that UDP listener. Rebuild/recreate with `docker compose up -d --build` so both
+the UI and relay switch transport, then download and reinstall profiles.
+This mode requires a certificate on the relay host; the default HTTP/2 mode
+does not. If you choose HTTP/3 and want to reuse a Traefik certificate:
 
 On the Raspberry Pi, find the **host** path mounted as `/letsencrypt/acme.json`
 in Traefik. If the file lives inside `~/traefik`, list its location with:
@@ -249,25 +311,6 @@ After a Traefik certificate renewal, repeat export/transfer/install and run
 read the certificate store on the other machine. Downloads already installed
 on devices remain valid when the hostname stays the same.
 
-To forward through Traefik, merge this entry into the Raspberry Pi's existing
-`entryPoints` in `traefik.yml` (static configuration):
-
-```yaml
-entryPoints:
-  apple-relay:
-    address: ":8443/udp"
-    udp:
-      timeout: 90s
-```
-
-For Docker bridge networking, add `"8443:8443/udp"` to Traefik's existing
-`ports` list. Copy [config/traefik-relay.yml](config/traefik-relay.yml) into its
-dynamic configuration directory, then recreate/restart Traefik to load the
-new entry point. Forward WAN **UDP 8443 to the Raspberry Pi** and allow the Pi
-to reach `170.134.51.30:8443/udp`. Existing website routers keep using 443.
-Alternatively, forward UDP 8443 directly to the OpenVPN host and skip these
-Traefik routing changes. See [Traefik UDP routing](https://doc.traefik.io/traefik/reference/routing-configuration/udp/routing/router/).
-
 ## Layout
 
 ```
@@ -291,13 +334,14 @@ tests/e2e/           end-to-end test in Docker-in-Docker
 
 ## Host networking
 
-Both containers run in the host's network namespace. Nothing is published, so
+All three containers run in the host's network namespace. Nothing is published, so
 there is no port mapping to keep in sync:
 
 | | Where it comes from |
 |---|---|
 | VPN ports | the `local` lines in `server.conf`, bound directly on the host |
 | Web UI | host port `8080` |
+| Apple relay backend | host TCP port `8444`, reachable by the trusted proxy |
 | Management interface | `127.0.0.1:2080` on the host, behind a generated password |
 
 Consequences worth knowing:

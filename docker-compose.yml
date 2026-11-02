@@ -9,9 +9,13 @@ services:
     network_mode: host
     depends_on: [openvpn-ui]
     environment:
+      RELAY_TRANSPORT: ${APPLE_RELAY_TRANSPORT:-http2}
+      RELAY_HTTP2_BIND: ${APPLE_RELAY_HTTP2_BIND:-:8444}
+      # Raspberry Pi address observed in the existing proxy logs; adjust if needed.
+      RELAY_TRUSTED_PROXIES: ${APPLE_RELAY_TRUSTED_PROXIES:-127.0.0.1/32 ::1/128 170.134.51.13/32}
       RELAY_BIND: ${APPLE_RELAY_BIND:-:8443}
       RELAY_AUTH_URL: ${APPLE_RELAY_AUTH_URL:-http://127.0.0.1:8080/api/relay/authorize}
-    # Directory containing fullchain.pem and privkey.pem, readable by UID 65532.
+    # Only used in optional direct HTTP/3 mode; HTTP/2 needs no certificate here.
     volumes:
       - ${APPLE_RELAY_TLS_DIR:-./relay-tls}:/tls:ro
     cap_drop: [ALL]
@@ -75,6 +79,7 @@ services:
       GUEST_SUB: *guest_sub
       HOME_SUB: *home_sub
       GUEST_BLOCK: *guest_block
+      OVPN_RELAY_TRANSPORT: ${APPLE_RELAY_TRANSPORT:-http2}
       # OVPN_BACKUP_KEEP: "14"      # daily backup archives to keep in ./backups; 0 = no backups
     volumes:
       - ./:/etc/openvpn

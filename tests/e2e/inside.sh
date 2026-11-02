@@ -14,14 +14,7 @@ docker tag openvpn-ui:e2e openvpn-ui:local
 docker tag openvpn-apple-relay:e2e openvpn-apple-relay:local
 docker network create --subnet $NET.0/24 e2e >/dev/null
 
-# Throwaway relay TLS files, readable only by the relay's unprivileged UID.
-# Production uses a publicly trusted certificate instead of this test identity.
-mkdir -p relay-tls
-docker run --rm -v /srv/openvpn/relay-tls:/tls --entrypoint sh openvpn-ui:local -c '
-    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -noenc -days 1 \
-        -subj /CN=relay.test -addext subjectAltName=DNS:relay.test \
-        -keyout /tls/privkey.pem -out /tls/fullchain.pem >/dev/null 2>&1
-    chown -R 65532:65532 /tls && chmod 700 /tls && chmod 600 /tls/privkey.pem'
+# No relay TLS files: the default HTTP/2 backend must start without them.
 
 # Test settings: a short keepalive so a vanished client times out quickly, and
 # OpenVPN's own mssfix off so that the firewall's clamp is what gets measured.
@@ -33,7 +26,7 @@ up() {
     docker compose up -d --no-build 2>&1 | sed 's/^/    /'
     for _ in $(seq 90); do
         if wget -qO- http://127.0.0.1:8080/healthz 2>/dev/null | grep -q '"openvpn":true' \
-            && docker compose exec -T apple-relay sh -c 'grep -q ":20FB " /proc/net/udp /proc/net/udp6' 2>/dev/null; then
+            && docker compose exec -T apple-relay sh -c 'grep -q ":20FC " /proc/net/tcp /proc/net/tcp6' 2>/dev/null; then
             return 0
         fi
         sleep 1

@@ -7,6 +7,8 @@ on:
 jobs:
   relay:
     runs-on: ubuntu-latest
+    env:
+      GODEBUG: http2xconnect=1
     defaults:
       run:
         working-directory: relay
@@ -16,6 +18,13 @@ jobs:
         with:
           go-version-file: relay/go.mod
           cache-dependency-path: relay/go.sum
+      - name: Install Traefik for TLS termination tests
+        run: |
+          mkdir -p "$RUNNER_TEMP/relay-traefik"
+          curl -fsSL --retry 3 https://github.com/traefik/traefik/releases/download/v3.7.15/traefik_v3.7.15_linux_amd64.tar.gz -o "$RUNNER_TEMP/relay-traefik/traefik.tar.gz"
+          printf '%s  %s\n' 5b9f51199fcb7a3b5f7ae0f9dae8dcf01efadafd92c5fca96ea2822eca81f8e6 "$RUNNER_TEMP/relay-traefik/traefik.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/relay-traefik/traefik.tar.gz" -C "$RUNNER_TEMP/relay-traefik" traefik
+          echo "TRAEFIK_BIN=$RUNNER_TEMP/relay-traefik/traefik" >> "$GITHUB_ENV"
       - run: go test -race ./...
       - run: go vet ./...
       - run: docker build -f Dockerfile -t openvpn-apple-relay:ci ..

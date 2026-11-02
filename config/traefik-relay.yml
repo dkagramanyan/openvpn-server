@@ -1,14 +1,23 @@
 # Copy into Traefik's dynamic configuration directory on the Raspberry Pi.
-# First add an apple-relay entryPoint at :8443/udp in its static configuration
-# and publish 8443:8443/udp if Traefik uses Docker bridge networking.
-# This forwards encrypted QUIC packets; the relay still needs its TLS files.
-udp:
+# Add an apple-relay TCP entryPoint at :8443 in static traefik.yml and publish
+# 8443:8443/tcp if Traefik uses Docker bridge networking. Recreate Traefik.
+# Its existing certificate store supplies the certificate for dgkagramanyan.ru.
+# TLS ends here; the backend accepts cleartext HTTP/2 only from trusted proxies.
+tcp:
   routers:
     apple-relay:
       entryPoints: [apple-relay]
+      rule: "HostSNI(`dgkagramanyan.ru`)"
       service: apple-relay
+      tls:
+        options: apple-relay-http2
   services:
     apple-relay:
       loadBalancer:
         servers:
-          - address: "170.134.51.30:8443"
+          - address: "170.134.51.30:8444"
+tls:
+  options:
+    apple-relay-http2:
+      minVersion: VersionTLS12
+      alpnProtocols: [h2]

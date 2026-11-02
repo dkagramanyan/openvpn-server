@@ -864,12 +864,13 @@ function relaySettingsCard(s) {
   const split = input => input.value.split(/[\s,]+/).filter(Boolean);
   return card('Apple Network Relay', h('div', { class: 'form' },
     h('label', { class: 'row' }, enabled, 'Enable Apple relay profiles'),
-    field('Public relay URL', url, 'HTTPS hostname and port of the apple-relay service. A trusted TLS certificate and reachable UDP port are required.'),
+    h('p', { class: 'small muted' }, s.transport === 'http2' ? 'HTTP/2 via Traefik: Traefik manages TLS and forwards connections through a TCP router to this server. No certificate files are needed on the OpenVPN host.' : 'Direct HTTP/3: the relay needs its own TLS certificate and a reachable UDP port.'),
+    field('Public relay URL', url, s.transport === 'http2' ? 'HTTPS hostname and TCP port served by the Traefik relay router, for example https://dgkagramanyan.ru:8443.' : 'HTTPS hostname and UDP port of the apple-relay service.'),
     h('label', { class: 'row' }, routeAll, 'Route all domains for non-guests (internet + LAN)'),
     field('LAN domains', domains, 'Used only when all-domain routing is off. Enter comma-separated domains, such as home.arpa. LAN service names must resolve on the relay server.'),
     field('LAN networks', networks, 'Comma-separated IPv4 or IPv6 CIDRs blocked for guests. In LAN-only mode, non-guests can reach only these networks. With all-domain routing enabled, non-guests can reach internet and LAN destinations.'),
     h('p', { class: 'small muted' }, 'Each profile contains a separate access credential; OpenVPN passwords and 2FA do not apply. Guests get internet-only relay access (IPv4 destinations). Changing access type or renewing a certificate requires a new relay profile.'),
-    h('p', { class: 'small muted' }, 'Start all services on the server with docker compose up -d --build. The relay needs its TLS certificate and an open UDP port before connections work; downloading a profile does not check connectivity. The relay does not provide a VPN address, ping or Bonjour discovery.'),
+    h('p', { class: 'small muted' }, 'Start all services on the server with docker compose up -d --build. Downloading a profile does not check connectivity. The relay does not provide a VPN address, ping or Bonjour discovery. After changing transport, download and reinstall profiles.'),
     h('div', null, h('button', { class: 'btn primary', onClick: async () => {
       await withToast(api('/api/relay/settings', { method: 'PUT', body: { enabled: enabled.checked, route_all: routeAll.checked, url: url.value.trim(), match_domains: split(domains), allowed_cidrs: split(networks) } }), 'Relay settings saved; download and reinstall profiles if routing, domains or URL changed');
     } }, 'Save relay settings'))));

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -75,19 +76,25 @@ func (s *relayServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	var udpReq *masque.ProxyRequest
 	target := r.Host
-	if r.Proto == "connect-udp" {
+	protocol := r.Proto
+	if r.ProtoMajor == 2 {
+		protocol = r.Header.Get(":protocol")
+	}
+	if protocol == "connect-udp" {
 		template, err := uritemplate.New(p.URL + udpPath)
 		if err != nil {
 			http.Error(w, "Invalid relay configuration", 503)
 			return
 		}
-		udpReq, err = masque.ParseProxyRequest(r, template)
+		request := r.Clone(ctx)
+		request.Proto = "connect-udp" // masque-go's HTTP/3 representation
+		udpReq, err = masque.ParseProxyRequest(request, template)
 		if err != nil {
 			http.Error(w, "Invalid UDP request", 400)
 			return
 		}
 		target = udpReq.Target
-	} else if r.Proto != "HTTP/3.0" {
+	} else if !((r.ProtoMajor == 2 && protocol == "") || r.Proto == "HTTP/3.0") {
 		http.Error(w, "Unsupported CONNECT protocol", 400)
 		return
 	}
@@ -112,6 +119,10 @@ func (s *relayServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		defer conn.Close()
+		if r.ProtoMajor == 2 {
+			s.proxyHTTP2UDP(w, r, conn, token, addr.Addr(), p.URL)
+			return
+		}
 		proxy := &masque.Proxy{}
 		var once sync.Once
 		closeProxy := func() { once.Do(func() { proxy.Close() }) }
@@ -126,6 +137,10 @@ func (s *relayServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.Close()
+	if r.ProtoMajor == 2 {
+		s.proxyHTTP2TCP(w, r, conn.(*net.TCPConn), token, addr.Addr(), p.URL)
+		return
+	}
 	stream := w.(http3.HTTPStreamer).HTTPStream()
 	var outputComplete atomic.Bool
 	closeFlow := func() {
@@ -166,15 +181,34 @@ func env(key, fallback string) string {
 }
 
 func main() {
-	cert, err := tls.LoadX509KeyPair("/tls/fullchain.pem", "/tls/privkey.pem")
-	if err != nil {
-		log.Fatalf("Relay TLS setup required: put fullchain.pem and privkey.pem in APPLE_RELAY_TLS_DIR (default ./relay-tls), readable by UID 65532: %v", err)
-	}
 	handler := &relayServer{
 		api: env("RELAY_AUTH_URL", "http://127.0.0.1:8080/api/relay/authorize"),
 		client: &http.Client{Timeout: 3 * time.Second, Transport: &http.Transport{Proxy: nil, MaxIdleConnsPerHost: 32, IdleConnTimeout: 90 * time.Second},
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
 		slots: make(chan struct{}, 256), recheck: 5 * time.Second, policyTTL: time.Second,
+	}
+	mode := env("RELAY_TRANSPORT", "http2")
+	if mode == "http2" {
+		if !strings.Contains(os.Getenv("GODEBUG"), "http2xconnect=1") {
+			log.Fatal("HTTP/2 relay requires GODEBUG=http2xconnect=1 (set by the Docker image)")
+		}
+		trusted, err := parseTrustedProxies(env("RELAY_TRUSTED_PROXIES", "127.0.0.1/32 ::1/128"))
+		if err != nil {
+			log.Fatal(err)
+		}
+		listener, err := net.Listen("tcp", env("RELAY_HTTP2_BIND", ":8444"))
+		if err != nil {
+			log.Fatal(err)
+		}
+		log.Printf("Apple Network Relay HTTP/2 backend listening on %s; TLS terminates at the trusted proxy", listener.Addr())
+		log.Fatal(serveHTTP2(listener, handler, trusted))
+	}
+	if mode != "http3" {
+		log.Fatal("RELAY_TRANSPORT must be http2 or http3")
+	}
+	cert, err := tls.LoadX509KeyPair("/tls/fullchain.pem", "/tls/privkey.pem")
+	if err != nil {
+		log.Fatalf("HTTP/3 TLS setup required: put fullchain.pem and privkey.pem in APPLE_RELAY_TLS_DIR, readable by UID 65532: %v", err)
 	}
 	server := &http3.Server{
 		Addr: env("RELAY_BIND", ":8443"), Handler: handler, EnableDatagrams: true,
