@@ -204,7 +204,7 @@ tls:
         else:
             raise RuntimeError("UI did not become ready")
         policy_name = prefix + "-policy"
-        command("docker", "run", "-d", "--name", policy_name, "--network", "container:" + relay,
+        command("docker", "run", "-d", "--name", policy_name, "--restart", "unless-stopped", "--network", "container:" + relay,
                 "-v", f"{fixture.TMP}/pki:/etc/openvpn/pki:ro", "-v", f"{fixture.TMP}/guests:/etc/openvpn/guests:ro",
                 "-v", f"{fixture.TMP}/server.conf:/etc/openvpn/server.conf:ro",
                 "--tmpfs", "/etc/openvpn/pki/private:mode=0700", "--tmpfs", "/etc/openvpn/pki/renewed:mode=0700",
@@ -339,6 +339,22 @@ HTTPServer(("0.0.0.0", 8089), Handler).serve_forever()
             except Exception: time.sleep(1)
         assert "OpenVPN" in command(*curl, "http://" + address + ":8080/")
         print("PASS: relay works during UI outage; live role changes apply; policy outage returns retryable 503; policy cannot read admin data or keys")
+        restarts = json.loads(command("docker", "inspect", policy_name))[0]["RestartCount"]
+        config = json.loads(api("/api/server/config/server"))["content"]
+        api("/api/server/config/server", {"content": config + "\n# Policy mount refresh test\n"}, "PUT")
+        assert "OpenVPN" in command(*curl, "http://" + address + ":8080/")
+        # The UI deliberately writes in place. Editors/git-style replacements
+        # can unlink the bound inode: exercise that separate deployment case.
+        command("docker", "run", "--rm", "-v", f"{fixture.TMP}:/fixture", "--entrypoint", "python", "openvpn-ui:relay-test",
+                "-c", "from pathlib import Path; p=Path('/fixture/server.conf'); t=p.with_suffix('.new'); t.write_bytes(p.read_bytes()); t.replace(p)")
+        for _ in range(40):
+            restarted = json.loads(command("docker", "inspect", policy_name))[0]["RestartCount"] > restarts
+            health = subprocess.run(["docker", "exec", relay, "wget", "-qO-", "http://127.0.0.1:8446/readyz"], capture_output=True)
+            if restarted and health.returncode == 0: break
+            time.sleep(0.5)
+        else: raise AssertionError("Policy did not refresh the atomically replaced server configuration")
+        assert "OpenVPN" in command(*curl, "http://" + address + ":8080/")
+        print("PASS: UI config saves keep relay access; external atomic replacement refreshes the policy mount automatically")
         api("/api/clients/alice/relay", method="DELETE")
         time.sleep(2)
         denied = subprocess.run([*curl, "http://" + address + ":8080/"], capture_output=True)

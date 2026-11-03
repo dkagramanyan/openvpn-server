@@ -12,6 +12,8 @@
 * Generate missing database passwords in `.env`, with separate application and
   read-only policy roles. Add an independent relay policy service so UI restarts
   do not interrupt authorization. Hide private PKI key areas from that service.
+  Refresh the policy file mount automatically after external atomic config
+  replacements; UI saves continue to update the existing file in place.
 * Add configurable per-client/global flow budgets and HTTP/2 capacity/liveness
   limits. Classify policy outages separately from credential denial and DNS
   errors separately from destination blocking; add readiness and Prometheus

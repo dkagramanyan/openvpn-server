@@ -102,6 +102,9 @@ The independent `relay-policy` service reads a restricted PostgreSQL view and
 public certificate/access metadata. Its login cannot read admin password
 hashes or write settings, and its container does not mount private CA/client
 key directories. UI restarts no longer remove the relay's policy endpoint.
+After an atomic `server.conf` save, the policy process detects its old file
+mount and restarts automatically so Docker mounts the current configuration.
+Requests fail closed during that brief refresh.
 Successful authorization is cached for at most one second; active flows are
 rechecked every five seconds. Missing policy/DB state fails closed, with a
 retryable 503 for new requests; explicit credential denials return 403.

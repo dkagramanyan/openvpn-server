@@ -28,7 +28,7 @@ up() {
     docker compose up -d --no-build 2>&1 | sed 's/^/    /'
     for _ in $(seq 90); do
         if wget -qO- http://127.0.0.1:8080/healthz 2>/dev/null | grep -q '"openvpn":true' \
-            && docker compose exec -T apple-relay sh -c 'grep -q ":20FC " /proc/net/tcp /proc/net/tcp6' 2>/dev/null; then
+            && docker compose exec -T apple-relay wget -qO- http://127.0.0.1:8446/readyz 2>/dev/null | grep -q '"ok":true'; then
             return 0
         fi
         sleep 1
