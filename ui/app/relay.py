@@ -102,6 +102,8 @@ def guest_blocks(config: dict) -> list[str]:
     """Mirror LAN/VPN exclusions, including LANs using public address space."""
     networks = [settings.home_sub, settings.guest_sub, *settings.guest_block.split(), *config["allowed_cidrs"]]
     # Read errors or malformed relevant directives fail closed in authorize().
+    if settings.server_conf.stat().st_nlink == 0:
+        raise OSError("Bound server configuration was replaced; recreate relay-policy")
     for line in settings.server_conf.read_text().splitlines():
         words = shlex.split(line, comments=True)
         if not words:
@@ -183,7 +185,7 @@ def renewed(db, name, previous_serial):
                 conn.execute("UPDATE settings SET value = ? WHERE key = ?", (json.dumps(grant), key))
 
 
-def authorize(db, authorization: str) -> dict | None:
+def authorize(db, authorization: str, *, strict_state: bool = False) -> dict | None:
     if not authorization.startswith("Bearer ") or len(authorization) > 512:
         return None
     name, sep, secret = authorization[7:].partition(":")
@@ -203,6 +205,7 @@ def authorize(db, authorization: str) -> dict | None:
     try:
         blocked = guest_blocks(config) if guest else []
     except (OSError, ValueError, IndexError):
+        if strict_state: raise
         return None
     # Full-access users may reach internet and LAN destinations. Keep the
     # configured LAN list separate so guest exclusions never become 0.0.0.0/0.

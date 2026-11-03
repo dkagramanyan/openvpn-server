@@ -38,7 +38,7 @@ IP_ATTEMPTS = 20        # failed logins from one address, whatever the user name
 SESSION_RECHECK = 60    # seconds between two looks at the session of an open live stream
 RANGES = {"today": None, "24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400, "90d": 90 * 86400, "all": None}
 
-db = Database(settings.db_path)
+db = Database(settings.database_url, schema=settings.database_schema)
 _mgmt_host, _mgmt_port, _ = settings.management_endpoint()
 mgmt = Management(_mgmt_host, _mgmt_port, settings.management_password)
 collector = Collector(db, mgmt, settings.poll_interval, settings.status_file,
@@ -49,8 +49,13 @@ limiter = auth.LoginLimiter()
 
 # -- startup ---------------------------------------------------------------------
 def bootstrap() -> None:
+    # Ensure mount targets before the policy container masks private key areas.
+    for relative in ("private", "renewed", "revoked"):
+        (settings.pki_dir / relative).mkdir(parents=True, exist_ok=True)
     for d in (settings.clients_dir, settings.static_dir, settings.guests_dir, settings.db_path.parent):
         d.mkdir(parents=True, exist_ok=True)
+    if settings.db_path.exists() and db.get_setting("migration:legacy_sqlite") is None and db.get_setting("migration:postgres_dump") is None:
+        raise RuntimeError("Legacy state needs migration: run bin/upgrade-relay.sh before starting this UI")
     migrate()
     if db.one("SELECT 1 FROM users LIMIT 1") is None:
         password = settings.admin_password or secrets.token_urlsafe(12)
@@ -796,7 +801,7 @@ def delete_client(name: str, user: dict[str, Any] = Authed):
     serials = [row["cert"]["serial"]] + [h["serial"] for h in row["history"]]
     with db.tx() as conn:
         for serial in serials:
-            conn.execute("INSERT OR IGNORE INTO hidden_certs (serial, name, hidden_at) VALUES (?, ?, ?)",
+            conn.execute("INSERT INTO hidden_certs (serial, name, hidden_at) VALUES (?, ?, ?) ON CONFLICT DO NOTHING",
                          (serial, name, int(time.time())))
         conn.execute("DELETE FROM clients WHERE name = ?", (name,))
     event("client_deleted", user, name)

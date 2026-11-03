@@ -7,7 +7,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 os.environ.setdefault("OPENVPN_DIR", "/nonexistent")
 
 from app import auth, mgmt, pki  # noqa: E402
-from app.db import Database  # noqa: E402
+from pg_fixture import Database  # noqa: E402
 
 
 def test_parse_index_handles_legacy_suffix_and_reasons():
@@ -117,17 +117,16 @@ def test_management_password_is_read_when_connecting():
 
 
 def test_a_failed_commit_does_not_leave_the_connection_in_a_transaction(tmp_path):
-    import sqlite3
+    import psycopg
     db = Database(tmp_path / "t.db")
     conn = db._conn()
-    conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
     conn.execute("CREATE TABLE child (p INTEGER REFERENCES parent (id) DEFERRABLE INITIALLY DEFERRED)")
     try:
         with db.tx() as c:
             c.execute("INSERT INTO child (p) VALUES (1)")      # checked at COMMIT, which then fails
         raise AssertionError("the commit should have failed")
-    except sqlite3.IntegrityError:
+    except psycopg.IntegrityError:
         pass
     db.set_setting("k", "v")                                    # the next transaction starts normally
     assert db.get_setting("k") == "v" and db.one("SELECT COUNT(*) AS n FROM child")["n"] == 0

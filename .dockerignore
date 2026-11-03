@@ -7,7 +7,7 @@ log/
 backups/
 relay-tls/
 *.mobileconfig
-.env
+.env*
 config/management.pw
 config/*.bak
 

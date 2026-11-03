@@ -7,14 +7,22 @@ services:
     image: openvpn-apple-relay:local
     build: { context: ., dockerfile: relay/Dockerfile }
     network_mode: host
-    depends_on: [openvpn-ui]
+    depends_on:
+      relay-policy: {condition: service_healthy}
     environment:
       RELAY_TRANSPORT: ${APPLE_RELAY_TRANSPORT:-http2}
       RELAY_HTTP2_BIND: ${APPLE_RELAY_HTTP2_BIND:-:8444}
       # Raspberry Pi address observed in the existing proxy logs; adjust if needed.
       RELAY_TRUSTED_PROXIES: ${APPLE_RELAY_TRUSTED_PROXIES:-127.0.0.1/32 ::1/128 170.134.51.13/32}
       RELAY_BIND: ${APPLE_RELAY_BIND:-:8443}
-      RELAY_AUTH_URL: ${APPLE_RELAY_AUTH_URL:-http://127.0.0.1:8080/api/relay/authorize}
+      RELAY_MAX_FLOWS: ${APPLE_RELAY_MAX_FLOWS:-256}
+      RELAY_MAX_FLOWS_PER_CLIENT: ${APPLE_RELAY_MAX_FLOWS_PER_CLIENT:-64}
+      RELAY_MAX_AUTH_CHECKS: ${APPLE_RELAY_MAX_AUTH_CHECKS:-64}
+      RELAY_MAX_H2_CONNECTIONS: ${APPLE_RELAY_MAX_H2_CONNECTIONS:-128}
+      RELAY_H2_READ_IDLE: ${APPLE_RELAY_H2_READ_IDLE:-10s}
+      RELAY_H2_PING_TIMEOUT: ${APPLE_RELAY_H2_PING_TIMEOUT:-5s}
+      RELAY_MAX_H2_STREAMS: ${APPLE_RELAY_MAX_H2_STREAMS:-256}
+      RELAY_AUTH_URL: ${APPLE_RELAY_AUTH_URL:-http://127.0.0.1:8447/api/relay/authorize}
     # Only used in optional direct HTTP/3 mode; HTTP/2 needs no certificate here.
     volumes:
       - ${APPLE_RELAY_TLS_DIR:-./relay-tls}:/tls:ro
@@ -66,8 +74,15 @@ services:
     # Also on the host network: OpenVPN's management interface listens on
     # 127.0.0.1:2080 there.
     network_mode: host
-    depends_on: [openvpn]
+    depends_on:
+      openvpn: {condition: service_started}
+      postgres: {condition: service_healthy}
     environment:
+      PGHOST: 127.0.0.1
+      PGPORT: ${OPENVPN_DB_PORT:-5433}
+      PGDATABASE: openvpn
+      PGUSER: openvpn
+      PGPASSWORD: ${OPENVPN_DB_PASSWORD:?Run python3 bin/setup-env.py}
       OPENVPN_ADMIN_USERNAME: ${OPENVPN_ADMIN_USERNAME:-admin}
       OPENVPN_ADMIN_PASSWORD: ${OPENVPN_ADMIN_PASSWORD:-}   # empty = random, printed once in the logs
       OVPN_PUBLIC_HOST: ${OVPN_PUBLIC_HOST:-}               # public address written into client profiles
@@ -94,3 +109,67 @@ services:
     tmpfs: [/tmp]
     logging: *logging
     restart: unless-stopped
+
+  # Independent evaluator: UI maintenance is not part of the relay data path.
+  relay-policy:
+    image: openvpn-ui:local
+    build: {context: ., dockerfile: ui/Dockerfile}
+    command: [python, -m, app.policy_server]
+    network_mode: host
+    depends_on:
+      openvpn-ui: {condition: service_healthy}
+    environment:
+      OPENVPN_DIR: /etc/openvpn
+      PGHOST: 127.0.0.1
+      PGPORT: ${OPENVPN_DB_PORT:-5433}
+      PGDATABASE: openvpn
+      PGUSER: relay_policy
+      PGPASSWORD: ${RELAY_POLICY_DB_PASSWORD:?Run python3 bin/setup-env.py}
+      GUEST_SUB: *guest_sub
+      HOME_SUB: *home_sub
+      GUEST_BLOCK: *guest_block
+    volumes:
+      - ./pki:/etc/openvpn/pki:ro
+      - ./guests:/etc/openvpn/guests:ro
+      - ./server.conf:/etc/openvpn/server.conf:ro
+    # Private CA/client key areas are hidden; only public identity state is used.
+    tmpfs:
+      - /tmp
+      - /etc/openvpn/pki/private:size=64k,mode=0700
+      - /etc/openvpn/pki/renewed:size=64k,mode=0700
+      - /etc/openvpn/pki/revoked:size=64k,mode=0700
+    cap_drop: [ALL]
+    cap_add: [DAC_READ_SEARCH]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request as u; u.build_opener(u.ProxyHandler({})).open('http://127.0.0.1:8447/healthz',timeout=3).read()"]
+      interval: 15s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    logging: *logging
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:18.6-alpine
+    environment:
+      POSTGRES_DB: openvpn
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Run python3 bin/setup-env.py}
+      OPENVPN_DB_PASSWORD: ${OPENVPN_DB_PASSWORD:?Run python3 bin/setup-env.py}
+      RELAY_POLICY_DB_PASSWORD: ${RELAY_POLICY_DB_PASSWORD:?Run python3 bin/setup-env.py}
+    ports: ["127.0.0.1:${OPENVPN_DB_PORT:-5433}:5432"]
+    volumes:
+      - postgres-data:/var/lib/postgresql
+      - ./postgres/00-roles.sh:/docker-entrypoint-initdb.d/00-roles.sh:ro
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -h 127.0.0.1 -U postgres -d openvpn"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    logging: *logging
+    restart: unless-stopped
+
+volumes:
+  postgres-data:

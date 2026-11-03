@@ -920,8 +920,8 @@ function relayView(el) {
   }
   function draw() {
     if (!info) return;
-    summary.replaceChildren(tile('Relay backend', info.ready ? 'Running' : 'Unavailable', info.ready ? `${info.transport.toUpperCase()} · started ${fmtDateTime(info.started_at)}` : info.message),
-      tile('Connections', info.active.length, `${fmtNum(info.total || 0)} accepted · ${fmtNum(info.denied || 0)} denied since startup`));
+    summary.replaceChildren(tile('Relay backend', !info.ready ? 'Unavailable' : info.policy_ready === false ? 'Policy unavailable' : 'Running', info.ready ? `${info.transport.toUpperCase()} · started ${fmtDateTime(info.started_at)}` : info.message),
+      tile('Connections', info.active.length, `${fmtNum(info.total || 0)} accepted · ${fmtNum(info.denied || 0)} denied since startup${info.limits ? ` · limit ${info.limits.flows} total / ${info.limits.per_client} per client` : ''}`));
     active.replaceChildren(table(info.active, true));
     events.replaceChildren(table([...info.events].reverse(), false));
   }

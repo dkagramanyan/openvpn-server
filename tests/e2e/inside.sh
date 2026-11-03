@@ -22,6 +22,8 @@ sed -i 's/^keepalive .*/keepalive 2 6/' server.conf
 echo 'mssfix 0' >> server.conf
 printf 'OPENVPN_ADMIN_PASSWORD=e2e-password\nOVPN_PUBLIC_HOST=%s\n' "$NET.1" > .env
 
+docker run --rm -v /srv/openvpn:/etc/openvpn --entrypoint python openvpn-ui:local /etc/openvpn/bin/setup-env.py
+
 up() {
     docker compose up -d --no-build 2>&1 | sed 's/^/    /'
     for _ in $(seq 90); do
@@ -67,8 +69,27 @@ vpn_ip()   { docker exec "$1" ip -4 -o addr show tun0 | awk '{print $4}' | cut -
 reaches()  { docker exec "$1" wget -qO /dev/null -T 4 "http://$2/" 2>/dev/null; }
 fw()       { docker exec openvpn iptables "$@"; }
 
+say "Migrate an existing SQLite deployment to PostgreSQL"
+docker run --rm -i -v /srv/openvpn:/etc/openvpn -e PYTHONPATH=/etc/openvpn/ui/tests --entrypoint python openvpn-ui:local - <<'PYCODE'
+import sqlite3
+from pathlib import Path
+from app.auth import hash_password
+LEGACY = Path('/etc/openvpn/ui/tests/fixtures/legacy.sql').read_text()
+path = Path('/etc/openvpn/db/openvpn-ui.db')
+path.parent.mkdir(exist_ok=True)
+with sqlite3.connect(path) as db:
+    db.executescript(LEGACY)
+    db.execute('INSERT INTO users(username,password_hash,created_at) VALUES(?,?,?)', ('admin', hash_password('e2e-password'), 100))
+    db.execute("INSERT INTO settings VALUES('legacy-preserved','yes')")
+PYCODE
+LEGACY_HASH=$(sha256sum db/openvpn-ui.db)
+docker compose up -d --wait postgres
+docker compose run --rm --no-deps --entrypoint python openvpn-ui -m app.migrate_db import
+[ "$LEGACY_HASH" = "$(sha256sum db/openvpn-ui.db)" ] || fail "migration modified the legacy source"
+
 say "Start the service"
 up
+docker exec openvpn-ui python -c "from app.main import db; assert db.get_setting('legacy-preserved') == 'yes'; assert db.get_setting('migration:legacy_sqlite')"
 docker exec openvpn iptables -t mangle -S OVPN-MSS | grep -q 'set-mss 1400' || fail "no MSS clamp in the firewall"
 docker exec openvpn iptables -S OVPN-FORWARD | grep -q -- '-d 93.123.161.4/32 -j DROP' \
     || fail "guests can loop back through the public reverse proxy"
@@ -207,8 +228,10 @@ say "Backups: the UI's archive and the script's directory copy"
 api backup
 ARCHIVE=$(ls backups/openvpn-backup-*.tar.gz | tail -1)     # the first one was written by the daily task
 [ "$(ls backups | wc -l)" -ge 2 ] || fail "the daily backup task wrote no archive"
-docker run --rm -v /srv:/srv --entrypoint bash openvpn-ui:local /srv/openvpn/backup.sh -y -b /srv/openvpn /srv/copy | sed 's/^/    /'
-[ -s /srv/copy/db/openvpn-ui.db ] && [ ! -e /srv/copy/db/openvpn-ui.db-wal ] || fail "the directory backup has no clean database copy"
+docker exec openvpn-ui bash /etc/openvpn/backup.sh -y -b /etc/openvpn /etc/openvpn/.test-directory-backup | sed 's/^/    /'
+docker cp openvpn-ui:/etc/openvpn/.test-directory-backup /srv/copy
+rm -rf .test-directory-backup
+[ -s /srv/copy/db/openvpn-ui.pgdump ] || fail "the directory backup has no clean database copy"
 [ -f /srv/copy/pki/private/ca.key ] && [ -d /srv/copy/guests ] || fail "the directory backup is incomplete"
 api summary > /srv/e2e/before.json
 
@@ -216,12 +239,14 @@ say "Lose everything, restore from the archive"
 docker stop -t 30 openvpn >/dev/null
 docker logs --tail 5 openvpn 2>&1 | grep -q 'OpenVPN stopped (exit code 0)' && [ "$(docker inspect -f '{{.State.ExitCode}}' openvpn)" = 0 ] \
     || fail "a stop signal did not shut OpenVPN down cleanly"
-docker compose down 2>&1 | sed 's/^/    /'
+docker compose down -v 2>&1 | sed 's/^/    /'
 rm -rf pki/* clients/* staticclients/* guests db/openvpn-ui.db* config/management.pw .env
 restore() { docker run --rm -v /srv:/srv --entrypoint bash openvpn-server:local /srv/openvpn/backup.sh -y -r /srv/openvpn "$1" | sed 's/^/    /'; }
 restore /srv/openvpn/no-such-backup && fail "a restore from nothing must not succeed"
 restore "/srv/openvpn/$ARCHIVE"
 [ -f .env ] && [ -f pki/private/ca.key ] || fail "the restore left files missing"
+docker compose up -d --wait postgres
+docker compose run --rm --no-deps --entrypoint python openvpn-ui -m app.migrate_db import
 up
 api summary > /srv/e2e/after.json
 cmp /srv/e2e/before.json /srv/e2e/after.json || { cat /srv/e2e/before.json /srv/e2e/after.json; fail "clients or history differ after the restore"; }
@@ -243,7 +268,7 @@ restore_to -r /srv/unsealed "/srv/openvpn/$SEALED" && fail "an encrypted archive
 mkdir -p /srv/unsealed
 restore_to -i /srv/e2e/backup-key.txt -r /srv/unsealed "/srv/openvpn/$SEALED"
 cmp pki/private/ca.key /srv/unsealed/pki/private/ca.key || fail "the decrypted archive does not hold the CA key"
-[ -s /srv/unsealed/db/openvpn-ui.db ] || fail "the decrypted archive has no database"
+[ -s /srv/unsealed/db/openvpn-ui.pgdump ] || fail "the decrypted archive has no database"
 
 say "A first start that was interrupted after the CA was built"
 docker compose down 2>&1 | sed 's/^/    /'

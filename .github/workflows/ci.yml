@@ -36,9 +36,7 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.14"
-      - run: pip install --require-hashes -r ui/requirements.txt
-      - run: pip install pytest httpx
-      - run: python -m pytest ui/tests -q
+      - run: python tests/run-ui.py
 
   e2e:
     runs-on: ubuntu-latest

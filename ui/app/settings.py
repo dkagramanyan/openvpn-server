@@ -19,6 +19,8 @@ class Settings:
         self.pki_dir = Path(_env("EASYRSA_PKI", str(self.openvpn_dir / "pki")))
         self.db_path = Path(_env("OVPN_UI_DB", str(self.openvpn_dir / "db" / "openvpn-ui.db")))
 
+        self.database_url = _env("OVPN_DATABASE_URL", "")
+        self.database_schema = _env("OVPN_DATABASE_SCHEMA", "public")
         self.server_conf = self.openvpn_dir / "server.conf"
         self.vars_template = self.openvpn_dir / "config" / "easy-rsa.vars"
         self.clients_dir = self.openvpn_dir / "clients"

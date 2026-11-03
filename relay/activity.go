@@ -17,6 +17,12 @@ type activityLog struct {
 	mu        sync.Mutex
 	started   int64
 	transport string
+	reasons   map[string]uint64
+	bytesUp   int64
+	bytesDown int64
+	runtime   *relayMetrics
+	limits    map[string]int
+	readiness func(context.Context) error
 	sequence  uint64
 	events    []flowEvent
 	next      int
@@ -78,7 +84,7 @@ func (f *flowLog) add(up, down int64) {
 }
 
 func newActivity(mode string) *activityLog {
-	return &activityLog{started: time.Now().Unix(), transport: mode, active: make(map[uint64]*flowLog)}
+	return &activityLog{started: time.Now().Unix(), transport: mode, active: make(map[uint64]*flowLog), reasons: make(map[string]uint64)}
 }
 
 func (a *activityLog) begin() *flowLog {
@@ -143,6 +149,9 @@ func (f *flowLog) finish() {
 		kind = "denied"
 		f.log.denied++
 	}
+	f.log.reasons[f.snapshot(kind).Reason]++
+	f.log.bytesUp += f.up.Load()
+	f.log.bytesDown += f.down.Load()
 	f.log.mu.Unlock()
 	f.log.record(f.snapshot(kind))
 }
@@ -150,8 +159,24 @@ func (f *flowLog) finish() {
 func (a *activityLog) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
-	if r.Method != http.MethodGet || (r.URL.Path != "/status" && r.URL.Path != "/healthz") {
+	if r.Method != http.MethodGet || (r.URL.Path != "/status" && r.URL.Path != "/healthz" && r.URL.Path != "/readyz" && r.URL.Path != "/metrics") {
 		http.Error(w, "Not found", 404)
+		return
+	}
+	if r.URL.Path == "/metrics" {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		a.metrics(w)
+		return
+	}
+	policyReady := true
+	if a.readiness != nil && r.URL.Path != "/healthz" {
+		policyReady = a.readiness(r.Context()) == nil
+	}
+	if r.URL.Path == "/readyz" {
+		if !policyReady {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+		json.NewEncoder(w).Encode(map[string]bool{"ok": policyReady})
 		return
 	}
 	if r.URL.Path == "/healthz" {
@@ -172,7 +197,7 @@ func (a *activityLog) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		active = append(active, f.snapshot("connected"))
 	}
 	json.NewEncoder(w).Encode(map[string]any{"ready": true, "transport": a.transport, "started_at": a.started,
-		"total": total, "denied": denied, "active": active, "events": events})
+		"total": total, "denied": denied, "active": active, "events": events, "policy_ready": policyReady, "limits": a.limits, "metrics": a.runtime.snapshot()})
 }
 
 func (a *activityLog) listen(address string) (*http.Server, error) {

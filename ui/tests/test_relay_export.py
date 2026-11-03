@@ -21,9 +21,33 @@ def identity(path, name, days=1):
     subprocess.run(["openssl", "req", "-new", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256",
                     "-nodes", "-subj", "/CN=" + name, "-addext", "subjectAltName=DNS:" + name,
                     "-keyout", str(key), "-out", str(path / "request.pem")], check=True, capture_output=True)
-    subprocess.run(["openssl", "x509", "-req", "-in", str(path / "request.pem"), "-signkey", str(key),
-                    "-copy_extensions", "copy", "-days", str(days), "-out", str(cert)],
-                   check=True, capture_output=True)
+    if days < 0:
+        # OpenSSL 3.5 rejects negative -days. Sign with explicit historical dates.
+        (path / "index").write_text("")
+        (path / "serial").write_text("01\n")
+        subprocess.run(["openssl", "req", "-x509", "-new", "-key", str(key), "-subj", "/CN=Test CA",
+                        "-out", str(path / "ca.pem"), "-days", "1"], check=True, capture_output=True)
+        (path / "ca.cnf").write_text(f"""[ca]
+default_ca = test
+[test]
+database = {path}/index
+serial = {path}/serial
+new_certs_dir = {path}
+certificate = {path}/ca.pem
+private_key = {key}
+default_md = sha256
+policy = names
+copy_extensions = copy
+[names]
+commonName = supplied
+""")
+        subprocess.run(["openssl", "ca", "-batch", "-config", str(path / "ca.cnf"),
+                        "-startdate", "20200101000000Z", "-enddate", "20210101000000Z", "-notext",
+                        "-in", str(path / "request.pem"), "-out", str(cert)], check=True, capture_output=True)
+    else:
+        subprocess.run(["openssl", "x509", "-req", "-in", str(path / "request.pem"), "-signkey", str(key),
+                        "-copy_extensions", "copy", "-days", str(days), "-out", str(cert)],
+                       check=True, capture_output=True)
     return {"domain": {"main": name}, "certificate": base64.b64encode(cert.read_bytes()).decode(),
             "key": base64.b64encode(key.read_bytes()).decode()}
 

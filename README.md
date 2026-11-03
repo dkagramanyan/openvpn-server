@@ -26,6 +26,7 @@ the UI replaces d3vilh/openvpn-ui.
 git clone https://github.com/dkagramanyan/openvpn-server
 cd openvpn-server
 cp .env.example .env        # set the admin password and your public host name
+python3 bin/setup-env.py    # generate missing PostgreSQL passwords
 docker compose up -d --build
 ```
 
@@ -56,6 +57,78 @@ Put the UI behind an HTTPS reverse proxy for anything but a LAN; set
 `OVPN_UI_SECURE_COOKIES=true` in `.env` when you do, and
 `OVPN_UI_TRUSTED_PROXIES` to the proxy's address if it is not on the server
 itself. `OVPN_UI_BIND` limits the UI to one address (e.g. the LAN one).
+
+## Upgrade to PostgreSQL (1.8)
+
+The UI now stores accounts, settings, sessions, traffic and audit history in
+PostgreSQL. SQLite is used only to read a legacy database during migration.
+For an existing deployment, keep your `.env`, PKI and `db/` directory and run:
+
+```shell
+cd ~/openvpn-server &&
+git pull --ff-only &&
+bin/upgrade-relay.sh --sudo-docker
+```
+
+Without sudo, omit `--sudo-docker`. The helper generates missing PostgreSQL
+passwords in `.env` (mode 0600), builds before stopping the old UI, starts
+PostgreSQL, and pauses the UI and relay while importing. It leaves an already
+running OpenVPN container running. The legacy `db/openvpn-ui.db`, including
+committed WAL data, is read from a consistent read-only snapshot. All known
+application tables are imported in one PostgreSQL transaction and their row
+counts are checked before commit. Existing password hashes, portal accounts,
+relay secrets, share links, notes, traffic and session IDs are preserved;
+guest markers and certificates remain in their existing directories.
+
+If an import fails, its writes roll back and the helper starts the previous
+UI/relay containers again. A completed import is recorded, so rerunning the
+helper does not duplicate data. A nonempty PostgreSQL database without the
+migration marker is refused rather than merged or overwritten. Keep the
+original SQLite file as a recovery copy; the UI refuses to bootstrap a new
+admin account over unimported legacy state. After PostgreSQL has accepted new
+writes, reverting to the old SQLite UI would lose those new writes: recover
+from a PostgreSQL backup instead.
+
+PostgreSQL 18 runs in the `postgres-data` named volume, exposed only on
+`127.0.0.1:5433`. Change `OPENVPN_DB_PORT` if that local port is occupied.
+`POSTGRES_PASSWORD`, `OPENVPN_DB_PASSWORD` and `RELAY_POLICY_DB_PASSWORD` are
+generated once; preserve `.env` together with the volume. Changing a password
+in `.env` alone does not change a role in an already initialized database.
+Never use `docker compose down -v` on a deployment whose data you want to keep.
+
+### Relay reliability and diagnostics
+
+The independent `relay-policy` service reads a restricted PostgreSQL view and
+public certificate/access metadata. Its login cannot read admin password
+hashes or write settings, and its container does not mount private CA/client
+key directories. UI restarts no longer remove the relay's policy endpoint.
+Successful authorization is cached for at most one second; active flows are
+rechecked every five seconds. Missing policy/DB state fails closed, with a
+retryable 503 for new requests; explicit credential denials return 403.
+
+The **Relay** page shows policy availability, connection limits and separate
+reasons for authorization, capacity, DNS and destination failures. Host-local
+endpoints are `http://127.0.0.1:8446/readyz` and `/metrics`; do not publish them.
+Readiness checks policy/DB/metadata availability, not reachability of every
+internet service. Default limits are 256 total flows, 64 per client, 64 parallel
+authorization checks, 128 HTTP/2 connections and 256 streams per connection.
+Client limits apply across all devices using that client's credential. See
+`.env.example` for overrides.
+
+HTTP/2 sends a PING after 10 seconds without incoming frames and closes a
+nonresponsive path after a further 5 seconds. A blackholed-path regression test
+checks that abandoned flows release capacity and a new connection using the
+same credential succeeds. Existing TCP streams still need to reconnect when a
+network path disappears. Recovery on a physical iPhone must be checked after
+this update; server-side tests cannot prove how a particular iOS version
+retries its connections.
+
+The first stage of the research-PDF recommendations is implemented here:
+independent policy evaluation, fair limits, typed failures and diagnostics.
+Simultaneous HTTP/3 + HTTP/2 fallback, live QUIC certificate reload and drain,
+and measured DNS/MTU tuning remain later work. The current Traefik HTTP/2
+forwarding and signing setup can stay as it is. DNS failures do not silently
+bypass the relay or relax guest restrictions.
 
 ## Apple Network Relay
 
@@ -176,9 +249,9 @@ limit throughput under load. Check the
 [upstream buffer guidance](https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes)
 before adjusting host settings. The application does not modify host sysctls.
 
-The relay authenticates against the UI over host loopback and has no access to
-the PKI or UI database. If `OVPN_UI_BIND` excludes loopback, set
-`APPLE_RELAY_AUTH_URL` to the UI's address on the same host. Changing the
+The relay authenticates against `relay-policy` over host loopback on port 8447
+and has no direct access to the PKI or database. The independent policy service
+uses public identity metadata and its restricted PostgreSQL login. Changing the
 transport or public URL requires redistributing profiles; CIDR changes and disabling relay
 access take effect on existing connections without redistributing them.
 
@@ -193,7 +266,7 @@ ss -ltnp 'sport = :8444'
 
 An empty container list means it has not been created. Older Compose files put
 the relay behind an optional profile; update the checkout, then run
-`docker compose up -d --build` to start all three services. You can also start
+`docker compose up -d --build` to start the services (after the PostgreSQL upgrade helper on an existing installation). You can also start
 only the relay without restarting OpenVPN:
 
 ```shell
@@ -204,7 +277,8 @@ For HTTP/2, verify WAN TCP 8443 reaches Traefik, its TCP router forwards to the
 backend's TCP 8444, and `APPLE_RELAY_TRUSTED_PROXIES` matches the Pi's source IP.
 An ordinary Traefik HTTP router rejects CONNECT; use a TCP router with TLS termination.
 A successful profile download in the UI logs only confirms profile generation;
-`POST /api/relay/authorize` requests show that relay traffic is reaching the UI.
+Relay activity in the UI and `/readyz` provide the policy/data-path diagnostics;
+authorization checks now go to the independent service rather than the UI log.
 
 Run relay checks with `cd relay && GODEBUG=http2xconnect=1 go test -race ./... && go vet ./...`.
 Set `TRAEFIK_BIN` to a Traefik executable to include real TLS-termination tests
@@ -371,7 +445,7 @@ pki/                 easy-rsa PKI (CA, certificates, CRL, tls-crypt keys)
 clients/             generated .ovpn profiles, 2FA secrets and QR codes
 staticclients/       per-client "ifconfig-push" files (static IPs)
 guests/              one empty file per guest client
-db/                  UI database (sessions, traffic, audit log)
+db/                  retained legacy SQLite source / restored PostgreSQL dumps
 backups/             daily backup archives written by the UI (git-ignored)
 log/                 openvpn.log, openvpn-status.log, oath.log
 bin/                 CLI scripts (also used by the UI)
@@ -723,7 +797,7 @@ keeps working; `pki/vars` inside the PKI is what easy-rsa reads.
 The UI writes an archive once a day to `backups/openvpn-backup-<time>.tar.gz`
 and keeps the newest 14: `server.conf`, `config/`, the PKI, the profiles and
 2FA secrets, static IPs, guests, `fw-rules.sh`, `docker-compose.yml`, `.env`
-and a consistent snapshot of the database. The Server page shows the last one
+and a consistent PostgreSQL custom-format dump (`db/openvpn-ui.pgdump`). The Server page shows the last one
 and has **Back up now**; the dashboard warns when there has been none for
 three days.
 
@@ -752,8 +826,14 @@ docker compose down
 sudo ./backup.sh -r ~/openvpn-server ~/backup/openvpn-2026-09-05      # restore that copy
 sudo ./backup.sh -r ~/openvpn-server backups/openvpn-backup-20261002-080139.tar.gz   # or an archive
 sudo ./backup.sh -i backup-key.txt -r ~/openvpn-server backups/openvpn-backup-20261002-080139.tar.gz.age   # an encrypted one (needs age)
-docker compose up -d
+bin/upgrade-relay.sh --sudo-docker
 ```
+
+Restore database data into an **empty** PostgreSQL application database. The
+helper refuses to overwrite an existing one. For disaster recovery on a new
+host, clone the current repository, restore the archive, then run the helper;
+it imports either the PostgreSQL dump or an older archive’s SQLite file.
+Keep the old host/volume intact until recovery is verified.
 
 ## Security notes
 
@@ -784,8 +864,8 @@ docker compose up -d
 ## Development
 
 ```shell
-cd ui && python -m pytest tests          # unit tests (parsers, DB roll-ups, auth, API)
-docker compose build                     # rebuild all three images
+python3 tests/run-ui.py                  # UI/migration tests with isolated PostgreSQL in Docker
+docker compose build                     # rebuild application images
 tests/e2e/run.sh                         # end-to-end test (needs Docker)
 ```
 

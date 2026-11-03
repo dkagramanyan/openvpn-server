@@ -4,9 +4,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
-	"errors"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -22,7 +22,7 @@ type policyEntry struct {
 // for at most one second. Never serve expired policy during an API outage.
 func (s *relayServer) authorize(ctx context.Context, token string) (policy, error) {
 	if !strings.HasPrefix(token, "Bearer ") || len(token) > 512 {
-		return policy{}, errors.New("missing credential")
+		return policy{}, errAccessDenied
 	}
 	if s.policyTTL <= 0 {
 		return s.authorizeBackend(ctx, token)
@@ -31,6 +31,7 @@ func (s *relayServer) authorize(ctx context.Context, token string) (policy, erro
 	s.authMu.Lock()
 	if entry := s.policies[key]; entry != nil && (entry.expires.IsZero() || time.Now().Before(entry.expires)) {
 		s.authMu.Unlock()
+		s.metrics.observe("authorization_cache_hits", time.Time{})
 		select {
 		case <-ctx.Done():
 			return policy{}, ctx.Err()
@@ -79,16 +80,27 @@ func (s *relayServer) authorize(ctx context.Context, token string) (policy, erro
 }
 
 func (s *relayServer) authorizeBackend(ctx context.Context, token string) (policy, error) {
+	started := time.Now()
+	defer s.metrics.observe("authorization_checks", started)
 	var p policy
+	if s.authSlots != nil {
+		select {
+		case s.authSlots <- struct{}{}:
+			defer func() { <-s.authSlots }()
+		default:
+			s.metrics.observe("authorization_capacity_errors", time.Time{})
+			return p, errAuthUnavailable
+		}
+	}
 	if !strings.HasPrefix(token, "Bearer ") || len(token) > 512 {
-		return p, errors.New("missing credential")
+		return p, errAccessDenied
 	}
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	for attempt := range 3 {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.api, nil)
 		if err != nil {
-			return p, err
+			return p, errAuthUnavailable
 		}
 		req.Header.Set("Authorization", token)
 		resp, err := s.client.Do(req)
@@ -96,15 +108,27 @@ func (s *relayServer) authorizeBackend(ctx context.Context, token string) (polic
 			if resp.StatusCode == http.StatusOK {
 				err := json.NewDecoder(io.LimitReader(resp.Body, 32768)).Decode(&p)
 				resp.Body.Close()
-				return p, err
+				if err != nil {
+					s.metrics.observe("authorization_errors", time.Time{})
+					return p, errAuthUnavailable
+				}
+				if err := p.compile(); err != nil {
+					return p, errAuthUnavailable
+				}
+				return p, nil
 			}
 			resp.Body.Close()
+			if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+				s.metrics.observe("authorization_denials", time.Time{})
+				return p, errAccessDenied
+			}
 			if resp.StatusCode != 502 && resp.StatusCode != 503 && resp.StatusCode != 504 {
-				return p, errors.New("access denied")
+				return p, errAuthUnavailable
 			}
 		}
 		if attempt == 2 {
-			return p, errors.New("authorization service unavailable")
+			s.metrics.observe("authorization_errors", time.Time{})
+			return p, errAuthUnavailable
 		}
 		// Retry short transport/proxy outages within the same deadline. An
 		// explicit denial is final and expired cached policy is never reused.
@@ -116,5 +140,29 @@ func (s *relayServer) authorizeBackend(ctx context.Context, token string) (polic
 		case <-timer.C:
 		}
 	}
-	return p, errors.New("authorization service unavailable")
+	return p, errAuthUnavailable
+}
+
+// Readiness checks the independent evaluator, not the UI collector or a public destination.
+func (s *relayServer) checkReadiness(ctx context.Context) error {
+	endpoint, err := url.Parse(s.api)
+	if err != nil {
+		return errAuthUnavailable
+	}
+	endpoint.Path, endpoint.RawQuery, endpoint.Fragment = "/healthz", "", ""
+	ctx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
+	if err != nil {
+		return errAuthUnavailable
+	}
+	response, err := s.client.Do(request)
+	if err != nil {
+		return errAuthUnavailable
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return errAuthUnavailable
+	}
+	return nil
 }

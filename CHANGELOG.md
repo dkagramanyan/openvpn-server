@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### 1.8: PostgreSQL and relay availability
+
+* Replace runtime SQLite with PostgreSQL 18. The upgrade helper imports legacy
+  accounts, sessions, settings, portal logins, relay credentials and traffic in
+  one transaction, verifies counts, resets ID sequences, refuses nonempty
+  targets and retains the original SQLite file. PostgreSQL dumps replace
+  SQLite copies in automatic/manual backups; legacy archives remain importable.
+* Generate missing database passwords in `.env`, with separate application and
+  read-only policy roles. Add an independent relay policy service so UI restarts
+  do not interrupt authorization. Hide private PKI key areas from that service.
+* Add configurable per-client/global flow budgets and HTTP/2 capacity/liveness
+  limits. Classify policy outages separately from credential denial and DNS
+  errors separately from destination blocking; add readiness and Prometheus
+  diagnostics and show policy availability/limits in the Relay page.
+* Exercise lost-path cleanup/reconnection, PostgreSQL imports and rollback,
+  real Traefik forwarding and policy-role isolation. Physical iPhone Wi-Fi ↔
+  cellular recovery still requires deployment testing.
+
+
 * Prefill new relay settings with `HOME_SUB` (`170.134.51.0/24` by default),
   preserving saved destination networks.
 * Static asset URLs follow their content hashes, so rebuilt UI assets refresh

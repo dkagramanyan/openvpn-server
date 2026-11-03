@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
 	"strconv"
@@ -10,50 +11,87 @@ import (
 )
 
 type policy struct {
-	Client  string   `json:"client"`
-	CIDRs   []string `json:"allowed_cidrs"`
-	URL     string   `json:"url"`
-	Guest   bool     `json:"guest"`
-	Blocked []string `json:"blocked_cidrs"`
+	Client          string   `json:"client"`
+	CIDRs           []string `json:"allowed_cidrs"`
+	URL             string   `json:"url"`
+	Guest           bool     `json:"guest"`
+	Blocked         []string `json:"blocked_cidrs"`
+	compiled        bool
+	allowedPrefixes []netip.Prefix
+	blockedPrefixes []netip.Prefix
+	interfaces      []netip.Prefix
+}
+
+var guestSpecial = func() []netip.Prefix {
+	var values []netip.Prefix
+	for _, cidr := range []string{"0.0.0.0/8", "100.64.0.0/10", "192.0.0.0/24", "192.0.2.0/24", "192.88.99.0/24", "198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24", "240.0.0.0/4"} {
+		values = append(values, netip.MustParsePrefix(cidr))
+	}
+	return values
+}()
+
+// Compile CIDRs once per fresh policy, including a fresh interface snapshot.
+func (p *policy) compile() error {
+	for _, group := range []struct {
+		source []string
+		target *[]netip.Prefix
+	}{{p.CIDRs, &p.allowedPrefixes}, {p.Blocked, &p.blockedPrefixes}} {
+		for _, value := range group.source {
+			prefix, err := netip.ParsePrefix(value)
+			if err != nil {
+				return err
+			}
+			*group.target = append(*group.target, prefix.Masked())
+		}
+	}
+	if p.Guest {
+		addresses, err := net.InterfaceAddrs()
+		if err != nil {
+			return err
+		}
+		for _, address := range addresses {
+			prefix, err := netip.ParsePrefix(address.String())
+			if err == nil {
+				p.interfaces = append(p.interfaces, prefix.Masked())
+			}
+		}
+	}
+	p.compiled = true
+	return nil
 }
 
 func (p policy) allows(addr netip.Addr) bool {
+	if !p.compiled {
+		if p.compile() != nil {
+			return false
+		}
+	}
 	addr = addr.Unmap()
-	// Never expose local control-plane services or special-address traffic.
 	if addr.IsLoopback() || addr.IsUnspecified() || addr.IsMulticast() || addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() {
 		return false
 	}
 	if p.Guest {
-		// Match OpenVPN's IPv4-only guest egress; do not expose IPv6 transition
-		// mechanisms that can embed or translate private IPv4 destinations.
 		if !addr.Is4() || !addr.IsGlobalUnicast() || addr.IsPrivate() {
 			return false
 		}
-		for _, cidr := range []string{"0.0.0.0/8", "100.64.0.0/10", "192.0.0.0/24", "192.0.2.0/24", "192.88.99.0/24", "198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24", "240.0.0.0/4"} {
-			if netip.MustParsePrefix(cidr).Contains(addr) {
+		for _, prefix := range guestSpecial {
+			if prefix.Contains(addr) {
 				return false
 			}
 		}
-		// Block directly attached networks even when they use public addresses.
-		networks, err := net.InterfaceAddrs()
-		if err != nil {
-			return false
-		}
-		for _, network := range networks {
-			prefix, err := netip.ParsePrefix(network.String())
-			if err == nil && prefix.Contains(addr) {
+		for _, prefix := range p.interfaces {
+			if prefix.Contains(addr) {
 				return false
 			}
 		}
 	}
-	for _, cidr := range p.Blocked {
-		prefix, err := netip.ParsePrefix(cidr)
-		if err != nil || prefix.Contains(addr) {
+	for _, prefix := range p.blockedPrefixes {
+		if prefix.Contains(addr) {
 			return false
 		}
 	}
-	for _, cidr := range p.CIDRs {
-		if prefix, err := netip.ParsePrefix(cidr); err == nil && prefix.Contains(addr) {
+	for _, prefix := range p.allowedPrefixes {
+		if prefix.Contains(addr) {
 			return true
 		}
 	}
@@ -63,17 +101,17 @@ func (p policy) allows(addr netip.Addr) bool {
 func resolveAll(ctx context.Context, target string, p policy) ([]netip.AddrPort, error) {
 	host, portText, err := net.SplitHostPort(target)
 	if err != nil {
-		return nil, err
+		return nil, errInvalidTarget
 	}
 	port, err := strconv.Atoi(portText)
 	if err != nil || port < 1 || port > 65535 {
-		return nil, errors.New("invalid port")
+		return nil, errInvalidTarget
 	}
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	addrs, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %v", errDNSFailed, err)
 	}
 	var allowed []netip.AddrPort
 	for _, addr := range addrs {
@@ -85,7 +123,7 @@ func resolveAll(ctx context.Context, target string, p policy) ([]netip.AddrPort,
 		}
 	}
 	if len(allowed) == 0 {
-		return nil, errors.New("destination denied")
+		return nil, errDestinationDenied
 	}
 	return allowed, nil
 }

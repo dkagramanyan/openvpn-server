@@ -49,9 +49,24 @@ func trustedProxy(remote string, prefixes []netip.Prefix) bool {
 // TCP peer before accepting bytes; forwarded headers never grant proxy trust.
 func serveHTTP2(listener net.Listener, handler http.Handler, trusted []netip.Prefix) error {
 	server := &http2.Server{MaxConcurrentStreams: 256, IdleTimeout: 90 * time.Second,
-		ReadIdleTimeout: 20 * time.Second, PingTimeout: 10 * time.Second, WriteByteTimeout: 15 * time.Second,
+		ReadIdleTimeout: 10 * time.Second, PingTimeout: 5 * time.Second, WriteByteTimeout: 15 * time.Second,
 		MaxUploadBufferPerConnection: 4 << 20, MaxUploadBufferPerStream: 256 << 10}
-	connections := make(chan struct{}, 128)
+	maxConnections := 128
+	if relay, ok := handler.(*relayServer); ok {
+		if relay.h2ReadIdle > 0 {
+			server.ReadIdleTimeout = relay.h2ReadIdle
+		}
+		if relay.h2PingTimeout > 0 {
+			server.PingTimeout = relay.h2PingTimeout
+		}
+		if relay.maxH2Connections > 0 {
+			maxConnections = relay.maxH2Connections
+		}
+		if relay.maxH2Streams > 0 {
+			server.MaxConcurrentStreams = uint32(relay.maxH2Streams)
+		}
+	}
+	connections := make(chan struct{}, maxConnections)
 	for {
 		conn, err := listener.Accept()
 		if err != nil {

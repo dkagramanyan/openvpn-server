@@ -493,7 +493,7 @@ def test_visits_and_connection_quality(client):
 
 
 def test_backup_archive(client):
-    import sqlite3
+    import subprocess
     import tarfile
     from app import backup
     from app.settings import settings
@@ -507,13 +507,11 @@ def test_backup_archive(client):
     with tarfile.open(archive) as tar:
         names = set(tar.getnames())
         assert {"server.conf", "pki/ca.crt", "pki/private/ca.key", "clients/oath.secrets", "config/client.conf",
-                "db/openvpn-ui.db"} <= names
+                "db/openvpn-ui.pgdump"} <= names
         assert not any(n.startswith(("backups", "log")) or "-wal" in n for n in names)
-        tar.extract("db/openvpn-ui.db", TMP / "restored", filter="data")
-    copy = sqlite3.connect(TMP / "restored" / "db" / "openvpn-ui.db")
-    assert copy.execute("SELECT username FROM users").fetchone() == ("admin",)
-    assert copy.execute("SELECT COUNT(*) FROM vpn_sessions WHERE client_name = 'alice'").fetchone() == (3,)
-    copy.close()
+        tar.extract("db/openvpn-ui.pgdump", TMP / "restored", filter="data")
+    listing = subprocess.run(["pg_restore", "--list", str(TMP / "restored/db/openvpn-ui.pgdump")], check=True, capture_output=True, text=True).stdout
+    assert "TABLE DATA" in listing and "users" in listing and "vpn_sessions" in listing
     assert backup.ensure_recent() is None                    # one a day is enough
     assert list(archive.parent.glob(".*")) == []             # no snapshot or partial file left behind
     # only the newest archives are kept

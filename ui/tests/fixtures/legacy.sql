@@ -1,0 +1,13 @@
+CREATE TABLE users(id INTEGER PRIMARY KEY,username TEXT NOT NULL UNIQUE,password_hash TEXT NOT NULL,created_at INTEGER NOT NULL,last_login INTEGER,client_name TEXT,client_serial TEXT);
+CREATE TABLE web_sessions(token_hash TEXT PRIMARY KEY,user_id INTEGER NOT NULL,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,ip TEXT,user_agent TEXT);
+CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+CREATE TABLE clients(name TEXT PRIMARY KEY,note TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL);
+CREATE TABLE hidden_certs(serial TEXT PRIMARY KEY,name TEXT,hidden_at INTEGER NOT NULL);
+CREATE TABLE vpn_sessions(id INTEGER PRIMARY KEY,client_name TEXT NOT NULL,cid INTEGER,real_address TEXT,vpn_ip TEXT,username TEXT,cipher TEXT,connected_at INTEGER NOT NULL,last_seen INTEGER NOT NULL,disconnected_at INTEGER,bytes_in INTEGER NOT NULL DEFAULT 0,bytes_out INTEGER NOT NULL DEFAULT 0,proto TEXT,platform TEXT,client_ver TEXT,end_reason TEXT,grp INTEGER);
+CREATE TABLE traffic_minute(ts INTEGER NOT NULL,client_name TEXT NOT NULL,bytes_in INTEGER NOT NULL DEFAULT 0,bytes_out INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(ts,client_name));
+CREATE TABLE traffic_hour(ts INTEGER NOT NULL,client_name TEXT NOT NULL,bytes_in INTEGER NOT NULL DEFAULT 0,bytes_out INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(ts,client_name));
+CREATE TABLE traffic_day(ts INTEGER NOT NULL,client_name TEXT NOT NULL,bytes_in INTEGER NOT NULL DEFAULT 0,bytes_out INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(ts,client_name));
+CREATE TABLE events(id INTEGER PRIMARY KEY,ts INTEGER NOT NULL,kind TEXT NOT NULL,client_name TEXT,actor TEXT,detail TEXT);
+CREATE TABLE archived_clients(key TEXT PRIMARY KEY,name TEXT NOT NULL,archived_at INTEGER NOT NULL);
+CREATE TABLE rejections(day INTEGER NOT NULL,client_name TEXT NOT NULL,reason TEXT NOT NULL,address TEXT NOT NULL,count INTEGER NOT NULL,last_ts INTEGER NOT NULL,PRIMARY KEY(day,client_name,reason,address));
+CREATE TABLE share_tokens(token_hash TEXT PRIMARY KEY,client_name TEXT NOT NULL,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,used_at INTEGER,created_by TEXT);

@@ -19,7 +19,6 @@ from urllib.request import build_opener, HTTPCookieProcessor, ProxyHandler, Requ
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "ui/tests"))
-import test_api as fixture
 from test_profile_signing import make_identity, write_store
 
 
@@ -90,6 +89,8 @@ def main():
     prefix = "ovpn-relay-test-" + secrets.token_hex(4)
     folder = Path(tempfile.mkdtemp(prefix=prefix))
     containers = []
+    fixture = None
+    stream = None
     password, signing_token = secrets.token_hex(24), secrets.token_hex(32)
     network = prefix
 
@@ -107,6 +108,22 @@ def main():
         entry = make_identity(folder / "identity")
         write_store(folder / "acme.json", entry)
         command("docker", "network", "create", network)
+        pg_password = secrets.token_urlsafe(24)
+        app_password, policy_password = secrets.token_urlsafe(24), secrets.token_urlsafe(24)
+        postgres = run("postgres", "-p", "127.0.0.1::5432", "-e", "POSTGRES_PASSWORD=" + pg_password,
+                       "-e", "POSTGRES_DB=openvpn", "-e", "OPENVPN_DB_PASSWORD=" + app_password,
+                       "-e", "RELAY_POLICY_DB_PASSWORD=" + policy_password,
+                       "-v", f"{ROOT}/postgres/00-roles.sh:/docker-entrypoint-initdb.d/00-roles.sh:ro", "postgres:18.6-alpine")
+        for _ in range(60):
+            if subprocess.run(["docker", "exec", postgres, "pg_isready", "-h", "127.0.0.1", "-U", "postgres", "-d", "openvpn"], capture_output=True).returncode == 0:
+                break
+            time.sleep(1)
+        else: raise RuntimeError("PostgreSQL did not become ready")
+        # Host fixtures and production containers use the actual restricted app role.
+        os.environ["OVPN_DATABASE_URL"] = "postgresql://openvpn:" + app_password + "@127.0.0.1:" + published(postgres, 5432) + "/openvpn"
+        import test_api as fixture
+        container_dsn = "postgresql://openvpn:" + app_password + "@postgres/openvpn"
+        policy_dsn = "postgresql://relay_policy:" + policy_password + "@postgres/openvpn"
         subnet = json.loads(command("docker", "network", "inspect", network))[0]["IPAM"]["Config"][0]["Subnet"]
         relay = run("relay", "-p", "127.0.0.1::8080", "-e", "RELAY_TRUSTED_PROXIES=" + subnet,
                     "openvpn-apple-relay:relay-test")
@@ -166,7 +183,7 @@ tls:
         command("docker", "run", "-d", "--name", ui_name, "--network", "container:" + relay,
                 "-v", f"{fixture.TMP}:/etc/openvpn", "-v", f"{folder}:/fixture:ro",
                 "-e", "SSL_CERT_FILE=/fixture/identity/ca.pem", "-e", "MGMT_PORT=1", "-e", "OVPN_BACKUP_KEEP=0",
-                "-e", "OPENVPN_ADMIN_PASSWORD=" + password, "-e", "OVPN_RELAY_SIGNER_URL=https://traefik/internal/relay-sign",
+                "-e", "OVPN_DATABASE_URL=" + container_dsn, "-e", "OPENVPN_ADMIN_PASSWORD=" + password, "-e", "OVPN_RELAY_SIGNER_URL=https://traefik/internal/relay-sign",
                 "-e", "RELAY_PROFILE_SIGNING_TOKEN=" + signing_token, "openvpn-ui:relay-test")
         containers.append(ui_name)
         api_url = "http://127.0.0.1:" + published(relay, 8080)
@@ -186,6 +203,30 @@ tls:
                 time.sleep(1)
         else:
             raise RuntimeError("UI did not become ready")
+        policy_name = prefix + "-policy"
+        command("docker", "run", "-d", "--name", policy_name, "--network", "container:" + relay,
+                "-v", f"{fixture.TMP}/pki:/etc/openvpn/pki:ro", "-v", f"{fixture.TMP}/guests:/etc/openvpn/guests:ro",
+                "-v", f"{fixture.TMP}/server.conf:/etc/openvpn/server.conf:ro",
+                "--tmpfs", "/etc/openvpn/pki/private:mode=0700", "--tmpfs", "/etc/openvpn/pki/renewed:mode=0700",
+                "--tmpfs", "/etc/openvpn/pki/revoked:mode=0700", "--read-only", "--tmpfs", "/tmp",
+                "-e", "OVPN_DATABASE_URL=" + policy_dsn, "openvpn-ui:relay-test", "python", "-m", "app.policy_server")
+        containers.append(policy_name)
+        for _ in range(30):
+            health = subprocess.run(["docker", "exec", relay, "wget", "-qO-", "http://127.0.0.1:8446/readyz"], capture_output=True)
+            if health.returncode == 0: break
+            time.sleep(1)
+        else: raise RuntimeError("Independent policy service did not become ready")
+        assert command("docker", "exec", policy_name, "sh", "-c", "test ! -e /etc/openvpn/pki/private/ca.key && echo hidden") == "hidden"
+        # The policy role cannot read admin password hashes or change access.
+        from app.db import connection_parameters
+        import psycopg
+        params = connection_parameters(os.environ["OVPN_DATABASE_URL"])
+        with psycopg.connect(**{**params, "user": "relay_policy", "password": policy_password}, autocommit=True) as connection:
+            assert connection.execute("SELECT count(*) FROM relay_policy_settings").fetchone() is not None
+            for statement in ("SELECT * FROM users", "UPDATE settings SET value='bad'"):
+                try: connection.execute(statement)
+                except psycopg.Error: pass
+                else: raise AssertionError("Policy role had excessive database permissions")
         api("/api/relay/settings", {"enabled": True, "url": origin, "allowed_cidrs": [subnet]}, "PUT")
         status = json.loads(api("/api/relay/signing"))
         assert status["ready"], status
@@ -209,7 +250,7 @@ tls:
         denied = subprocess.run([*curl, "http://" + address + ":8080/"], capture_output=True)
         assert denied.returncode != 0
         activity = json.loads(api("/api/relay/status"))["events"]
-        assert any(e["guest"] and e["kind"] == "denied" and e["reason"] == "destination_denied_or_dns_failed" for e in activity)
+        assert any(e["guest"] and e["kind"] == "denied" and e["reason"] == "destination_denied" for e in activity)
         internet = command(*curl, "https://example.com/")
         assert "Example Domain" in internet
         print("PASS: guest reaches public HTTPS internet while LAN access is denied")
@@ -228,6 +269,76 @@ tls:
         assert command(*public_check, "--output", "/dev/null", "--write-out", "%{http_code}", portal_url + "/api/server") == "404"
         if os.environ.get("RELAY_STACK_BROWSER"):
             check_browser(api_url, portal_url, password, folder)
+        # UI maintenance must not interrupt relay authorization. Use the private
+        # signer HTTP backend as a destination while the UI is stopped.
+        signer_address = json.loads(command("docker", "inspect", prefix + "-signer"))[0]["NetworkSettings"]["Networks"][network]["IPAddress"]
+        destination = "http://" + signer_address + ":8085/"
+        (folder / "stream.py").write_text('''from http.server import BaseHTTPRequestHandler, HTTPServer
+import time
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Length", "122880")
+        self.end_headers()
+        try:
+            for _ in range(120):
+                self.wfile.write(b"x" * 1024)
+                self.wfile.flush()
+                time.sleep(0.2)
+        except (OSError, ConnectionError): pass
+    def log_message(self, *args): pass
+HTTPServer(("0.0.0.0", 8089), Handler).serve_forever()
+''')
+        streamer = run("streamer", "-v", f"{folder}:/fixture:ro", "--entrypoint", "python", "openvpn-ui:relay-test", "/fixture/stream.py")
+        stream_address = json.loads(command("docker", "inspect", streamer))[0]["NetworkSettings"]["Networks"][network]["IPAddress"]
+        for _ in range(30):
+            probe = subprocess.run(["docker", "exec", streamer, "python", "-c", "import socket; socket.create_connection(('127.0.0.1',8089),timeout=1).close()"], capture_output=True)
+            if probe.returncode == 0: break
+            time.sleep(0.2)
+        else: raise AssertionError("Stream destination did not start")
+        progress = folder / "download"
+        stream = subprocess.Popen([*curl, "--max-time", "40", "--output", str(progress), "http://" + stream_address + ":8089/"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        for _ in range(30):
+            if progress.exists() and progress.stat().st_size > 0: break
+            time.sleep(0.2)
+        else: raise AssertionError("Long-lived CONNECT did not start")
+        command("docker", "stop", "-t", "3", ui_name)
+        time.sleep(2)
+        before = progress.stat().st_size
+        time.sleep(6)  # Exceeds live policy recheck interval.
+        assert stream.poll() is None and progress.stat().st_size > before
+        # Any response from the destination is sufficient; CONNECT must be 200.
+        assert command(*[x for x in curl if x != "--fail"], destination).startswith("{}")
+        metrics = command("docker", "exec", relay, "wget", "-qO-", "http://127.0.0.1:8446/metrics")
+        assert "relay_authorization_checks_total" in metrics and token not in metrics and "alice" not in metrics
+        # Independent policy sees role changes even while the UI is down.
+        command("docker", "run", "--rm", "-v", f"{fixture.TMP}:/fixture", "--entrypoint", "sh", "openvpn-ui:relay-test", "-c", "touch /fixture/guests/alice")
+        time.sleep(2)
+        denied = subprocess.run([*curl, destination], capture_output=True)
+        assert denied.returncode != 0
+        stream.communicate(timeout=12)
+        assert stream.returncode != 0, "Role downgrade did not terminate the active LAN flow"
+        state = json.loads(command("docker", "exec", relay, "wget", "-qO-", "http://127.0.0.1:8446/status"))
+        assert any(e["reason"] == "access_revoked" for e in state["events"])
+        assert any(e["guest"] and e["reason"] == "destination_denied" and e["target"].endswith(":8085") for e in state["events"])
+        command("docker", "run", "--rm", "-v", f"{fixture.TMP}:/fixture", "--entrypoint", "sh", "openvpn-ui:relay-test", "-c", "rm /fixture/guests/alice")
+        time.sleep(2)
+        assert command(*[x for x in curl if x != "--fail"], destination).startswith("{}")
+        command("docker", "stop", "-t", "2", policy_name)
+        time.sleep(2)
+        unavailable = subprocess.run([*curl, destination], capture_output=True)
+        assert unavailable.returncode != 0
+        state = json.loads(command("docker", "exec", relay, "wget", "-qO-", "http://127.0.0.1:8446/status"))
+        assert state["policy_ready"] is False
+        assert any(e["reason"] == "authorization_unavailable" for e in state["events"])
+        command("docker", "start", policy_name, ui_name)
+        for _ in range(30):
+            try:
+                api("/api/login", {"username": "admin", "password": password})
+                break
+            except Exception: time.sleep(1)
+        assert "OpenVPN" in command(*curl, "http://" + address + ":8080/")
+        print("PASS: relay works during UI outage; live role changes apply; policy outage returns retryable 503; policy cannot read admin data or keys")
         api("/api/clients/alice/relay", method="DELETE")
         time.sleep(2)
         denied = subprocess.run([*curl, "http://" + address + ":8080/"], capture_output=True)
@@ -240,11 +351,18 @@ tls:
             print(name + ": " + (logs.stdout + logs.stderr).decode(errors="replace"), file=sys.stderr)
         raise
     finally:
+        if stream is not None and stream.poll() is None:
+            stream.kill()
+            stream.communicate()
         if containers:
             subprocess.run(["docker", "rm", "-f", *reversed(containers)], capture_output=True)
         subprocess.run(["docker", "network", "rm", network], capture_output=True)
         shutil.rmtree(folder, ignore_errors=True)
-        shutil.rmtree(fixture.TMP, ignore_errors=True)
+        if fixture is not None:
+            # Only the synthetic fixture: Docker created root-owned PKI directories.
+            subprocess.run(["docker", "run", "--rm", "-v", f"{fixture.TMP}:/fixture", "--entrypoint", "sh",
+                            "openvpn-ui:relay-test", "-c", f"chown -R {os.getuid()}:{os.getgid()} /fixture"], capture_output=True)
+            shutil.rmtree(fixture.TMP, ignore_errors=True)
 
 
 if __name__ == "__main__":

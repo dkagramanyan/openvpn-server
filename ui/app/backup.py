@@ -4,7 +4,6 @@ from __future__ import annotations
 import os
 import re
 import shutil
-import sqlite3
 import subprocess
 import tarfile
 import tempfile
@@ -43,7 +42,7 @@ def _write_archive(fh, snapshot: Path) -> None:
             if path.exists():
                 tar.add(path, arcname=item)
         if snapshot.exists():
-            tar.add(snapshot, arcname="db/openvpn-ui.db")
+            tar.add(snapshot, arcname="db/openvpn-ui.pgdump")
 
 
 def create() -> Path:
@@ -67,15 +66,8 @@ def create() -> Path:
         # directory (memory, in the container), so a slow or hanging backup directory - it may be
         # a network share - is written without the lock and cannot hold up a revocation.
         with pki.lock:
-            if settings.db_path.exists():
-                # The backup API copies a consistent database while the collector keeps writing;
-                # a plain file copy of a database in WAL mode can come out torn or stale.
-                src, dst = sqlite3.connect(str(settings.db_path), timeout=30), sqlite3.connect(str(snapshot))
-                try:
-                    src.backup(dst)
-                finally:
-                    src.close()
-                    dst.close()
+            from .migrate_db import dump_postgres
+            dump_postgres(snapshot)
             with open(built, "wb") as fh:
                 if recipient:
                     age = subprocess.Popen(["age", "-r", recipient], stdin=subprocess.PIPE, stdout=fh,

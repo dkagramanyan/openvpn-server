@@ -7,7 +7,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 os.environ.setdefault("OPENVPN_DIR", "/nonexistent")
 
 from app.collector import Collector, parse_connection  # noqa: E402
-from app.db import MERGE_GAP, Database  # noqa: E402
+from app.db import MERGE_GAP
+from pg_fixture import Database  # noqa: E402
 from app.mgmt import ManagementError  # noqa: E402
 
 
@@ -272,7 +273,7 @@ def test_a_database_from_1_4_gets_the_new_columns_and_visits(tmp_path):
 
 
 def test_a_failed_database_write_does_not_stop_the_collector(tmp_path):
-    import sqlite3
+    import psycopg
     import threading
     db = Database(tmp_path / "c.db")
     mgmt = FakeMgmt()
@@ -286,7 +287,7 @@ def test_a_failed_database_write_does_not_stop_the_collector(tmp_path):
 
     def tx():
         if broken.is_set():
-            raise sqlite3.OperationalError("database or disk is full")
+            raise psycopg.OperationalError("database unavailable")
         return real_tx()
     db.tx = tx
     broken.set()

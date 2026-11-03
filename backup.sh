@@ -25,7 +25,7 @@ ACTION=$1
 SERVER_ENV=${2%/}
 BACKUP_DIR=${3%/}
 
-ITEMS=(server.conf config pki clients staticclients guests db fw-rules.sh docker-compose.yml .env)
+ITEMS=(server.conf config pki clients staticclients guests fw-rules.sh docker-compose.yml .env)
 DB=db/openvpn-ui.db
 
 confirm() {
@@ -45,18 +45,16 @@ case $ACTION in
                 echo " $item backed up"
             fi
         done
-        # The UI keeps writing to the database, and a file copy of a database in
-        # use can come out torn. Replace it with a consistent snapshot.
-        if [[ -f $SERVER_ENV/$DB ]]; then
-            rm -f "$BACKUP_DIR/$DB" "$BACKUP_DIR/$DB"-wal "$BACKUP_DIR/$DB"-shm
-            if command -v python3 >/dev/null; then
-                python3 -c 'import sqlite3, sys; src, dst = sqlite3.connect(sys.argv[1]), sqlite3.connect(sys.argv[2]); src.backup(dst); dst.close()' \
-                    "$SERVER_ENV/$DB" "$BACKUP_DIR/$DB"
-            else
-                cp -p "$SERVER_ENV/$DB"* "$BACKUP_DIR/db/"
-                echo -e " \033[1;33mpython3 not found: the database was copied as files. Stop the UI first (docker compose stop openvpn-ui) to be sure the copy is consistent.\033[0m"
-            fi
+        mkdir -p "$BACKUP_DIR/db"
+        if command -v docker >/dev/null && docker inspect openvpn-ui >/dev/null 2>&1; then
+            docker exec openvpn-ui python -m app.migrate_db dump --stdout > "$BACKUP_DIR/db/openvpn-ui.pgdump"
+        elif command -v python3 >/dev/null; then
+            python3 -m app.migrate_db dump --output "$BACKUP_DIR/db/openvpn-ui.pgdump"
+        else
+            echo "PostgreSQL backup needs the running UI container or its Python/client tools" >&2
+            exit 1
         fi
+        chmod 600 "$BACKUP_DIR/db/openvpn-ui.pgdump"
         echo -e "\033[1;32mBackup created at $BACKUP_DIR\033[0m"
         ;;
     -r)
@@ -77,11 +75,17 @@ case $ACTION in
             fi
             BACKUP_DIR=$tmp
         fi
-        for item in "${ITEMS[@]}"; do
-            if [[ $item == db && -e $BACKUP_DIR/db ]]; then
+        for item in "${ITEMS[@]}" db; do
+            if [[ $item == docker-compose.yml && -f $BACKUP_DIR/db/openvpn-ui.db && -f $SERVER_ENV/$item ]] \
+                && grep -q '^  postgres:' "$SERVER_ENV/$item" && ! grep -q '^  postgres:' "$BACKUP_DIR/$item"; then
+                # An older archive must not replace the current migration services.
+                mkdir -p "$SERVER_ENV/db"
+                cp -p "$BACKUP_DIR/$item" "$SERVER_ENV/db/legacy-docker-compose.yml"
+                echo " current PostgreSQL Compose kept; old Compose saved in db/legacy-docker-compose.yml"
+            elif [[ $item == db && -e $BACKUP_DIR/db ]]; then
                 # Only the database: a write-ahead log left next to a restored database would corrupt it.
                 mkdir -p "$SERVER_ENV/db"
-                rm -f "$SERVER_ENV/$DB" "$SERVER_ENV/$DB"-wal "$SERVER_ENV/$DB"-shm
+                rm -f "$SERVER_ENV/$DB" "$SERVER_ENV/$DB"-wal "$SERVER_ENV/$DB"-shm "$SERVER_ENV/db/openvpn-ui.pgdump"
                 cp -Rp "$BACKUP_DIR/db/." "$SERVER_ENV/db/"
                 echo " $item restored"
             elif [[ -e $BACKUP_DIR/$item ]]; then
@@ -90,7 +94,7 @@ case $ACTION in
                 echo " $item restored"
             fi
         done
-        echo -e "\033[1;34mRestore completed. Run: docker compose up -d\033[0m"
+        echo -e "\033[1;34mFiles restored. Run the PostgreSQL import with bin/upgrade-relay.sh before starting the UI\033[0m"
         ;;
     *)
         usage

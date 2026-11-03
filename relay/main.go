@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"io"
 	"log"
 	"net"
@@ -25,18 +26,25 @@ import (
 const udpPath = "/.well-known/masque/udp/{target_host}/{target_port}/"
 
 type relayServer struct {
-	api       string
-	client    *http.Client
-	slots     chan struct{}
-	recheck   time.Duration
-	policyTTL time.Duration
-	authMu    sync.Mutex
-	policies  map[[32]byte]*policyEntry
-	activity  *activityLog
+	api              string
+	client           *http.Client
+	slots            chan struct{}
+	recheck          time.Duration
+	policyTTL        time.Duration
+	authMu           sync.Mutex
+	policies         map[[32]byte]*policyEntry
+	activity         *activityLog
+	quota            *flowQuota
+	authSlots        chan struct{}
+	metrics          *relayMetrics
+	maxH2Connections int
+	maxH2Streams     int
+	h2ReadIdle       time.Duration
+	h2PingTimeout    time.Duration
 }
 
 // Revalidate live tunnels as well as new requests. Policy changes, expiry,
-// revocation and an unavailable UI all close active flows within ~9 seconds.
+// revocation and unavailable policy state close active flows within ~9 seconds.
 func (s *relayServer) watch(ctx context.Context, token string, addr netip.Addr, origin string, closeFlow func()) {
 	ticker := time.NewTicker(s.recheck)
 	defer ticker.Stop()
@@ -52,7 +60,11 @@ func (s *relayServer) watch(ctx context.Context, token string, addr netip.Addr, 
 				return
 			}
 			if err != nil || p.URL != origin || !p.allows(addr) {
-				flowFrom(ctx).reason("access_revoked_or_unavailable")
+				reason := "access_revoked"
+				if err != nil && !errors.Is(err, errAccessDenied) {
+					reason = "authorization_unavailable"
+				}
+				flowFrom(ctx).reason(reason)
 				closeFlow()
 				return
 			}
@@ -73,19 +85,38 @@ func (s *relayServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		defer func() { <-s.slots }()
 	default:
 		flow.reason("capacity_reached")
+		w.Header().Set("Retry-After", "1")
 		http.Error(w, "Relay busy", 503)
 		return
 	}
 	token := r.Header.Get("Authorization")
 	p, err := s.authorize(r.Context(), token)
 	if err != nil {
-		flow.reason("authorization_denied")
-		http.Error(w, "Relay access denied", 403)
+		if errors.Is(err, errAccessDenied) {
+			flow.reason("authorization_denied")
+			http.Error(w, "Relay access denied", 403)
+		} else {
+			flow.reason("authorization_unavailable")
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "Relay authorization temporarily unavailable", 503)
+		}
 		return
 	}
 	if flow != nil {
 		flow.event.Client, flow.event.Guest = p.Client, p.Guest
 	}
+	identity := p.Client
+	if identity == "" {
+		identity = token
+	}
+	release, ok := s.quota.acquire(identity)
+	if !ok {
+		flow.reason("client_capacity_reached")
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "Client relay capacity reached", 503)
+		return
+	}
+	defer release()
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 	var udpReq *masque.ProxyRequest
@@ -123,10 +154,21 @@ func (s *relayServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		flow.event.Counted = udpReq == nil
 	}
+	resolved := time.Now()
 	addresses, err := resolveAll(ctx, target, p)
+	s.metrics.observe("dns_lookups", resolved)
 	if err != nil {
-		flow.reason("destination_denied_or_dns_failed")
-		http.Error(w, "Destination unavailable or denied", 403)
+		switch {
+		case errors.Is(err, errInvalidTarget):
+			flow.reason("invalid_target")
+			http.Error(w, "Invalid target", 400)
+		case errors.Is(err, errDNSFailed):
+			flow.reason("dns_failed")
+			http.Error(w, "Destination DNS unavailable", 502)
+		default:
+			flow.reason("destination_denied")
+			http.Error(w, "Destination denied", 403)
+		}
 		return
 	}
 	// Dial the numeric address we checked, never resolve a hostname twice.
@@ -159,7 +201,9 @@ func (s *relayServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_ = proxy.ProxyConnectedSocket(w, udpReq, conn)
 		return
 	}
+	dialStarted := time.Now()
 	conn, addr, err := dialTCP(ctx, addresses)
+	s.metrics.observe("tcp_dials", dialStarted)
 	if err != nil {
 		flow.reason("destination_unreachable")
 		http.Error(w, "Destination unavailable", 502)
@@ -215,14 +259,47 @@ func env(key, fallback string) string {
 }
 
 func main() {
+	maximum, err := limitEnv("RELAY_MAX_FLOWS", 256, 65536)
+	if err != nil {
+		log.Fatal(err)
+	}
+	perClient, err := limitEnv("RELAY_MAX_FLOWS_PER_CLIENT", 64, maximum)
+	if err != nil {
+		log.Fatal(err)
+	}
+	authChecks, err := limitEnv("RELAY_MAX_AUTH_CHECKS", 64, 4096)
+	if err != nil {
+		log.Fatal(err)
+	}
+	h2Connections, err := limitEnv("RELAY_MAX_H2_CONNECTIONS", 128, 4096)
+	if err != nil {
+		log.Fatal(err)
+	}
+	h2Streams, err := limitEnv("RELAY_MAX_H2_STREAMS", 256, 65536)
+	if err != nil {
+		log.Fatal(err)
+	}
+	readIdle, err := durationEnv("RELAY_H2_READ_IDLE", 10*time.Second)
+	if err != nil {
+		log.Fatal(err)
+	}
+	pingTimeout, err := durationEnv("RELAY_H2_PING_TIMEOUT", 5*time.Second)
+	if err != nil {
+		log.Fatal(err)
+	}
 	handler := &relayServer{
-		api: env("RELAY_AUTH_URL", "http://127.0.0.1:8080/api/relay/authorize"),
+		api: env("RELAY_AUTH_URL", "http://127.0.0.1:8447/api/relay/authorize"),
 		client: &http.Client{Timeout: 3 * time.Second, Transport: &http.Transport{Proxy: nil, MaxIdleConnsPerHost: 32, IdleConnTimeout: 90 * time.Second},
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
-		slots: make(chan struct{}, 256), recheck: 5 * time.Second, policyTTL: time.Second,
+		slots: make(chan struct{}, maximum), recheck: 5 * time.Second, policyTTL: time.Second,
+		quota: &flowQuota{maximum: perClient}, authSlots: make(chan struct{}, authChecks), metrics: &relayMetrics{},
+		maxH2Connections: h2Connections, maxH2Streams: h2Streams, h2ReadIdle: readIdle, h2PingTimeout: pingTimeout,
 	}
 	mode := env("RELAY_TRANSPORT", "http2")
 	handler.activity = newActivity(mode)
+	handler.activity.runtime = handler.metrics
+	handler.activity.limits = map[string]int{"flows": maximum, "per_client": perClient, "auth_checks": authChecks, "h2_connections": h2Connections, "h2_streams": h2Streams}
+	handler.activity.readiness = handler.checkReadiness
 	admin, err := handler.activity.listen("127.0.0.1:8446")
 	if err != nil {
 		log.Fatal(err)
