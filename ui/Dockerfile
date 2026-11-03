@@ -52,4 +52,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
 # UVICORN_HOST sets the listen address; X-Forwarded-For is only believed from
 # FORWARDED_ALLOW_IPS (a reverse proxy), never from arbitrary clients.
 ENV UVICORN_HOST=0.0.0.0 FORWARDED_ALLOW_IPS=127.0.0.1
-CMD ["python", "-m", "uvicorn", "app.main:app", "--port", "8080", "--proxy-headers", "--no-server-header"]
+CMD ["python", "-m", "uvicorn", "app.main:app", "--port", "8080", "--no-proxy-headers", "--no-server-header"]

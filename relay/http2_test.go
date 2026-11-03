@@ -348,8 +348,8 @@ func TestHTTP2ProxyTrust(t *testing.T) {
 			t.Errorf("accepted proxy trust %q", invalid)
 		}
 	}
-	trusted, err := parseTrustedProxies("170.134.51.13/32,::1/128")
-	if err != nil || !trustedProxy("170.134.51.13:9999", trusted) || !trustedProxy("[::1]:9999", trusted) || trustedProxy("170.134.51.99:9999", trusted) {
+	trusted, err := parseTrustedProxies("192.0.2.13/32,::1/128")
+	if err != nil || !trustedProxy("192.0.2.13:9999", trusted) || !trustedProxy("[::1]:9999", trusted) || trustedProxy("192.0.2.99:9999", trusted) {
 		t.Fatal("proxy trust does not match actual peer addresses")
 	}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -364,7 +364,7 @@ func TestHTTP2ProxyTrust(t *testing.T) {
 	origin, transport := h2Frontend(t, listener.Addr().String(), false)
 	defer transport.CloseIdleConnections()
 	req, _ := http.NewRequestWithContext(ctx, "GET", origin, nil)
-	req.Header.Set("X-Forwarded-For", "170.134.51.13")
+	req.Header.Set("X-Forwarded-For", "192.0.2.13")
 	if _, err := transport.RoundTrip(req); err == nil || calls.Load() != 0 {
 		t.Fatal("untrusted TCP peer reached the handler")
 	}

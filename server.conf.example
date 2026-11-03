@@ -1,4 +1,5 @@
-# OpenVPN server configuration (OpenVPN 2.7).
+# Generic OpenVPN bootstrap template (OpenVPN 2.7).
+# The installed server.conf is private runtime data, configured in the UI.
 # Paths are relative to /etc/openvpn (the container runs OpenVPN with --cd).
 
 # Management interface. Don't change the address/port: the web UI shares this
@@ -69,26 +70,21 @@ explicit-exit-notify 1
 
 # ---- Addressing and routes ------------------------------------------------
 # One tunnel subnet: with "topology subnet" OpenVPN only accepts addresses
-# inside it. 10.0.70.2-99 is the dynamic pool, 10.0.70.100-127 is for static
-# IPs, and 10.0.70.128/25 (GUEST_SUB) for guests: internet and DNS only.
-server 10.0.70.0 255.255.255.0 nopool
-ifconfig-pool 10.0.70.2 10.0.70.99
-push "route 10.0.60.0 255.255.255.0"     # Route to Home VPN subnet
-# DNS server for VPN clients: "dns" for OpenVPN 2.6+ and Connect 3, and
-# "dhcp-option" for older clients.
-# 170.134.51.1 answers the home domains with LAN addresses (split DNS), so
-# clients reach home services directly instead of through the public IP.
-push "dns server 0 address 170.134.51.1"
-push "dhcp-option DNS 170.134.51.1"
+# inside it. 10.8.0.2-99 is the dynamic pool, 10.8.0.100-127 is for static
+# IPs, and 10.8.0.128/25 (GUEST_SUB) for guests: internet and DNS only.
+server 10.8.0.0 255.255.255.0 nopool
+ifconfig-pool 10.8.0.2 10.8.0.99
+# Generic bootstrap DNS; edit it in Settings → Network.
+push "dns server 0 address 1.1.1.1"
+push "dhcp-option DNS 1.1.1.1"
 # All IPv4 through the tunnel. IPv6 is routed into the tunnel too, so it
 # cannot leak around it, and answered there with "no route" (block-ipv6 on
 # both ends): the private range below exists only for that.
-ifconfig-ipv6 fd00:70::1/64 fd00:70::2
-ifconfig-ipv6-pool fd00:70::1000/64
+ifconfig-ipv6 fd00:8::1/64 fd00:8::2
+ifconfig-ipv6-pool fd00:8::1000/64
 block-ipv6
 push "redirect-gateway def1 ipv6 bypass-dhcp"
 push "block-ipv6"
-push "route 171.134.51.0 255.255.255.0"  # as on the old server
 push "block-outside-dns"                 # Windows clients: prevent DNS leaks
 
 # ---- Logging --------------------------------------------------------------

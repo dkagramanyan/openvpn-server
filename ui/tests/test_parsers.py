@@ -14,7 +14,7 @@ def test_parse_index_handles_legacy_suffix_and_reasons():
     text = (
         "V\t281208105324Z\t\t6A99\tunknown\t/C=UA/CN=server/emailAddress=a@b\n"
         "R\t281208105325Z\t260905105325Z,keyCompromise\tD87D\tunknown\t/C=UA/CN=alice/emailAddress=a@b\n"
-        "V\t281208105324Z\t\t9941\tunknown\t/CN=bob/name=bob/LocalIP=10.0.71.5/2FAName=none\n"
+        "V\t281208105324Z\t\t9941\tunknown\t/CN=bob/name=bob/LocalIP=10.8.1.5/2FAName=none\n"
         "garbage line\n"
     )
     entries = pki.parse_index(text)
@@ -37,9 +37,9 @@ def test_status_parsing(monkeypatch):
         "TIME\t2026-09-05 10:00:00\t1788602400",
         "HEADER\tCLIENT_LIST\tCommon Name\tReal Address\tVirtual Address\tVirtual IPv6 Address\tBytes Received"
         "\tBytes Sent\tConnected Since\tConnected Since (time_t)\tUsername\tClient ID\tPeer ID\tData Channel Cipher",
-        "CLIENT_LIST\talice\t1.2.3.4:5555\t10.0.70.2\t\t1234\t5678\t2026-09-05 09:00:00\t1788598800\tUNDEF\t0\t0\tAES-256-GCM",
+        "CLIENT_LIST\talice\t1.2.3.4:5555\t10.8.0.2\t\t1234\t5678\t2026-09-05 09:00:00\t1788598800\tUNDEF\t0\t0\tAES-256-GCM",
         "HEADER\tROUTING_TABLE\tVirtual Address\tCommon Name\tReal Address\tLast Ref\tLast Ref (time_t)",
-        "ROUTING_TABLE\t10.0.70.2\talice\t1.2.3.4:5555\t2026-09-05 09:59:00\t1788602340",
+        "ROUTING_TABLE\t10.8.0.2\talice\t1.2.3.4:5555\t2026-09-05 09:59:00\t1788602340",
         "GLOBAL_STATS\tMax bcast/mcast queue length\t0",
         "GLOBAL_STATS\tdco_enabled\t0",
     ]
@@ -217,7 +217,7 @@ def test_tfa_uri_and_qr(monkeypatch):
 STATUS_V3 = (
     "TITLE\tOpenVPN 2.7.7\nTIME\t2026-09-05 10:00:00\t1788602400\n"
     "HEADER\tCLIENT_LIST\tCommon Name\tReal Address\tVirtual Address\tBytes Received\tBytes Sent\n"
-    "CLIENT_LIST\talice\t1.2.3.4:5555\t10.0.70.2\t1234\t5678\nEND\n"
+    "CLIENT_LIST\talice\t1.2.3.4:5555\t10.8.0.2\t1234\t5678\nEND\n"
 )
 
 

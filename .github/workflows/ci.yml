@@ -42,6 +42,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      - run: sudo unshare --net env GUEST_PORTAL_NETNS_TEST=1 bash tests/guest-portal-network.sh
       - run: tests/e2e/run.sh
 
   relay-stack:
@@ -53,6 +54,7 @@ jobs:
           python-version: "3.14"
       - run: pip install --require-hashes -r ui/requirements.txt
       - run: pip install pytest httpx
+      - run: python -m pytest tests/test_guest_portal_firewall.py -q
       - run: docker build -f signer/Dockerfile -t openvpn-profile-signer:relay-test .
       - run: docker build -f relay/Dockerfile -t openvpn-apple-relay:relay-test .
       - run: docker build -f ui/Dockerfile -t openvpn-ui:relay-test .

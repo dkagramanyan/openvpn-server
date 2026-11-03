@@ -28,7 +28,7 @@ class RelaySettings(BaseModel):
     url: str = Field(default="", max_length=2048)
     route_all: bool = True  # Accepted for old API clients; roles now always route all domains.
     match_domains: list[str] = Field(default_factory=lambda: ["home.arpa"], max_length=100)
-    allowed_cidrs: list[str] = Field(default_factory=lambda: [settings.home_sub], max_length=100)
+    allowed_cidrs: list[str] = Field(default_factory=lambda: [settings.home_sub] if settings.home_sub else [], max_length=100)
 
 
 def get_settings(db) -> dict:
@@ -100,7 +100,12 @@ def is_guest(name: str) -> bool:
 
 def guest_blocks(config: dict) -> list[str]:
     """Mirror LAN/VPN exclusions, including LANs using public address space."""
-    networks = [settings.home_sub, settings.guest_sub, *settings.guest_block.split(), *config["allowed_cidrs"]]
+    network = settings.read_network()
+    networks = [settings.guest_sub, *config["allowed_cidrs"]]
+    if network:
+        networks += network["lan_cidrs"] + network["blocked_cidrs"]
+    else:
+        networks += ([settings.home_sub] if settings.home_sub else []) + settings.guest_block.split()
     # Read errors or malformed relevant directives fail closed in authorize().
     if settings.server_conf.stat().st_nlink == 0:
         raise OSError("Bound server configuration was replaced; recreate relay-policy")
@@ -210,5 +215,8 @@ def authorize(db, authorization: str, *, strict_state: bool = False) -> dict | N
     # Full-access users may reach internet and LAN destinations. Keep the
     # configured LAN list separate so guest exclusions never become 0.0.0.0/0.
     allowed = ["0.0.0.0/0"] if guest else ["0.0.0.0/0", "::/0"]
+    network = settings.read_network()
+    portal = network.get("portal", {})
     return {"client": name, "allowed_cidrs": allowed,
-            "blocked_cidrs": blocked, "guest": guest, "url": config["url"]}
+            "blocked_cidrs": blocked, "guest": guest, "url": config["url"],
+            "portal": portal if guest and portal.get("enabled") else None}

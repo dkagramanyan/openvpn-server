@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -75,7 +76,11 @@ func serveHTTP2(listener net.Listener, handler http.Handler, trusted []netip.Pre
 		if err != nil {
 			return err
 		}
-		if !trustedProxy(conn.RemoteAddr().String(), trusted) {
+		currentTrust := trusted
+		if relay, ok := handler.(*relayServer); ok && relay.proxyConfig != "" {
+			currentTrust = networkProxyTrust(relay.proxyConfig, trusted)
+		}
+		if !trustedProxy(conn.RemoteAddr().String(), currentTrust) {
 			conn.Close()
 			continue
 		}
@@ -248,4 +253,25 @@ func (s *relayServer) proxyHTTP2UDP(w http.ResponseWriter, r *http.Request, conn
 	r.Body.Close()
 	conn.Close()
 	<-done
+}
+
+// Reload private UI settings for new connections; malformed saved data denies access.
+func networkProxyTrust(path string, fallback []netip.Prefix) []netip.Prefix {
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return fallback
+	}
+	if err != nil {
+		return nil
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if value, ok := strings.CutPrefix(line, "PROXY_CIDRS="); ok {
+			prefixes, err := parseTrustedProxies(value)
+			if err == nil {
+				return prefixes
+			}
+			return nil
+		}
+	}
+	return nil
 }

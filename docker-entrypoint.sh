@@ -16,9 +16,9 @@ LOG_DIR=/var/log/openvpn
 SERVER_CONF=$OPENVPN_DIR/server.conf
 MGMT_PW_FILE=$OPENVPN_DIR/config/management.pw
 
-TRUST_SUB=${TRUST_SUB:-10.0.70.0/24}
-GUEST_SUB=${GUEST_SUB:-10.0.70.128/25}
-HOME_SUB=${HOME_SUB:-170.134.51.0/24}
+TRUST_SUB=${TRUST_SUB:-}
+GUEST_SUB=${GUEST_SUB:-}
+LAN_CIDRS=${HOME_SUB:-}
 GUEST_BLOCK=${GUEST_BLOCK:-10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16}
 OVPN_STRICT_FORWARD=${OVPN_STRICT_FORWARD:-1}
 OVPN_LOG_STDOUT=${OVPN_LOG_STDOUT:-1}
@@ -30,6 +30,26 @@ OVPN_MAX_DEVICES=${OVPN_MAX_DEVICES:-10}
 log()  { printf '%s [entrypoint] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
 warn() { printf '%s [entrypoint] WARNING: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >&2; }
 die()  { printf '%s [entrypoint] ERROR: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >&2; exit 1; }
+
+source "$(dirname "${BASH_SOURCE[0]}")/bin/guest-portal.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/bin/network-settings.sh"
+mkdir -p "$OPENVPN_DIR/config/network"
+if [[ ! -f $SERVER_CONF ]]; then
+    if [[ -f $OPENVPN_DIR/config/network/server.conf ]]; then
+        cp "$OPENVPN_DIR/config/network/server.conf" "$SERVER_CONF"
+    else
+        cp "$OPENVPN_DIR/server.conf.example" "$SERVER_CONF"
+    fi
+fi
+if [[ ! -f $OPENVPN_DIR/config/client.conf ]]; then
+    if [[ -f $OPENVPN_DIR/config/network/client.conf ]]; then
+        cp "$OPENVPN_DIR/config/network/client.conf" "$OPENVPN_DIR/config/client.conf"
+    else
+        cp "$OPENVPN_DIR/config/client.conf.example" "$OPENVPN_DIR/config/client.conf"
+    fi
+fi
+load_network_settings || die "Invalid network configuration; review Settings → Network"
+chmod 600 "$SERVER_CONF" "$OPENVPN_DIR/config/client.conf"
 
 export EASYRSA_BATCH=1
 export EASYRSA_PKI=$PKI_DIR
@@ -156,7 +176,7 @@ fi
 # What server.conf says the tunnel network is, against what the firewall is told.
 conf_net=$(sed -n 's/^[[:space:]]*server[[:space:]]\+\([0-9.]\+\)[[:space:]].*/\1/p' "$SERVER_CONF" | head -1)
 if [[ -n $conf_net && $conf_net != "${TRUST_SUB%/*}" ]]; then
-    warn "server.conf hands out addresses in $conf_net but TRUST_SUB is $TRUST_SUB: clients will have no internet. Set TRUST_SUB (and GUEST_SUB) in docker-compose.yml to match."
+    warn "The VPN subnet and firewall subnet differ; review Settings → Network."
 fi
 
 # Our rules live in our own chains, flushed and rebuilt on every OpenVPN start,
@@ -172,16 +192,19 @@ chain() {   # [IPT=ip6tables] chain TABLE NAME BUILTIN -I|-A
 forward_first() { iptables -n -L DOCKER-USER >/dev/null 2>&1 && echo DOCKER-USER || echo FORWARD; }
 
 firewall() {
+    load_network_settings || return 1
     local egress dns p net dir f c v6
     egress=${OVPN_EGRESS_IFACE:-$(ip -4 route show default 2>/dev/null \
         | awk '{for (i = 1; i < NF; i++) if ($i == "dev") {print $(i + 1); exit}}')}
     egress=${egress:-eth0}
     log "Configuring iptables in the current network namespace (the host's under network_mode: host)"
-    log "Egress interface: $egress  trusted: $TRUST_SUB  guest: $GUEST_SUB  home: $HOME_SUB"
+    log "Applying the configured VPN and guest network rules"
     chain nat OVPN-NAT POSTROUTING -A
+    chain nat OVPN-PORTAL PREROUTING -I
     chain filter OVPN-INPUT INPUT -I
     chain filter OVPN-FORWARD "$(forward_first)" -I
     chain filter OVPN-ACCEPT FORWARD -A
+    guest_portal_rules -A
     iptables -t nat -A OVPN-NAT -s "$TRUST_SUB" -o "$egress" -j MASQUERADE   # guests are inside TRUST_SUB
 
     # Guests: the pushed DNS servers and the internet, nothing else - no LAN, no
@@ -192,7 +215,7 @@ firewall() {
         for p in udp tcp; do iptables -A OVPN-FORWARD -s "$GUEST_SUB" -d "$dns" -p $p --dport 53 -j ACCEPT; done
     done
     iptables -A OVPN-FORWARD -s "$GUEST_SUB" -p icmp --icmp-type echo-request -j DROP
-    for net in "$HOME_SUB" $GUEST_BLOCK; do
+    for net in $LAN_CIDRS $GUEST_BLOCK; do
         iptables -A OVPN-FORWARD -s "$GUEST_SUB" -d "$net" -j DROP
     done
     # push "route NET [MASK]": a host route without a mask; not the default routes, which would
@@ -259,7 +282,7 @@ firewall() {
         warn "No mangle table on this host - the TCP MSS is left alone"
     fi
 
-    for c in nat:OVPN-NAT filter:OVPN-INPUT filter:OVPN-FORWARD filter:OVPN-ACCEPT mangle:OVPN-MSS; do
+    for c in nat:OVPN-NAT nat:OVPN-PORTAL filter:OVPN-INPUT filter:OVPN-FORWARD filter:OVPN-ACCEPT mangle:OVPN-MSS; do
         iptables -t "${c%%:*}" -S "${c#*:}" 2>/dev/null | sed 's/^/    /' || true
     done
     for c in OVPN-INPUT OVPN-FORWARD; do
@@ -271,6 +294,8 @@ firewall() {
 # or a Docker restart can remove them behind our back.
 firewall_intact() {
     iptables -t nat -C POSTROUTING -j OVPN-NAT 2>/dev/null \
+        && iptables -t nat -C PREROUTING -j OVPN-PORTAL 2>/dev/null \
+        && guest_portal_rules -C 2>/dev/null \
         && iptables -t nat -S OVPN-NAT 2>/dev/null | grep -q MASQUERADE \
         && iptables -C INPUT -j OVPN-INPUT 2>/dev/null \
         && iptables -C OVPN-INPUT -i 'tun+' -s "$GUEST_SUB" -j DROP 2>/dev/null \
@@ -332,7 +357,7 @@ int2ip() { echo "$(( $1 >> 24 & 255 )).$(( $1 >> 16 & 255 )).$(( $1 >> 8 & 255 )
 prepare_access() {
     local net=$(ip2int "${GUEST_SUB%/*}") size=$(( 1 << (32 - ${GUEST_SUB#*/}) ))
     local mask=$(sed -n 's/^[[:space:]]*server[[:space:]]\+[0-9.]\+[[:space:]]\+\([0-9.]\+\).*/\1/p' "$SERVER_CONF" | head -1)
-    # "ifconfig-ipv6 fd00:70::1/64 ..." -> V6_BASE=fd00:70:: V6_BITS=64 V6_GW=fd00:70::1
+    # "ifconfig-ipv6 fd00:8::1/64 ..." -> V6_BASE=fd00:8:: V6_BITS=64 V6_GW=fd00:8::1
     local v6=$(sed -n 's/^[[:space:]]*ifconfig-ipv6[[:space:]]\+\([0-9a-fA-F:]*::\)\([0-9a-fA-F]\+\)\/\([0-9]\+\).*/\1 \2 \3/p' "$SERVER_CONF" | head -1)
     local v6base v6host v6bits; read -r v6base v6host v6bits <<< "$v6"
     printf 'GUEST_FIRST=%s\nGUEST_LAST=%s\nNETMASK=%s\nV6_BASE=%s\nV6_BITS=%s\nV6_GW=%s\nMAX_DEVICES=%d\n' \

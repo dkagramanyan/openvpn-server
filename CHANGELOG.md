@@ -1,3 +1,4 @@
+<!-- Network addresses in examples are synthetic; deployment-specific notes are omitted. -->
 # Changelog
 
 ## Unreleased
@@ -44,7 +45,7 @@
   cellular recovery still requires deployment testing.
 
 
-* Prefill new relay settings with `HOME_SUB` (`170.134.51.0/24` by default),
+* Prefill new relay settings with the locally configured LAN networks,
   preserving saved destination networks.
 * Static asset URLs follow their content hashes, so rebuilt UI assets refresh
   even without a release-version bump. Static responses require revalidation.
@@ -68,7 +69,7 @@ A security and reliability release, from a review of the whole service.
 
 ### Security
 * **Guests could reach a network the server pushes a route to.** The guest
-  rules covered `HOME_SUB` and the private ranges, but not `171.134.51.0/24`
+  rules covered `HOME_SUB` and the private ranges, but not `203.0.113.0/24`
   from `server.conf`. Guests are now blocked from every pushed route.
 * **IPv6 from VPN clients was not filtered.** All firewall rules were IPv4.
   With kernel offload (DCO) a client that ignores the pushed `block-ipv6`
@@ -152,7 +153,7 @@ A security and reliability release, from a review of the whole service.
 * The live stream of a signed-out session kept running.
 * Two PKI operations at once (a double click on **Create**, a backup during a
   renewal) could collide; they now run one after the other.
-* A static IP such as `10.0.70.07`, or a mistyped network in `server.conf`,
+* A static IP such as `10.8.0.07`, or a mistyped network in `server.conf`,
   made pages fail with a server error.
 * The UI read the management password once, at start; on a first start it
   could come up before the server had written it.
@@ -168,7 +169,7 @@ A security and reliability release, from a review of the whole service.
   `openvpn://` link (they now open the page); make new ones.
 * If some certificate is in use on more than 10 devices at once, raise
   `OVPN_MAX_DEVICES` in `docker-compose.yml`.
-* If you added a `GUEST_BLOCK` line for `171.134.51.0/24`, it is no longer
+* If you added a `GUEST_BLOCK` line for `203.0.113.0/24`, it is no longer
   needed (and does no harm).
 * Not changed: kernel offload (DCO) stays on. OpenVPN 2.7.7 has an open bug
   in it that can end the server process (it restarts within seconds); the
@@ -244,12 +245,7 @@ A security and reliability release, from a review of the whole service.
 ## 1.4.2 - 2026-09-27
 
 ### Changed
-* Clients get DNS `170.134.51.1` again, as on the old server: it answers the
-  home domains with LAN addresses, so clients reach home services directly
-  instead of looping through the public IP (Traefik saw every VPN client as
-  `171.134.51.1`). The pushed route is `171.134.51.0/24` again, like before,
-  instead of `170.134.51.0/24`.
-
+* Corrected network and DNS behavior. Deployment-specific values are omitted.
 ## 1.4.1 - 2026-09-27
 
 ### Fixed
@@ -261,9 +257,9 @@ A security and reliability release, from a review of the whole service.
   thread: 200 open streams leave `/healthz` at under 10 ms.
 * **Duplicate IPv6 addresses.** A pushed IPv4 address (guests, static IPs)
   left OpenVPN's IPv6 pool out of step, so two devices could get the same
-  `fd00:70::` address ("MULTI_sva: WARNING: if --ifconfig-push is used for
+  `fd00:8::` address ("MULTI_sva: WARNING: if --ifconfig-push is used for
   IPv4 ..."). `client-access.sh` now pushes an IPv6 address derived from the
-  IPv4 one (`10.0.70.129` -> `fd00:70::a00:4681`).
+  IPv4 one (`10.8.0.129` -> `fd00:8::a08:81`).
 
 ## 1.4.0 - 2026-09-27
 
@@ -272,7 +268,7 @@ A security and reliability release, from a review of the whole service.
   `bin/client-access.sh` (client-connect) gives every device of a guest a free
   address from the guest range, and a static IP to the first device only.
   Guests are now a marker (`guests/<name>`) instead of a static IP; 1.3 guests
-  are converted on start. Pool `10.0.70.2-99`, static IPs `10.0.70.100-127`.
+  are converted on start. Pool `10.8.0.2-99`, static IPs `10.8.0.100-127`.
 * **Full access / Guest switch** on the client page.
 * **One-time profile links** (Share link): a link valid once, for 1 h to 7 days,
   with a QR code of its `openvpn://import-profile/` form for OpenVPN Connect.
@@ -285,7 +281,7 @@ A security and reliability release, from a review of the whole service.
   until you switch.
 * DNS is also pushed as `dns server` (OpenVPN 2.6+, Connect 3).
 * IPv6 no longer leaks around the tunnel: it is routed into it (private
-  `fd00:70::/64`) and answered there with "no route" (`block-ipv6`). Verified
+  `fd00:8::/64`) and answered there with "no route" (`block-ipv6`). Verified
   with a client that has IPv6: before, public IPv6 left through its own link.
 
 ### Fixed
@@ -304,11 +300,11 @@ A security and reliability release, from a review of the whole service.
 ### Upgrade notes
 * Existing certificates and profiles keep working; nothing has to be handed
   out again unless you switch to per-client keys on the Server page.
-* `server.conf` changed (`client-connect`, pool `10.0.70.2-99`, IPv6 lines,
+* `server.conf` changed (`client-connect`, pool `10.8.0.2-99`, IPv6 lines,
   `dns` push). If you edited it on the server: `git stash && git pull &&
   git stash pop`, then `docker compose up -d --build`.
-* A static IP inside the new pool (`10.0.70.2-99`) is listed on the dashboard;
-  move it to `10.0.70.100-127`.
+* A static IP inside the new pool (`10.8.0.2-99`) is listed on the dashboard;
+  move it to `10.8.0.100-127`.
 
 ## 1.3.1 - 2026-09-26
 
@@ -324,7 +320,7 @@ A security and reliability release, from a review of the whole service.
   `OVPN_PUBLIC_HOST` was unchanged; the public host is now applied again.
 
 ### Changed
-* Pushed DNS server: `171.134.51.1`.
+* Pushed DNS server: `203.0.113.1`.
 
 ## 1.3.0 - 2026-09-26
 
@@ -340,10 +336,7 @@ A security and reliability release, from a review of the whole service.
   take a guest address.
 
 ### Fixed
-* The LAN is `170.134.51.0/24` (the server is 170.134.51.30): 1.2.0 set
-  `HOME_SUB`, the pushed route and the pushed DNS to 171.134.51.0/24.
-
-### Updated
+* Corrected network and DNS behavior. Deployment-specific values are omitted.
 * easy-rsa 3.2.7 (signature checked with the pinned maintainer key), Alpine
   3.24.2, Python 3.14 for the UI, uvicorn 0.54.0. OpenVPN 2.7.7, FastAPI and
   segno were already current.
@@ -355,24 +348,23 @@ A security and reliability release, from a review of the whole service.
 ## 1.2.0 - 2026-09-26
 
 ### Upgrade notes
-* Guests now use static IPs from `10.0.70.128/25`, inside the tunnel subnet:
+* Guests now use static IPs from `10.8.0.128/25`, inside the tunnel subnet:
   give existing guest clients a new static IP in the UI (the dashboard lists
   the ones OpenVPN cannot hand out). No new profiles are needed.
 * Rules from earlier releases were appended straight to `FORWARD`/`POSTROUTING`
   and stay until the host reboots or its firewall reloads; they are harmless.
 
 ### Fixed
-* Guest static IPs from the separate `10.0.71.0/24` never worked with
+* Guest static IPs from the separate `10.8.1.0/24` never worked with
   `topology subnet`: OpenVPN only accepts addresses inside the `server`
   network, and clients got a gateway outside their own subnet. The subnet is
-  now split: pool `10.0.70.2-127`, guests `10.0.70.128/25` (`nopool` +
+  now split: pool `10.8.0.2-127`, guests `10.8.0.128/25` (`nopool` +
   `ifconfig-pool`). The UI rejects static IPs outside the subnet, inside the
   pool or already taken.
 * Guests could reach the server host itself (SSH, the web UI, ...), other VPN
   clients and private networks; they are now limited to the internet and the
   pushed DNS servers, which were blocked before because they sit in `HOME_SUB`.
-* The LAN is `171.134.51.0/24` again (`HOME_SUB`, pushed route and DNS); 1.1.0
-  changed it by mistake.
+* Corrected network and DNS behavior. Deployment-specific values are omitted.
 * The UI believed `X-Forwarded-For` from any client, so the login rate limit
   could be bypassed and logged IPs forged. Only `OVPN_UI_TRUSTED_PROXIES`
   (default `127.0.0.1`) is trusted now.
@@ -413,8 +405,8 @@ A security and reliability release, from a review of the whole service.
 ### Fixed
 * The guest-isolation rules guarded a network that does not exist here:
   `HOME_SUB` still named `192.168.88.0/24` and `server.conf` pushed a route for
-  `171.134.51.0/24`, one digit away from the server's own LAN. Both now name
-  `170.134.51.0/24`.
+  `203.0.113.0/24`, one digit away from the server's own LAN. Both now name
+  `192.0.2.0/24`.
 
 ## 1.0.2 - 2026-09-12
 

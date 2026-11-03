@@ -25,7 +25,7 @@ for _ in $(seq 60); do docker exec "$NAME" docker info >/dev/null 2>&1 && break;
 
 docker save openvpn-server:e2e openvpn-ui:e2e openvpn-apple-relay:e2e postgres:18.6-alpine | docker exec -i "$NAME" docker load >/dev/null
 # The repository as git sees it: none of a real deployment's keys, database or .env.
-git -C "$ROOT" ls-files -co --exclude-standard -z | tar -C "$ROOT" --null -T - -cf - \
+git -C "$ROOT" ls-files -co --exclude-standard -z | tar -C "$ROOT" --ignore-failed-read --null -T - -cf - \
     | docker exec -i "$NAME" sh -c 'mkdir -p /srv/openvpn && tar -C /srv/openvpn -xf -'
 
 docker exec "$NAME" sh /srv/openvpn/tests/e2e/inside.sh

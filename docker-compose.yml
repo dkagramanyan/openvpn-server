@@ -12,8 +12,7 @@ services:
     environment:
       RELAY_TRANSPORT: ${APPLE_RELAY_TRANSPORT:-http2}
       RELAY_HTTP2_BIND: ${APPLE_RELAY_HTTP2_BIND:-:8444}
-      # Raspberry Pi address observed in the existing proxy logs; adjust if needed.
-      RELAY_TRUSTED_PROXIES: ${APPLE_RELAY_TRUSTED_PROXIES:-127.0.0.1/32 ::1/128 170.134.51.13/32}
+      RELAY_TRUSTED_PROXIES: ${APPLE_RELAY_TRUSTED_PROXIES:-127.0.0.1/32 ::1/128}
       RELAY_BIND: ${APPLE_RELAY_BIND:-:8443}
       RELAY_MAX_FLOWS: ${APPLE_RELAY_MAX_FLOWS:-256}
       RELAY_MAX_FLOWS_PER_CLIENT: ${APPLE_RELAY_MAX_FLOWS_PER_CLIENT:-64}
@@ -22,10 +21,12 @@ services:
       RELAY_H2_READ_IDLE: ${APPLE_RELAY_H2_READ_IDLE:-10s}
       RELAY_H2_PING_TIMEOUT: ${APPLE_RELAY_H2_PING_TIMEOUT:-5s}
       RELAY_MAX_H2_STREAMS: ${APPLE_RELAY_MAX_H2_STREAMS:-256}
+      RELAY_NETWORK_CONFIG: /etc/relay-network/proxies.conf
       RELAY_AUTH_URL: ${APPLE_RELAY_AUTH_URL:-http://127.0.0.1:8447/api/relay/authorize}
     # Only used in optional direct HTTP/3 mode; HTTP/2 needs no certificate here.
     volumes:
       - ${APPLE_RELAY_TLS_DIR:-./relay-tls}:/tls:ro
+      - ./config/network:/etc/relay-network:ro
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
     read_only: true
@@ -49,13 +50,8 @@ services:
     devices: [/dev/net/tun:/dev/net/tun]
     security_opt: [no-new-privileges:true]
     environment:
-      TRUST_SUB: "10.0.70.0/24"     # the "server" subnet in server.conf
-      GUEST_SUB: &guest_sub "10.0.70.128/25"   # guests' addresses: internet and DNS only
-      HOME_SUB: &home_sub "170.134.51.0/24"   # your LAN - guests are blocked from it
-      # Guests are also blocked from every network server.conf pushes a route to, and from:
-      # Block our public ingress too: NAT back to Traefik would appear LAN-trusted.
-      # Update 93.123.161.4/32 if the public address changes.
-      GUEST_BLOCK: &guest_block "10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16 93.123.161.4/32"
+      # Network policy is saved privately through the admin UI.
+      OVPN_STRICT_FORWARD: ${OVPN_STRICT_FORWARD:-1}
       # OVPN_EGRESS_IFACE: eth0     # auto-detected from the default route
       # OVPN_STRICT_FORWARD: "1"    # set to 0 to allow unsolicited inbound to VPN clients
       # OVPN_MSS: "1400"            # TCP MSS clamp for tunnel traffic (kernel offload has no mssfix); 0 = off
@@ -88,12 +84,9 @@ services:
       OVPN_PUBLIC_HOST: ${OVPN_PUBLIC_HOST:-}               # public address written into client profiles
       OVPN_UI_SECURE_COOKIES: ${OVPN_UI_SECURE_COOKIES:-auto} # "true" when served behind an HTTPS reverse proxy
       UVICORN_HOST: ${OVPN_UI_BIND:-0.0.0.0}                # address the UI listens on (port 8080)
-      FORWARDED_ALLOW_IPS: ${OVPN_UI_TRUSTED_PROXIES:-127.0.0.1,170.134.51.13} # proxies whose X-Forwarded-For is believed
+      FORWARDED_ALLOW_IPS: ${OVPN_UI_TRUSTED_PROXIES:-127.0.0.1} # proxies whose X-Forwarded-For is believed
       OVPN_PROFILE_BASE_URL: ${OVPN_PROFILE_BASE_URL:-}     # public base of one-time profile links (/p/...)
       OVPN_BACKUP_RECIPIENT: ${OVPN_BACKUP_RECIPIENT:-}     # age public key: backup archives are encrypted to it
-      GUEST_SUB: *guest_sub
-      HOME_SUB: *home_sub
-      GUEST_BLOCK: *guest_block
       OVPN_RELAY_TRANSPORT: ${APPLE_RELAY_TRANSPORT:-http2}
       OVPN_RELAY_REQUIRE_SIGNED: ${OVPN_RELAY_REQUIRE_SIGNED:-true}
       OVPN_RELAY_SIGNER_URL: ${OVPN_RELAY_SIGNER_URL:-}
@@ -126,13 +119,15 @@ services:
       PGDATABASE: openvpn
       PGUSER: relay_policy
       PGPASSWORD: ${RELAY_POLICY_DB_PASSWORD:?Run python3 bin/setup-env.py}
-      GUEST_SUB: *guest_sub
-      HOME_SUB: *home_sub
-      GUEST_BLOCK: *guest_block
     volumes:
       - ./pki:/etc/openvpn/pki:ro
       - ./guests:/etc/openvpn/guests:ro
-      - ./server.conf:/etc/openvpn/server.conf:ro
+      - type: bind
+        source: ./server.conf
+        target: /etc/openvpn/server.conf
+        read_only: true
+        bind: {create_host_path: false}
+      - ./config/network:/etc/openvpn/config/network:ro
     # Private CA/client key areas are hidden; only public identity state is used.
     tmpfs:
       - /tmp

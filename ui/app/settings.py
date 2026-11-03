@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import os
+import json
+import ipaddress
 import re
 from pathlib import Path
 
@@ -22,6 +24,7 @@ class Settings:
         self.database_url = _env("OVPN_DATABASE_URL", "")
         self.database_schema = _env("OVPN_DATABASE_SCHEMA", "public")
         self.server_conf = self.openvpn_dir / "server.conf"
+        self.network_file = self.openvpn_dir / "config/network/settings.conf"
         self.vars_template = self.openvpn_dir / "config" / "easy-rsa.vars"
         self.clients_dir = self.openvpn_dir / "clients"
         self.static_dir = self.openvpn_dir / "staticclients"
@@ -36,8 +39,8 @@ class Settings:
         self.public_host = _env("OVPN_PUBLIC_HOST", "").strip()
         self.secure_cookies = _env("OVPN_UI_SECURE_COOKIES", "auto").strip().lower()
         self.tfa_issuer = _env("OVPN_TFA_ISSUER", "OpenVPN").strip() or "OpenVPN"
-        self.guest_sub = _env("GUEST_SUB", "10.0.70.128/25").strip()   # same value as the openvpn service
-        self.home_sub = _env("HOME_SUB", "170.134.51.0/24").strip()
+        self._guest_sub = _env("GUEST_SUB", "").strip()
+        self.home_sub = _env("HOME_SUB", "").strip()
         self.relay_transport = _env("OVPN_RELAY_TRANSPORT", "http2").strip().lower()
         if self.relay_transport not in ("http2", "http3"):
             raise ValueError("OVPN_RELAY_TRANSPORT must be http2 or http3")
@@ -53,6 +56,30 @@ class Settings:
         self.backup_recipient = _env("OVPN_BACKUP_RECIPIENT", "").strip()
         # Public base URL of the one-time profile links (a reverse proxy forwarding /p/ to the UI).
         self.profile_base_url = _env("OVPN_PROFILE_BASE_URL", "").strip().rstrip("/")
+
+    def read_network(self):
+        try:
+            lines = self.network_file.read_text().splitlines()
+        except FileNotFoundError:
+            return {}
+        for line in lines:
+            if line.startswith("NETWORK_JSON="):
+                return json.loads(line.partition("=")[2])
+        raise ValueError("Network settings are incomplete; save them again in Settings")
+
+    @property
+    def guest_sub(self):
+        saved = self.read_network()
+        if saved:
+            return saved["guest_subnet"]
+        if self._guest_sub:
+            return self._guest_sub
+        try:
+            match = re.search(r"(?m)^\s*server\s+(\S+)\s+(\S+)", self.server_conf.read_text())
+            net = ipaddress.IPv4Network(match[1] + "/" + match[2])
+            return str(list(net.subnets(prefixlen_diff=1))[1])
+        except (OSError, ValueError, TypeError):
+            return "10.8.0.128/25"  # Generic bootstrap, replaced by UI settings.
 
     # -- management interface ---------------------------------------------
     def management_endpoint(self) -> tuple[str, int, Path | None]:

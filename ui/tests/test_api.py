@@ -20,7 +20,7 @@ TMP = Path(tempfile.mkdtemp(prefix="ovpn-ui-test-"))
 os.environ.update({
     "OPENVPN_DIR": str(TMP), "OVPN_BIN_DIR": str(ROOT / "bin"), "OVPN_LOG_DIR": str(TMP / "log"),
     "EASYRSA_DIR": "/nonexistent", "MGMT_PORT": "1", "OPENVPN_ADMIN_PASSWORD": "test-password",
-    "OVPN_UI_POLL_INTERVAL": "60",
+    "OVPN_UI_POLL_INTERVAL": "60", "HOME_SUB": "192.0.2.0/24",
 })
 
 CA_CNF = """
@@ -87,10 +87,11 @@ def build_env():
                                 "00\n-----END OpenVPN Static key V1-----\n")
     # Pin the listening sockets so the tests do not depend on the
     # deployment-specific values in the repository's server.conf.
-    conf = re.sub(r"(?m)^\s*local\s+.*\n", "", (ROOT / "server.conf").read_text())
+    conf = re.sub(r"(?m)^\s*local\s+.*\n", "", (ROOT / "server.conf.example").read_text())
     conf = conf.replace("proto udp\n", "proto udp\nlocal * 1197 udp\nlocal * 1196 tcp\n", 1)
+    conf += 'push "route 203.0.113.0 255.255.255.0"\npush "route 10.9.0.0 255.255.255.0"\n'
     (TMP / "server.conf").write_text(conf)
-    shutil.copy(ROOT / "config" / "client.conf", TMP / "config" / "client.conf")
+    shutil.copy(ROOT / "config" / "client.conf.example", TMP / "config" / "client.conf")
     (TMP / "clients" / "oath.secrets").write_text("alice:3132333435363738393031323334353637383930\n")
 
 
@@ -270,18 +271,18 @@ def test_delete_requires_revocation(client):
 
 def test_notes_static_ip_and_config(client):
     assert client.put("/api/clients/alice/note", json={"note": " laptop "}, headers=H).json() == {"note": "laptop"}
-    assert client.put("/api/clients/alice/static-ip", json={"ip": "10.0.70.100"}, headers=H).status_code == 200
-    assert (TMP / "staticclients" / "alice").read_text() == "ifconfig-push 10.0.70.100 255.255.255.0\n"
+    assert client.put("/api/clients/alice/static-ip", json={"ip": "10.8.0.100"}, headers=H).status_code == 200
+    assert (TMP / "staticclients" / "alice").read_text() == "ifconfig-push 10.8.0.100 255.255.255.0\n"
     # invalid, outside the subnet, the server itself, the dynamic pool, the guest range, taken by alice
-    for ip in ("300.1.1.1", "10.0.70.07", "10.0.71.9", "10.0.70.1", "10.0.70.50", "10.0.70.140", "10.0.70.100"):
+    for ip in ("300.1.1.1", "10.8.0.07", "10.8.1.9", "10.8.0.1", "10.8.0.50", "10.8.0.140", "10.8.0.100"):
         r = client.put("/api/clients/old/static-ip", json={"ip": ip}, headers=H)
         assert r.status_code == 400, ip
     assert "alice" in r.json()["detail"]
     row = client.get("/api/clients/alice").json()
-    assert row["note"] == "laptop" and row["static_ip"] == "10.0.70.100" and row["guest"] is False
+    assert row["note"] == "laptop" and row["static_ip"] == "10.8.0.100" and row["guest"] is False
     # a static IP left over from 1.1 (separate guest subnet) is flagged on the dashboard
-    (TMP / "staticclients" / "alice").write_text("ifconfig-push 10.0.71.9 255.255.255.0\n")
-    assert any("alice (10.0.71.9)" in w for w in client.get("/api/overview").json()["warnings"])
+    (TMP / "staticclients" / "alice").write_text("ifconfig-push 10.8.1.9 255.255.255.0\n")
+    assert any("alice (10.8.1.9)" in w for w in client.get("/api/overview").json()["warnings"])
     (TMP / "staticclients" / "alice").unlink()
     r = client.post("/api/clients", json={"name": "old"}, headers=H)
     assert r.status_code == 409 and "renew" in r.json()["detail"]
@@ -290,9 +291,9 @@ def test_notes_static_ip_and_config(client):
     assert r.status_code == 400
     assert client.get("/api/server/config/nope").status_code == 400
     # a mistyped network in server.conf is reported by OpenVPN, not by a broken dashboard
-    (TMP / "server.conf").write_text(conf.replace("server 10.0.70.0 255.255.255.0", "server 10.0.70.0 255.255.300.0"))
+    (TMP / "server.conf").write_text(conf.replace("server 10.8.0.0 255.255.255.0", "server 10.8.0.0 255.255.300.0"))
     assert client.get("/api/overview").status_code == 200
-    assert client.put("/api/clients/alice/static-ip", json={"ip": "10.0.70.100"}, headers=H).status_code == 200
+    assert client.put("/api/clients/alice/static-ip", json={"ip": "10.8.0.100"}, headers=H).status_code == 200
     (TMP / "staticclients" / "alice").unlink()
     (TMP / "server.conf").write_text(conf)
     s = client.get("/api/server").json()
@@ -356,16 +357,16 @@ def test_config_editor_refuses_lines_that_run_programs(client):
 def test_guests_get_addresses_per_device(client):
     from app import pki
     # guests are a marker, not a static IP
-    r = client.post("/api/clients", json={"name": "carol", "guest": True, "static_ip": "10.0.70.140"}, headers=H)
+    r = client.post("/api/clients", json={"name": "carol", "guest": True, "static_ip": "10.8.0.140"}, headers=H)
     assert r.status_code == 400 and "guest range" in r.json()["detail"]
     r = client.put("/api/clients/alice/access", json={"guest": True}, headers=H)
     assert r.status_code == 200 and (TMP / "guests" / "alice").exists()
     assert client.get("/api/clients/alice").json()["guest"] is True
-    assert client.put("/api/clients/alice/static-ip", json={"ip": "10.0.70.101"}, headers=H).status_code == 400
+    assert client.put("/api/clients/alice/static-ip", json={"ip": "10.8.0.101"}, headers=H).status_code == 400
     assert client.put("/api/clients/alice/access", json={"guest": False}, headers=H).status_code == 200
     assert not (TMP / "guests" / "alice").exists()
     # 1.3 guests (a static IP in the guest range) become guests with per-device addresses
-    (TMP / "staticclients" / "alice").write_text("ifconfig-push 10.0.70.129 255.255.255.0\n")
+    (TMP / "staticclients" / "alice").write_text("ifconfig-push 10.8.0.129 255.255.255.0\n")
     assert pki.migrate_guest_static_ips() == ["alice"]
     assert (TMP / "guests" / "alice").exists() and not (TMP / "staticclients" / "alice").exists()
     pki.set_guest("alice", False)
@@ -646,7 +647,7 @@ def test_full_access_relay_routes_internet_and_lan(client, configured):
     assert "Internet and LAN" in full_profile["PayloadDescription"]
     policy = client.post("/api/relay/authorize", headers={"Authorization": token}).json()
     assert policy == {"client": "alice", "guest": False, "allowed_cidrs": ["0.0.0.0/0", "::/0"],
-                      "blocked_cidrs": [], "url": configured["url"]}
+                      "blocked_cidrs": [], "url": configured["url"], "portal": None}
     # Legacy split-routing settings cannot diverge from the OpenVPN access role.
     assert client.put("/api/relay/settings", json={**configured, "route_all": False}, headers=H).json()["route_all"] is True
     assert client.post("/api/relay/authorize", headers={"Authorization": token}).json()["allowed_cidrs"] == ["0.0.0.0/0", "::/0"]
@@ -757,7 +758,7 @@ def test_guest_and_non_guest_relay_profiles(client, configured, route_all):
         assert "Guest" in profile["PayloadDisplayName"]
         policy = client.post("/api/relay/authorize", headers={"Authorization": guest_token}).json()
         assert policy["guest"] is True and policy["allowed_cidrs"] == ["0.0.0.0/0"]
-        for network in ["170.134.51.0/24", "171.134.51.0/24", "10.0.60.0/24", "10.0.70.0/24", "192.168.1.0/24"]:
+        for network in ["192.0.2.0/24", "203.0.113.0/24", "10.9.0.0/24", "10.8.0.0/24", "192.168.1.0/24"]:
             assert network in policy["blocked_cidrs"]
         assert "0.0.0.0/0" not in policy["blocked_cidrs"]
         assert client.get("/api/clients/alice").json()["relay_available"]
@@ -902,11 +903,11 @@ def test_guest_relay_denies_when_network_configuration_unreadable(client, config
 
 def test_guest_relay_blocks_configured_public_ingress(client, configured, monkeypatch):
     from app.settings import settings
-    monkeypatch.setattr(settings, "guest_block", settings.guest_block + " 93.123.161.4/32")
+    monkeypatch.setattr(settings, "guest_block", settings.guest_block + " 198.51.100.4/32")
     monkeypatch.setattr(relay, "is_guest", lambda name: True)
     _, token = download(client)
     policy = client.post("/api/relay/authorize", headers={"Authorization": token}).json()
-    assert "93.123.161.4/32" in policy["blocked_cidrs"]
+    assert "198.51.100.4/32" in policy["blocked_cidrs"]
 
 
 def test_relay_authorization_does_not_scan_client_certificates(client, configured, monkeypatch):
@@ -990,3 +991,18 @@ def test_portal_relay_activity_never_exposes_another_client(client, portal, monk
     assert 'bob' not in response.text and 'metrics' not in response.text
     assert portal.get('/api/relay/status').status_code == 403
     assert portal.put('/api/relay/signing', headers=H, json={'url':'','required':False}).status_code == 403
+
+
+def test_network_api_is_admin_only_and_private(client):
+    response = client.get("/api/network/settings")
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    assert "gateway" in response.json()
+    assert client.put("/api/network/settings", json=response.json()).status_code == 403
+    cookies = dict(client.cookies)
+    client.cookies.clear()
+    try:
+        assert client.get("/api/network/settings").status_code == 401
+        assert client.get("/api/network/traefik.json").status_code == 401
+    finally:
+        client.cookies.update(cookies)

@@ -226,7 +226,7 @@ def vpn_subnet() -> tuple[ipaddress.IPv4Network, tuple[int, int]] | None:
 def static_ip_problem(name: str, ip: str) -> str | None:
     """Why OpenVPN could not hand out <ip> to <name> as a static address, or None."""
     try:
-        addr = ipaddress.IPv4Address(ip)        # stricter than IP_RE: no "10.0.70.07"
+        addr = ipaddress.IPv4Address(ip)        # stricter than IP_RE: no "10.8.0.07"
     except ValueError:
         return "Invalid IPv4 address"
     subnet = vpn_subnet()

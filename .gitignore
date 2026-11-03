@@ -8,3 +8,9 @@ backups/
 relay-tls/
 *.mobileconfig
 .env-*
+config/network/
+*.private.json
+server.conf.bak
+server.conf
+config/client.conf
+config/client.conf.bak

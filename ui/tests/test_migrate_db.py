@@ -27,7 +27,7 @@ def legacy(path):
         source.execute("INSERT INTO web_sessions VALUES('web-session',41,100,9000000000,'203.0.113.1','iOS')")
         source.execute("INSERT INTO clients VALUES('alice',?,100)", ("Дом '50%' ?",))
         source.execute("INSERT INTO hidden_certs VALUES('AAAA','old',110)")
-        source.execute("INSERT INTO vpn_sessions VALUES(95,'alice',3,'203.0.113.1:1234','10.0.70.2',NULL,'AES-256-GCM',100,120,130,4294967297,8589934593,'udp','ios','3.7','left',95)")
+        source.execute("INSERT INTO vpn_sessions VALUES(95,'alice',3,'203.0.113.1:1234','10.8.0.2',NULL,'AES-256-GCM',100,120,130,4294967297,8589934593,'udp','ios','3.7','left',95)")
         for table in ('traffic_minute', 'traffic_hour', 'traffic_day'):
             source.execute(f"INSERT INTO {table} VALUES(100,'alice',4294967297,8589934593)")
         source.execute("INSERT INTO events VALUES(74,100,'test','alice','admin','preserved')")

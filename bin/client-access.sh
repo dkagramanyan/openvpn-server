@@ -49,7 +49,7 @@ client-connect)
         echo "$me" > "$LEASES/$ip"
         echo "ifconfig-push $ip $NETMASK" > "$1"
         # OpenVPN's IPv6 pool is tied to its IPv4 pool, so a pushed IPv4 address needs its
-        # own IPv6 one: the IPv4 address as the last 32 bits (10.0.70.129 -> fd00:70::a00:4681).
+        # own IPv6 one: the IPv4 address as the last 32 bits (10.8.0.129 -> fd00:8::a08:81).
         n=$(ip2int "$ip")
         [[ -n ${V6_BASE:-} ]] && printf 'ifconfig-ipv6-push %s%x:%x/%s %s\n' \
             "$V6_BASE" $(( n >> 16 )) $(( n & 65535 )) "$V6_BITS" "$V6_GW" >> "$1"

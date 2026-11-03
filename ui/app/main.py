@@ -21,7 +21,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Str
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import __version__, auth, backup, pki, relay, relay_services, watchdog
+from . import __version__, auth, backup, pki, relay, relay_services, watchdog, network
 from .collector import Collector, Maintenance
 from .db import Database
 from .mgmt import Management, ManagementError
@@ -51,6 +51,7 @@ limiter = auth.LoginLimiter()
 
 # -- startup ---------------------------------------------------------------------
 def bootstrap() -> None:
+    settings.network_file.parent.mkdir(parents=True, exist_ok=True)
     # Ensure mount targets before the policy container masks private key areas.
     for relative in ("private", "renewed", "revoked"):
         (settings.pki_dir / relative).mkdir(parents=True, exist_ok=True)
@@ -120,6 +121,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="OpenVPN UI", version=__version__, lifespan=lifespan,
               docs_url=None, redoc_url=None, openapi_url=None)
+app.add_middleware(network.NetworkProxyHeaders)
 
 
 @app.middleware("http")
@@ -1096,6 +1098,24 @@ def events(limit: int = 100, user: dict[str, Any] = Authed):
 def get_settings(user: dict[str, Any] = Authed):
     return {"remote": pki.get_remote(), "listen": pki.server_listen(), "tfa_issuer": settings.tfa_issuer,
             "poll_interval": settings.poll_interval, "version": __version__}
+
+
+@app.get("/api/network/settings")
+def get_network_settings(user: dict[str, Any] = Authed):
+    return JSONResponse(network.get_settings(), headers={"Cache-Control": "no-store"})
+
+
+@app.put("/api/network/settings", dependencies=[Csrf])
+def put_network_settings(body: network.NetworkSettings, user: dict[str, Any] = Authed):
+    result = network.save_settings(body)
+    event("network_settings_changed", user)  # Never put network values in audit events.
+    return result
+
+
+@app.get("/api/network/traefik.json")
+def download_gateway_network(user: dict[str, Any] = Authed):
+    return JSONResponse(network.export_gateway(), headers={"Cache-Control": "no-store",
+        "Content-Disposition": 'attachment; filename="network.private.json"'})
 
 
 @app.put("/api/settings", dependencies=[Csrf])

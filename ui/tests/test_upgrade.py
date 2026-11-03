@@ -14,6 +14,9 @@ ROOT = Path(__file__).resolve().parents[2]
 @pytest.mark.parametrize('failure', ['', 'build', 'import'])
 def test_upgrade_orders_database_migration_before_recreation_and_recovers(failure, tmp_path):
     (tmp_path / 'bin').mkdir()
+    (tmp_path / 'config').mkdir()
+    shutil.copy(ROOT / 'server.conf.example', tmp_path / 'server.conf.example')
+    shutil.copy(ROOT / 'config/client.conf.example', tmp_path / 'config/client.conf.example')
     for name in ('setup-env.py', 'upgrade-relay.sh'):
         shutil.copy(ROOT / 'bin' / name, tmp_path / 'bin' / name)
     (tmp_path / '.env').write_text("OVPN_PUBLIC_HOST=existing.example.com\nOPENVPN_ADMIN_PASSWORD='keep-this-value'\nOPENVPN_DB_PASSWORD='existing-db-secret'\nAPPLE_RELAY_AUTH_URL=http://127.0.0.1:8080/api/relay/authorize\n")
@@ -53,6 +56,8 @@ if (os.environ['FAIL_STAGE'] == 'build' and args[:2] == ['compose','build']) or 
     assert 'OVPN_PUBLIC_HOST=existing.example.com' in content
     assert '127.0.0.1:8447/api/relay/authorize' in content
     assert (tmp_path / '.env').stat().st_mode & 0o777 == 0o600
+    assert (tmp_path / 'server.conf').is_file()
+    assert (tmp_path / 'config/client.conf').is_file()
     subprocess.run([sys.executable, str(tmp_path / 'bin/setup-env.py')], check=True, capture_output=True)
     assert (tmp_path / '.env').read_text() == content
     assert 'existing-db-secret' not in result.stdout + result.stderr

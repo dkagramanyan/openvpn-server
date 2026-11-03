@@ -29,7 +29,7 @@ class FakeMgmt:
 
 
 def client(cn, cid, since, b_in, b_out):
-    return {"cn": cn, "real_address": "1.2.3.4:5", "vpn_ip": "10.0.70.2", "vpn_ipv6": "", "bytes_in": b_in,
+    return {"cn": cn, "real_address": "1.2.3.4:5", "vpn_ip": "10.8.0.2", "vpn_ipv6": "", "bytes_in": b_in,
             "bytes_out": b_out, "connected_since": since, "username": "", "cid": cid, "peer_id": 0, "cipher": ""}
 
 
@@ -82,7 +82,7 @@ def test_status_file_is_preferred_and_unchanged_file_is_skipped(tmp_path):
     def write(t, b_in):
         f.write_text(f"TITLE\tx\nTIME\tx\t{t}\nHEADER\tCLIENT_LIST\tCommon Name\tVirtual Address\tBytes Received"
                      f"\tBytes Sent\tConnected Since (time_t)\tClient ID\n"
-                     f"CLIENT_LIST\talice\t10.0.70.2\t{b_in}\t0\t{now - 60}\t3\nEND\n")
+                     f"CLIENT_LIST\talice\t10.8.0.2\t{b_in}\t0\t{now - 60}\t3\nEND\n")
 
     c = Collector(db, mgmt, 5, lambda: (f, 5))
     write(now - 10, 1000)

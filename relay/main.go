@@ -41,6 +41,7 @@ type relayServer struct {
 	maxH2Streams     int
 	h2ReadIdle       time.Duration
 	h2PingTimeout    time.Duration
+	proxyConfig      string
 }
 
 // Revalidate live tunnels as well as new requests. Policy changes, expiry,
@@ -59,7 +60,7 @@ func (s *relayServer) watch(ctx context.Context, token string, addr netip.Addr, 
 				closeFlow()
 				return
 			}
-			if err != nil || p.URL != origin || !p.allows(addr) {
+			if err != nil || p.URL != origin || !(p.allows(addr) || s.portalFlow(ctx, addr, p)) {
 				reason := "access_revoked"
 				if err != nil && !errors.Is(err, errAccessDenied) {
 					reason = "authorization_unavailable"
@@ -158,7 +159,8 @@ func (s *relayServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		flow.event.Counted = udpReq == nil || r.ProtoMajor == 2
 	}
 	resolved := time.Now()
-	addresses, err := resolveAll(ctx, target, p)
+	ctx, addresses, err := s.resolveDestination(ctx, target, p, udpReq == nil)
+	r = r.WithContext(ctx)
 	s.metrics.observe("dns_lookups", resolved)
 	if err != nil {
 		switch {
@@ -284,7 +286,8 @@ func main() {
 		log.Fatal(err)
 	}
 	handler := &relayServer{
-		api: env("RELAY_AUTH_URL", "http://127.0.0.1:8447/api/relay/authorize"),
+		proxyConfig: os.Getenv("RELAY_NETWORK_CONFIG"),
+		api:         env("RELAY_AUTH_URL", "http://127.0.0.1:8447/api/relay/authorize"),
 		client: &http.Client{Timeout: 3 * time.Second, Transport: &http.Transport{Proxy: nil, MaxIdleConnsPerHost: 32, IdleConnTimeout: 90 * time.Second},
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
 		slots: make(chan struct{}, maximum), recheck: 5 * time.Second, policyTTL: time.Second,

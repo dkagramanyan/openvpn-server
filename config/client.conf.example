@@ -1,3 +1,4 @@
+# Generic profile template; the UI writes private runtime config/client.conf.
 client
 dev tun
 remote 127.0.0.1 1197 udp

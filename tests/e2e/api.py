@@ -48,7 +48,7 @@ def check():
     assert next(s for s in alice if s["proto"] == "tcp")["end_reason"] in ("closed", "left")
     assert bob[0]["end_reason"] == "timed out"
     first = alice[-1]
-    assert first["bytes_in"] > 0 and first["bytes_out"] > 0 and first["vpn_ip"].startswith("10.0.70.")
+    assert first["bytes_in"] > 0 and first["bytes_out"] > 0 and first["vpn_ip"].startswith("10.8.0.")
 
     # alice's five connections came from one address within minutes: one visit
     visits = call("/api/sessions?merge=true")

@@ -7,15 +7,18 @@ import (
 	"net"
 	"net/netip"
 	"strconv"
+	"strings"
 	"time"
 )
 
 type policy struct {
-	Client          string   `json:"client"`
-	CIDRs           []string `json:"allowed_cidrs"`
-	URL             string   `json:"url"`
-	Guest           bool     `json:"guest"`
-	Blocked         []string `json:"blocked_cidrs"`
+	Client          string        `json:"client"`
+	CIDRs           []string      `json:"allowed_cidrs"`
+	URL             string        `json:"url"`
+	Guest           bool          `json:"guest"`
+	Blocked         []string      `json:"blocked_cidrs"`
+	Portal          *portalConfig `json:"portal"`
+	portal          *guestPortal
 	compiled        bool
 	allowedPrefixes []netip.Prefix
 	blockedPrefixes []netip.Prefix
@@ -32,6 +35,13 @@ var guestSpecial = func() []netip.Prefix {
 
 // Compile CIDRs once per fresh policy, including a fresh interface snapshot.
 func (p *policy) compile() error {
+	if p.Portal != nil && p.Guest && p.Portal.Enabled {
+		var err error
+		p.portal, err = parseGuestPortal(p.Portal.Host, p.Portal.Target, strings.Join(p.Portal.Destinations, " "))
+		if err != nil {
+			return err
+		}
+	}
 	for _, group := range []struct {
 		source []string
 		target *[]netip.Prefix

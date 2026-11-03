@@ -172,18 +172,14 @@ are enforced by the relay regardless of transport.
 
 To enable it:
 
-1. Keep `APPLE_RELAY_TRANSPORT=http2` (the default) and set
-   `APPLE_RELAY_TRUSTED_PROXIES` to the Traefik machine's LAN address as a `/32`.
-   The supplied Compose default is `170.134.51.13/32`, based on the existing
-   Raspberry Pi proxy logs, plus loopback for local diagnostics. Adjust it if
-   the Pi uses another address. The backend checks the actual TCP peer and
-   ignores forwarded headers for trust. It listens on **TCP 8444**, configurable
-   with `APPLE_RELAY_HTTP2_BIND`; only the proxy needs to reach this LAN port.
-2. Configure Traefik as described in [Traefik HTTP/2 setup](#traefik-http2-setup):
-   public **TCP 8443** terminates TLS at the Pi, then forwards the decrypted
-   HTTP/2 connection to `170.134.51.30:8444`. Traefik keeps obtaining and renewing
-   the certificate. No certificate, private key or ACME store needs to be copied
-   to the OpenVPN host. The Pi-to-server hop is unencrypted on the trusted LAN.
+1. Keep `APPLE_RELAY_TRANSPORT=http2` (the default). In **Settings → Network and
+   private portal**, enter the gateway's actual source address under **Trusted
+   reverse proxy CIDRs**. The initial trust list contains loopback only.
+   The backend checks the TCP peer and ignores forwarded headers for trust.
+2. Enter the gateway and relay backend details in that same UI, download the
+   private Traefik settings and import them on the gateway. Traefik terminates
+   TLS with ALPN `h2` and forwards HTTP/2 to the relay's LAN listener. Keep the
+   unencrypted backend hop on a trusted network.
 3. Start the services:
 
    ```shell
@@ -192,7 +188,7 @@ To enable it:
 
 4. In the existing UI, open **Settings → Apple Network Relay**. Set the public
    URL (e.g. `https://relay.example.com:8443`) and LAN CIDRs (e.g.
-   `170.134.51.0/24`) that guests must not reach. Access follows each client’s
+   `192.0.2.0/24`) that guests must not reach. Access follows each client’s
    OpenVPN role: guests have internet only; full-access clients have internet
    and LAN. Enable and save. Names such as `nas.home.arpa` must resolve to the intended
    LAN addresses **from the relay container**; configure its DNS in Compose if
@@ -240,10 +236,17 @@ between the OpenVPN and UI services; pushed routes and the relay's allowed LAN
 CIDRs are also excluded from guest egress. Include public NAT addresses that
 forward to protected LAN services in `GUEST_BLOCK`: otherwise a guest can loop
 back through the public address and appear LAN-trusted to a reverse proxy.
-The supplied Compose file includes this deployment's public ingress
-`93.123.161.4/32`; update it if the public address changes. This block applies
+Enter your own public ingress addresses under **Other networks blocked for
+guests** in Settings → Network. This block applies
 to both OpenVPN guests and relay guests, including public services sharing
 that address.
+
+An optional [private portal exception](https://github.com/dkagramanyan/traefik#private-portal-for-lan-openvpn-guests-and-apple-relay-guests)
+uses a separate Traefik listener serving only portal paths. Enter the portal hostname, target and DNS addresses in Settings → Network after
+deploying that listener. This does not remove the guest LAN blocks: OpenVPN
+redirects only guest TCP 443 connections to the listed IPv4 destinations, and
+the relay pins only the portal hostname/addresses to that listener. Authentication
+and live relay revocation checks still apply. Clear the portal enable checkbox to disable it.
 
 | Access type | OpenVPN | Apple relay |
 |---|---|---|
@@ -307,7 +310,7 @@ docker compose up -d --build --no-deps apple-relay
 ```
 
 For HTTP/2, verify WAN TCP 8443 reaches Traefik, its TCP router forwards to the
-backend's TCP 8444, and `APPLE_RELAY_TRUSTED_PROXIES` matches the Pi's source IP.
+backend's TCP 8444, and the trusted proxy CIDRs in Settings match the gateway source address.
 An ordinary Traefik HTTP router rejects CONNECT; use a TCP router with TLS termination.
 A successful profile download in the UI logs only confirms profile generation;
 Relay activity in the UI and `/readyz` provide the policy/data-path diagnostics;
@@ -322,7 +325,7 @@ API and profile tests are included in `python -m pytest ui/tests -q`.
 ### Automatic signed profiles
 
 The UI can return CMS-signed `.mobileconfig` downloads using the certificate
-Traefik already manages. The signer runs on the Raspberry Pi with read-only
+Traefik already manages. The signer runs on the gateway with read-only
 access to `letsencrypt/acme.json`; private keys never move to the OpenVPN host.
 It selects a valid, publicly trusted identity for the configured hostname,
 includes its intermediate chain, and reloads renewed certificates without a
@@ -333,21 +336,21 @@ or an unavailable signer returns 503 and never silently produces unsigned XML.
 An administrator can explicitly allow unsigned downloads for development. Installed profiles continue using their relay
 credentials independently of the signer.
 
-The Raspberry Pi deployment lives in the separate
+The gateway deployment lives in the separate
 [Traefik repository](https://github.com/dkagramanyan/traefik#automatic-profile-signing).
-It owns the Pi's Compose stack, routes, monitoring and certificate paths. Follow
+It owns the gateway's Compose stack, routes, monitoring and certificate paths. Follow
 its migration instructions to retain the existing ACME store and Docker volumes.
 The optional `profile-signing` Compose profile builds the signer from a pinned
-revision of this public application's source; the Pi needs no OpenVPN checkout.
+revision of this public application's source; the gateway needs no OpenVPN checkout.
 
-Generate a shared token with `openssl rand -hex 32`. In the Pi's existing `.env`,
+Generate a shared token with `openssl rand -hex 32`. In the gateway's existing `.env`,
 set `COMPOSE_PROFILES=profile-signing` and `RELAY_PROFILE_SIGNING_TOKEN` to that
 value, then run `sudo docker compose up -d --build` from its deployment folder.
 The HTTPS signing route publishes no additional host port and accepts only the
-OpenVPN host at `170.134.51.30`, authenticated with the shared token.
+configured OpenVPN backend, authenticated with the shared token.
 
 On the OpenVPN host, open **Relay → Profile signing**. Set the signer URL to
-`https://openvpn.dgkagramanyan.ru/internal/relay-sign` and paste the **existing**
+`https://openvpn.example.com/internal/relay-sign` and paste the **existing**
 `RELAY_PROFILE_SIGNING_TOKEN` from the Traefik `.env`. Keep **Require signed
 relay profiles** checked, save, and check for **Signed downloads enabled**.
 The token field is write-only; blank input keeps the existing token. These UI
@@ -358,7 +361,7 @@ The policy service cannot read them. Keep tokens and downloaded profiles private
 Alternatively, add to the OpenVPN host's existing `.env`:
 
 ```dotenv
-OVPN_RELAY_SIGNER_URL=https://openvpn.dgkagramanyan.ru/internal/relay-sign
+OVPN_RELAY_SIGNER_URL=https://openvpn.example.com/internal/relay-sign
 RELAY_PROFILE_SIGNING_TOKEN=THE_SAME_GENERATED_VALUE
 ```
 
@@ -437,18 +440,16 @@ ISP, proxy, authorization-service or server outage.
 
 ### Traefik HTTP/2 setup
 
-Production Pi configuration is maintained in
-[dkagramanyan/traefik](https://github.com/dkagramanyan/traefik#network-paths),
-separately from this VPN application. Keep the working relay URL
-**`https://dgkagramanyan.ru:8443`** and WAN **TCP 8443 forwarded to the Pi**.
-That repository includes the entry point, Docker port mapping and TCP route to
-`170.134.51.30:8444`, plus the existing websites, access rules and Zoraxy fallback.
-Use its migration helper to adopt the existing deployment directory.
+Gateway configuration is maintained in the separate
+[Traefik repository](https://github.com/dkagramanyan/traefik#network-settings-from-the-admin-ui).
+Enter its hosts, backend addresses and private-service inventory in the admin UI,
+then import the downloaded private settings on the gateway. No deployment
+addresses or services are shipped in the routing template.
 
-For another proxy deployment, the relay requires a TCP router that terminates
-TLS, negotiates ALPN `h2` and forwards decrypted HTTP/2 to the relay backend.
-Set `APPLE_RELAY_TRUSTED_PROXIES` to the proxy's actual source address. Keep the
-backend on the trusted LAN. Website routes stay on port 443.
+The relay needs a TCP router that terminates TLS, negotiates ALPN `h2` and
+forwards decrypted HTTP/2 to its backend. Set the trusted proxy CIDRs in the UI
+to the proxy's actual source addresses. Keep that backend on a trusted LAN.
+Website routes stay on port 443.
 [Traefik's TCP TLS documentation](https://doc.traefik.io/traefik/reference/routing-configuration/tcp/tls/)
 describes termination; its [CONNECT guidance](https://doc.traefik.io/traefik/migrate/v3/#connect-requests)
 directs forward-proxy tunnels through TCP routers.
@@ -473,6 +474,37 @@ store. Follow your proxy deployment's certificate-transfer procedure, then
 restart `apple-relay` after installing renewed files. Keep private keys local
 and out of Git. Installed profiles remain valid when the hostname stays the same.
 
+## Private network configuration
+
+Use **Settings → Network and private portal** for VPN addressing, DNS, LAN and
+additional guest blocks, trusted reverse proxies, the private portal, and gateway
+services. Values are saved in `config/network/settings.conf` with mode 0600. This
+directory is excluded from Git and container build contexts. Network changes also
+update your installed `server.conf`; save and restart OpenVPN to apply them.
+Runtime `server.conf` and `config/client.conf` are ignored; only generic `.example`
+templates are shipped.
+
+Before upgrading a checkout that tracked its live configuration, preserve it:
+
+```sh
+mkdir -p config/network
+cp server.conf config/network/server.conf
+cp config/client.conf config/network/client.conf
+chmod 600 config/network/*.conf
+```
+
+Do this **before pulling** the update that replaces tracked configs with templates.
+The entrypoint restores those private copies if the runtime files are absent.
+It keeps existing runtime files and only uses generic templates on a new install.
+
+The initial VPN range is a generic bootstrap network, not a deployment example.
+Existing server settings populate the form. Fill in your own LAN and public
+loopback destinations before admitting guest clients. Download the gateway export
+and import it with `./manage setup --network-file /path/to/network.private.json`
+in the Traefik checkout; no hand-edited network environment values are required.
+The export contains network information and should remain private. Credentials
+remain in local secret storage; they are not included in the export.
+
 ## User download portal
 
 Administrators can create or reset a personal website login from
@@ -484,22 +516,24 @@ OpenVPN and relay downloads. Revocation, expiry, deletion or an unexpected
 certificate replacement denies portal access; renewal through the UI preserves it.
 These website passwords are separate from OpenVPN key passphrases and TOTP.
 
-Users sign in at **`https://openvpn.dgkagramanyan.ru/portal`** to download their
+Users sign in at **`https://openvpn.example.com/portal`** to download their
 own OpenVPN config and automatically signed Apple relay profile, and change
 their own password. They have no access to other clients, server settings,
 relay logs, credentials or administrator endpoints. The backend enforces this
 for every administrative API, including direct requests outside the frontend.
-Admin credentials are rejected by the public portal login endpoint.
+Admin credentials are rejected by the user portal login endpoint.
 
 Deploy [the portal route from the Traefik repository](https://github.com/dkagramanyan/traefik/blob/main/dynamic/portal.yml)
-to make `/portal`, `/api/portal` and static assets reachable from outside the home
-network. This is necessary for guests and first-time users who do not yet have
-a VPN profile. The administrative website and APIs retain the existing
-`trusted-only` rule. Sign-in throttling, CSRF checks and secure cookie settings
+to serve `/portal`, `/api/portal` and static assets to explicitly allowed source
+networks. Configure its dedicated private listener and the guest portal exception
+above for remote OpenVPN/relay guests; the portal stays unavailable from the public
+internet. First-time users need their initial profile delivered privately or LAN
+access. The administrative website and APIs retain the existing `trusted-only`
+rule. Sign-in throttling, CSRF checks and secure cookie settings
 apply to both interfaces. Keep the existing `OVPN_UI_SECURE_COOKIES` and trusted
 proxy settings appropriate for your HTTPS reverse proxy.
-For this Pi, include `170.134.51.13` in `OVPN_UI_TRUSTED_PROXIES` and serve cookies
-securely over HTTPS. Correct proxy trust also gives each user's real source IP
+Enter your gateway source address in **Trusted reverse proxy CIDRs** and serve
+cookies securely over HTTPS. Correct proxy trust also gives each user's real source IP
 to the login limiter instead of combining all users under the proxy's IP.
 
 ## Layout
@@ -599,9 +633,9 @@ Environment variables of the `openvpn` service:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `TRUST_SUB` | `10.0.70.0/24` | the `server` subnet (NAT) |
-| `GUEST_SUB` | `10.0.70.128/25` | the addresses guests get: internet and DNS only (also given to the UI) |
-| `HOME_SUB` | `170.134.51.0/24` | your LAN, hidden from guests |
+| VPN subnet | From `server.conf` | Configure in Settings → Network |
+| Guest subnet | Upper half of the bootstrap VPN network | Configure in Settings → Network |
+| LAN networks | Empty | Enter your own LANs in Settings → Network |
 | `GUEST_BLOCK` | RFC 1918, CGNAT, link-local | further ranges hidden from guests, next to every network `server.conf` pushes a route to |
 | `OVPN_EGRESS_IFACE` | default-route interface | interface used for MASQUERADE |
 | `OVPN_STRICT_FORWARD` | `1` | only VPN-originated traffic and replies are forwarded |
@@ -725,11 +759,11 @@ http:
       tls: { certResolver: letsencrypt }
   services:
     ovpn-ui:
-      loadBalancer: { servers: [{ url: "http://170.134.51.30:8080" }] }
+      loadBalancer: { servers: [{ url: "http://192.0.2.30:8080" }] }
 ```
 
-In Zoraxy, a proxy rule for the host with a virtual directory `/p/` pointing at
-`170.134.51.30:8080` does the same. Set `OVPN_UI_TRUSTED_PROXIES` to the
+With another reverse proxy, forward the `/p/` path to the UI backend. Set the
+trusted proxy CIDRs in Settings to the
 proxy's address so failed attempts are rate limited per visitor, not per proxy.
 
 ## CLI
@@ -752,14 +786,14 @@ from it, and dropping a revoked entry would make that certificate valid again.
 
 ## Subnets, guests, devices and the firewall
 
-`server 10.0.70.0 255.255.255.0 nopool` is one tunnel subnet (with
+`server 10.8.0.0 255.255.255.0 nopool` is one tunnel subnet (with
 `topology subnet` OpenVPN only accepts addresses inside it):
 
 | Addresses | For |
 |---|---|
-| `10.0.70.2-99` | dynamic pool (full access) |
-| `10.0.70.100-127` | static IPs (full access) |
-| `10.0.70.128/25` (`GUEST_SUB`) | guests: internet and the pushed DNS servers only |
+| `10.8.0.2-99` | dynamic pool (full access) |
+| `10.8.0.100-127` | static IPs (full access) |
+| `10.8.0.128/25` (`GUEST_SUB`) | guests: internet and the pushed DNS servers only |
 
 One certificate may be used on several devices at once (`duplicate-cn`).
 `bin/client-access.sh` (`client-connect`) gives every device its own address:
@@ -796,7 +830,7 @@ covers the clients that do not. `OVPN_MSS=0` turns it off.
 
 Clients get the DNS server both as `dns server` (OpenVPN 2.6+, Connect 3) and
 as `dhcp-option DNS` (older clients). IPv6 is routed into the tunnel as well
-(a private `fd00:70::/64` exists only for that) and answered there with "no
+(a private `fd00:8::/64` exists only for that) and answered there with "no
 route" (`block-ipv6`), so it cannot bypass the tunnel. With kernel offload
 OpenVPN never sees those packets, so `ip6tables` chains of the same names drop
 everything that arrives from that network: without them a client that ignores

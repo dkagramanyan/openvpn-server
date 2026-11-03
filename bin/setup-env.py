@@ -7,6 +7,15 @@ import secrets
 import tempfile
 
 root = Path(__file__).resolve().parents[1]
+for name in ("server.conf", "config/client.conf"):
+    runtime = root / name
+    if not runtime.exists():
+        saved = root / "config/network" / runtime.name
+        source = saved if saved.is_file() else root / (name + ".example")
+        runtime.parent.mkdir(parents=True, exist_ok=True)
+        with runtime.open("x") as stream:
+            stream.write(source.read_text())
+        runtime.chmod(0o600)
 path = root / ".env"
 previous = path.read_text() if path.exists() else ""
 text = previous

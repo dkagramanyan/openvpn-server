@@ -194,8 +194,8 @@ class SigningServer(ThreadingHTTPServer):
 
 def main():
     signer = Signer(os.environ.get("PROFILE_SIGNER_ACME", "/letsencrypt/acme.json"),
-                    os.environ.get("PROFILE_SIGNER_HOSTNAME", "dgkagramanyan.ru"),
-                    os.environ.get("PROFILE_SIGNER_RELAY_URL", "https://dgkagramanyan.ru:8443"),
+                    os.environ.get("PROFILE_SIGNER_HOSTNAME", ""),
+                    os.environ.get("PROFILE_SIGNER_RELAY_URL", ""),
                     os.environ.get("PROFILE_SIGNER_TOKEN", ""))
     server = SigningServer(("0.0.0.0", 8085), handler(signer))
     print("Relay profile signer listening on port 8085; certificate keys stay on this host", flush=True)
