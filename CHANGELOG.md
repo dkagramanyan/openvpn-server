@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+* Recover permission-interrupted Git updates with a standalone helper: repair
+  code/Git ownership, preserve existing stashes, save only incoming code
+  collisions, and restore unambiguous runtime configuration from the user's
+  earlier stash. Runtime credentials, guest markers and database ownership stay
+  unchanged; real Git and mixed-ownership Docker tests cover the recovery.
+
 ### 1.8: PostgreSQL and relay availability
 
 * Replace runtime SQLite with PostgreSQL 18. The upgrade helper imports legacy

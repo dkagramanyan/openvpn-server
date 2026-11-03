@@ -96,6 +96,33 @@ generated once; preserve `.env` together with the volume. Changing a password
 in `.env` alone does not change a role in an already initialized database.
 Never use `docker compose down -v` on a deployment whose data you want to keep.
 
+### Recover a permission-interrupted Git update
+
+If `git pull` failed with permission errors and then reported modified code or
+untracked incoming files, run the recovery helper as your normal login user:
+
+```shell
+cd ~/openvpn-server &&
+ovpn_repair=$(mktemp /tmp/ovpn-recover.XXXXXX) &&
+curl -fsSL https://raw.githubusercontent.com/dkagramanyan/openvpn-server/main/bin/recover-checkout.py -o "$ovpn_repair" &&
+python3 "$ovpn_repair" --repo "$PWD" --repair-permissions &&
+bin/upgrade-relay.sh --sudo-docker
+```
+
+Downloading the helper separately lets it run even when Git cannot update its
+own checkout. It repairs ownership of code and Git metadata using sudo, saves
+interrupted code changes and colliding incoming files in a targeted stash, and
+fast-forwards `main`. Existing stashes are retained. If a previous stash from
+the current commit saved runtime configuration, the helper restores those
+specific files in place when they do not conflict with current/upstream edits.
+Independent configuration or custom Compose changes stop recovery for review.
+Private recovery records are kept under `.git/openvpn-recovery/`.
+
+The helper does not restart containers, reown runtime directories, or stash
+guest markers, databases, keys or `.env`. Applying an entire old stash over the
+updated application would bring back old code; use the saved records to review
+any remaining custom code changes instead.
+
 ### Relay reliability and diagnostics
 
 The independent `relay-policy` service reads a restricted PostgreSQL view and

@@ -25,7 +25,8 @@ try:
     else: raise RuntimeError("Temporary PostgreSQL did not start")
     run("docker", "run", "--rm", "--network", network, "-v", f"{ROOT}:/source:ro", "-w", "/source",
         "-e", "OVPN_TEST_DATABASE_URL=postgresql://postgres:" + password + "@postgres/postgres",
-        "--entrypoint", "sh", "openvpn-ui:unit-test", "-c", "pip install -q pytest httpx && python -m pytest ui/tests -q -p no:cacheprovider --tb=short")
+        "-e", "OVPN_TEST_REPAIR_PERMISSIONS=1",
+        "--entrypoint", "sh", "openvpn-ui:unit-test", "-c", "apk add --no-cache git sudo && pip install -q pytest httpx && python -m pytest ui/tests -q -p no:cacheprovider --tb=short")
 finally:
     subprocess.run(["docker", "rm", "-f", name], capture_output=True)
     subprocess.run(["docker", "network", "rm", network], capture_output=True)
