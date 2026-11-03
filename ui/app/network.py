@@ -101,10 +101,58 @@ def backend_url(value):
     return value
 
 
-def get_settings():
+def shared_settings(data, db=None):
+    """Reuse existing public URLs; explicit gateway settings take precedence."""
+    from . import relay, relay_services
+
+    gateway, portal = data["gateway"], data["portal"]
+    relay_config = relay.get_settings(db) if db is not None else {}
+    signer = relay_services.signing_config(db)
+
+    def dns_host(url):
+        try:
+            parsed = urlsplit(url)
+            return hostname(parsed.hostname) if parsed.hostname else ""
+        except (ValueError, TypeError, AttributeError, PkiError):
+            return ""
+
+    website = (gateway["openvpn_host"] or portal["host"] or dns_host(settings.profile_base_url)
+               or dns_host(signer["url"]))
+    relay_host = gateway["relay_host"] or dns_host(relay_config.get("url", ""))
+    if not gateway["domain"]:
+        # Only remove familiar service prefixes, never guess a registrable domain.
+        if relay_host:
+            gateway["domain"] = relay_host.removeprefix("relay.")
+        elif website.startswith(("openvpn.", "vpn.")):
+            gateway["domain"] = website.split(".", 1)[1]
+        else:
+            try:
+                candidate = hostname(pki.get_remote()["host"])
+                try:
+                    ipaddress.ip_address(candidate)
+                except ValueError:
+                    if candidate not in ("vpn.example.com", "example.com"):
+                        gateway["domain"] = candidate.removeprefix("openvpn.").removeprefix("vpn.")
+            except (OSError, PkiError):
+                pass
+    gateway["openvpn_host"] = website or ("openvpn." + gateway["domain"] if gateway["domain"] else "")
+    gateway["relay_host"] = relay_host
+    if not portal["host"]:
+        portal["host"] = gateway["openvpn_host"]
+    if not gateway["relay_backend"] and gateway["openvpn_backend"]:
+        backend_host = urlsplit(gateway["openvpn_backend"]).hostname
+        if backend_host:
+            gateway["relay_backend"] = (f"[{backend_host}]" if ":" in backend_host else backend_host) + ":8444"
+    # IPv6 is blocked for VPN guests altogether; preserve relay IPv6 blocks there.
+    relay_lans = [value for value in relay_config.get("allowed_cidrs", []) if ipaddress.ip_network(value).version == 4]
+    data["lan_cidrs"] = list(dict.fromkeys([*data["lan_cidrs"], *relay_lans]))
+    return data
+
+
+def get_settings(db=None):
     saved = settings.read_network()
     if saved:
-        return NetworkSettings(**saved).model_dump()
+        return shared_settings(NetworkSettings(**saved).model_dump(), db)
     subnet = pki.vpn_subnet()
     if not subnet:
         raise PkiError("Fix the server subnet and pool in Server → Configuration first")
@@ -119,13 +167,13 @@ def get_settings():
             dns.append(words[2])
         if words and words[0] == "route":
             routes.append(str(ipaddress.ip_network(words[1] + "/" + (words[2] if len(words) > 2 else "32"), strict=False)))
-    return NetworkSettings(vpn_subnet=str(net), pool_first=str(ipaddress.IPv4Address(first)),
+    return shared_settings(NetworkSettings(vpn_subnet=str(net), pool_first=str(ipaddress.IPv4Address(first)),
         pool_last=str(ipaddress.IPv4Address(last)), guest_subnet=settings.guest_sub,
         dns_servers=list(dict.fromkeys(dns)), routes=routes,
         lan_cidrs=[settings.home_sub] if settings.home_sub else [],
         blocked_cidrs=settings.guest_block.split(),
         proxy_cidrs=cidrs(os.environ.get("FORWARDED_ALLOW_IPS", "127.0.0.1/32,::1/128").replace(",", " ").split())
-    ).model_dump()
+    ).model_dump(), db)
 
 
 def validate(body):
@@ -155,6 +203,10 @@ def validate(body):
     if not data["proxy_cidrs"]:
         raise PkiError("Keep at least one trusted proxy address")
     portal = data["portal"]
+    gateway = data["gateway"]
+    for key in ("domain", "openvpn_host", "relay_host"):
+        if gateway[key]: gateway[key] = hostname(gateway[key])
+    portal["host"] = hostname(portal["host"]) if portal["host"] else gateway["openvpn_host"]
     if portal["enabled"]:
         portal["host"] = hostname(portal["host"])
         portal["target"] = endpoint(portal["target"], portal=True)
@@ -166,9 +218,8 @@ def validate(body):
                 endpoint(value + ":9443", portal=True)
         except ValueError:
             raise PkiError("Enter the portal's individual IPv4 DNS addresses")
-    gateway = data["gateway"]
-    for key in ("domain", "openvpn_host", "relay_host"):
-        if gateway[key]: gateway[key] = hostname(gateway[key])
+    if portal["enabled"] and portal["host"] != gateway["openvpn_host"]:
+        raise PkiError("The private portal and OpenVPN website must use the same hostname")
     if gateway["openvpn_backend"]: gateway["openvpn_backend"] = backend_url(gateway["openvpn_backend"])
     if gateway["relay_backend"]: gateway["relay_backend"] = endpoint(gateway["relay_backend"])
     for key in ("trusted_cidrs", "portal_cidrs"):
@@ -240,11 +291,14 @@ def save_settings(body):
     return {"settings": data, "restart_required": True}
 
 
-def export_gateway():
-    data = get_settings()
+def export_gateway(db=None):
+    data = get_settings(db)
     gateway = data["gateway"]
-    if any(not gateway[key] for key in ("domain", "openvpn_host", "openvpn_backend", "relay_host", "relay_backend", "trusted_cidrs")):
-        raise PkiError("Fill in the gateway domain, hosts, backends and trusted networks before exporting")
+    required = {"domain": "Gateway domain", "openvpn_host": "Website hostname", "openvpn_backend": "OpenVPN UI backend URL",
+                "relay_host": "Public relay URL", "relay_backend": "Relay backend", "trusted_cidrs": "Networks allowed into private services"}
+    missing = [label for key, label in required.items() if not gateway[key]]
+    if missing:
+        raise PkiError("Complete these settings before exporting: " + ", ".join(missing))
     if data["portal"]["enabled"] and data["portal"]["host"] != gateway["openvpn_host"]:
         raise PkiError("The private portal and gateway OpenVPN host must match")
     return {"version": 1, "gateway": gateway, "portal": data["portal"]}

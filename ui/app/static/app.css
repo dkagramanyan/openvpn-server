@@ -130,6 +130,15 @@ h3 { font-size: 13px; font-weight: 600; margin: 0; color: var(--ink-2); text-tra
 .grid.two { grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); }
 @media (max-width: 1100px) { .grid.two { grid-template-columns: 1fr; } }
 .stack { display: flex; flex-direction: column; gap: 14px; }
+.settings-details { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; }
+.settings-details > summary { cursor: pointer; font-weight: 500; }
+.settings-details[open] > summary { margin-bottom: 12px; }
+.network-settings label.row { flex-wrap: nowrap; align-items: flex-start; }
+@media (max-width: 600px) {
+  .network-settings .form.cols { grid-template-columns: 1fr; }
+  .network-settings .kv { grid-template-columns: 1fr; gap: 4px; }
+  .network-settings .kv dd + dt { margin-top: 8px; }
+}
 .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .loading { opacity: .55; transition: opacity .15s; pointer-events: none; }
 

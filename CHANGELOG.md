@@ -3,6 +3,14 @@
 
 ## Unreleased
 
+* Combine public VPN, gateway, portal and relay settings into one form. Reuse
+  existing URLs, share domain/website/LAN inputs, preserve custom endpoints,
+  and save current edits before downloading the private gateway export.
+* Wait for persistent relay policy/database readiness after startup and send
+  HTTP/2 GOAWAY on planned shutdown. Test reconnecting with the original signed
+  profile after restarting relay, UI, policy and PostgreSQL in boot order;
+  preserve credentials and profile identifiers without a replacement download.
+
 ### 1.9: signing requirements and per-user relay activity
 
 * Require CMS-signed relay downloads by default. Add admin signing URL/token

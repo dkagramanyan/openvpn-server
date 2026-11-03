@@ -12,9 +12,11 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	masque "github.com/quic-go/masque-go"
@@ -295,6 +297,11 @@ func main() {
 		maxH2Connections: h2Connections, maxH2Streams: h2Streams, h2ReadIdle: readIdle, h2PingTimeout: pingTimeout,
 	}
 	mode := env("RELAY_TRANSPORT", "http2")
+	if mode != "http2" && mode != "http3" {
+		log.Fatal("RELAY_TRANSPORT must be http2 or http3")
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	handler.activity = newActivity(mode)
 	handler.activity.runtime = handler.metrics
 	handler.activity.limits = map[string]int{"flows": maximum, "per_client": perClient, "auth_checks": authChecks, "h2_connections": h2Connections, "h2_streams": h2Streams}
@@ -304,6 +311,12 @@ func main() {
 		log.Fatal(err)
 	}
 	defer admin.Close()
+	// Docker can restart containers concurrently after a host reboot. Do not
+	// accept client connections until the persistent policy state is ready.
+	log.Print("Waiting for relay policy and database readiness")
+	if err := handler.waitForPolicy(ctx); err != nil {
+		return
+	}
 	if mode == "http2" {
 		if !strings.Contains(os.Getenv("GODEBUG"), "http2xconnect=1") {
 			log.Fatal("HTTP/2 relay requires GODEBUG=http2xconnect=1 (set by the Docker image)")
@@ -317,11 +330,14 @@ func main() {
 			log.Fatal(err)
 		}
 		log.Printf("Apple Network Relay HTTP/2 backend listening on %s; TLS terminates at the trusted proxy", listener.Addr())
-		log.Fatal(serveHTTP2(listener, handler, trusted))
+		if err := serveHTTP2Context(ctx, listener, handler, trusted); err != nil && ctx.Err() == nil {
+			log.Fatal(err)
+		}
+		return
 	}
-	if mode != "http3" {
-		log.Fatal("RELAY_TRANSPORT must be http2 or http3")
-	}
+	// Direct HTTP/3 retains its existing process signal handling after the
+	// startup gate; the HTTP/2 shutdown above handles planned proxy restarts.
+	stop()
 	cert, err := tls.LoadX509KeyPair("/tls/fullchain.pem", "/tls/privkey.pem")
 	if err != nil {
 		log.Fatalf("HTTP/3 TLS setup required: put fullchain.pem and privkey.pem in APPLE_RELAY_TLS_DIR, readable by UID 65532: %v", err)

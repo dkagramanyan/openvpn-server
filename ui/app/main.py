@@ -1102,19 +1102,37 @@ def get_settings(user: dict[str, Any] = Authed):
 
 @app.get("/api/network/settings")
 def get_network_settings(user: dict[str, Any] = Authed):
-    return JSONResponse(network.get_settings(), headers={"Cache-Control": "no-store"})
+    return JSONResponse(network.get_settings(db), headers={"Cache-Control": "no-store"})
+
+
+class NetworkUpdate(network.NetworkSettings):
+    relay_settings: relay.RelaySettings | None = Field(default=None, alias="relay")
+    remote: RemoteBody | None = None
 
 
 @app.put("/api/network/settings", dependencies=[Csrf])
-def put_network_settings(body: network.NetworkSettings, user: dict[str, Any] = Authed):
-    result = network.save_settings(body)
+def put_network_settings(body: NetworkUpdate, user: dict[str, Any] = Authed):
+    # Validate the whole form before changing persistent state.
+    if body.relay_settings is not None:
+        relay.validate_settings(body.relay_settings, lan_cidrs=body.lan_cidrs)
+    if body.remote is not None:
+        pki.validate_remote(body.remote.host, body.remote.ports)
+    result = network.save_settings(network.NetworkSettings(**body.model_dump(exclude={"relay_settings", "remote"})))
+    if body.relay_settings is not None:
+        result["relay"] = relay.save_settings(db, body.relay_settings)
+    if body.remote is not None:
+        current = pki.get_remote()
+        ports = {item["proto"]: int(item["port"]) for item in current["remotes"]}
+        if current["host"] != body.remote.host.strip() or any(ports.get(proto) != port for proto, port in body.remote.ports.items()):
+            pki.set_remote(body.remote.host, body.remote.ports)
+        result["remote"] = pki.get_remote()
     event("network_settings_changed", user)  # Never put network values in audit events.
     return result
 
 
 @app.get("/api/network/traefik.json")
 def download_gateway_network(user: dict[str, Any] = Authed):
-    return JSONResponse(network.export_gateway(), headers={"Cache-Control": "no-store",
+    return JSONResponse(network.export_gateway(db), headers={"Cache-Control": "no-store",
         "Content-Disposition": 'attachment; filename="network.private.json"'})
 
 

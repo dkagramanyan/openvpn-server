@@ -50,6 +50,10 @@ func trustedProxy(remote string, prefixes []netip.Prefix) bool {
 // Traefik terminates TLS and forwards HTTP/2 bytes unchanged. Check the actual
 // TCP peer before accepting bytes; forwarded headers never grant proxy trust.
 func serveHTTP2(listener net.Listener, handler http.Handler, trusted []netip.Prefix) error {
+	return serveHTTP2Context(context.Background(), listener, handler, trusted)
+}
+
+func serveHTTP2Context(ctx context.Context, listener net.Listener, handler http.Handler, trusted []netip.Prefix) error {
 	server := &http2.Server{MaxConcurrentStreams: 256, IdleTimeout: 90 * time.Second,
 		ReadIdleTimeout: 10 * time.Second, PingTimeout: 5 * time.Second, WriteByteTimeout: 15 * time.Second,
 		MaxUploadBufferPerConnection: 4 << 20, MaxUploadBufferPerStream: 256 << 10}
@@ -70,6 +74,45 @@ func serveHTTP2(listener net.Listener, handler http.Handler, trusted []netip.Pre
 			server.MaxConcurrentStreams = uint32(relay.maxH2Streams)
 		}
 	}
+	base := &http.Server{ErrorLog: log.New(protocolLogs, "", 0), MaxHeaderBytes: 8192, ReadHeaderTimeout: 10 * time.Second}
+	// Register HTTP/2's shutdown hook even though Traefik supplies plain TCP
+	// connections. It sends GOAWAY so clients know to open a new connection.
+	if err := http2.ConfigureServer(base, server); err != nil {
+		return err
+	}
+	var mu sync.Mutex
+	active := make(map[net.Conn]struct{})
+	var workers sync.WaitGroup
+	finished := make(chan struct{})
+	defer close(finished)
+	go func() {
+		select {
+		case <-ctx.Done():
+			listener.Close()
+		case <-finished:
+		}
+	}()
+	defer func() {
+		if ctx.Err() != nil {
+			// CONNECT streams can last indefinitely. Give clients time to see
+			// GOAWAY, then end the old streams within Docker's stop deadline.
+			_ = base.Shutdown(context.Background())
+			drained := make(chan struct{})
+			go func() { workers.Wait(); close(drained) }()
+			timer := time.NewTimer(2 * time.Second)
+			select {
+			case <-drained:
+			case <-timer.C:
+			}
+			timer.Stop()
+		}
+		mu.Lock()
+		for conn := range active {
+			conn.Close()
+		}
+		mu.Unlock()
+		workers.Wait()
+	}()
 	connections := make(chan struct{}, maxConnections)
 	for {
 		conn, err := listener.Accept()
@@ -86,10 +129,20 @@ func serveHTTP2(listener net.Listener, handler http.Handler, trusted []netip.Pre
 		}
 		select {
 		case connections <- struct{}{}:
+			mu.Lock()
+			active[conn] = struct{}{}
+			mu.Unlock()
+			workers.Add(1)
 			go func() {
-				defer func() { conn.Close(); <-connections }()
-				server.ServeConn(conn, &http2.ServeConnOpts{Handler: handler,
-					BaseConfig: &http.Server{ErrorLog: log.New(protocolLogs, "", 0), MaxHeaderBytes: 8192, ReadHeaderTimeout: 10 * time.Second}})
+				defer workers.Done()
+				defer func() {
+					conn.Close()
+					mu.Lock()
+					delete(active, conn)
+					mu.Unlock()
+					<-connections
+				}()
+				server.ServeConn(conn, &http2.ServeConnOpts{Handler: handler, BaseConfig: base})
 			}()
 		default:
 			conn.Close()

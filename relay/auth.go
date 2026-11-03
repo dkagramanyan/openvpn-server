@@ -166,3 +166,18 @@ func (s *relayServer) checkReadiness(ctx context.Context) error {
 	}
 	return nil
 }
+
+func (s *relayServer) waitForPolicy(ctx context.Context) error {
+	for {
+		if err := s.checkReadiness(ctx); err == nil {
+			return nil
+		}
+		timer := time.NewTimer(time.Second)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}

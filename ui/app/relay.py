@@ -37,7 +37,7 @@ def get_settings(db) -> dict:
     return {**config, "transport": settings.relay_transport}
 
 
-def save_settings(db, body: RelaySettings) -> dict:
+def validate_settings(body: RelaySettings, *, lan_cidrs=None) -> dict:
     config = body.model_dump()
     config["route_all"] = True
     url = body.url.strip().rstrip("/")
@@ -64,8 +64,15 @@ def save_settings(db, body: RelaySettings) -> dict:
                                                     for c in body.allowed_cidrs))
     except ValueError:
         raise PkiError("Allowed networks must be valid CIDRs, e.g. 192.168.1.0/24")
-    if body.enabled and (not url or not config["allowed_cidrs"]):
+    if lan_cidrs is None:
+        lan_cidrs = settings.read_network().get("lan_cidrs", [])
+    if body.enabled and (not url or not (config["allowed_cidrs"] or lan_cidrs)):
         raise PkiError("Enabling the relay requires an HTTPS URL and LAN networks to block for guests")
+    return config
+
+
+def save_settings(db, body: RelaySettings) -> dict:
+    config = validate_settings(body)
     db.set_setting("apple_relay", json.dumps(config))
     return {**config, "transport": settings.relay_transport}
 

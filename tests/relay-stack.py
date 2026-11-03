@@ -5,6 +5,7 @@ Run with UI test dependencies installed after building the three :relay-test ima
 Every identity and credential is temporary; no production keys or Docker ports are used.
 """
 import http.cookiejar
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -107,7 +108,8 @@ def main():
 
     def run(name, *args):
         full_name = prefix + "-" + name
-        command("docker", "run", "-d", "--name", full_name, "--network", network, "--network-alias", name, *args)
+        command("docker", "run", "-d", "--name", full_name, "--network", network,
+                "--ip", str(next(addresses)), "--network-alias", name, *args)
         containers.append(full_name)
         return full_name
 
@@ -119,6 +121,11 @@ def main():
         entry = make_identity(folder / "identity")
         write_store(folder / "acme.json", entry)
         command("docker", "network", "create", network)
+        # Production uses stable host/LAN addresses. Keep fixture addresses
+        # stable too when Docker releases and reattaches bridge endpoints.
+        subnet = json.loads(command("docker", "network", "inspect", network))[0]["IPAM"]["Config"][0]["Subnet"]
+        addresses = iter(ipaddress.ip_network(subnet).hosts())
+        next(addresses)  # Docker gateway.
         pg_password = secrets.token_urlsafe(24)
         app_password, policy_password = secrets.token_urlsafe(24), secrets.token_urlsafe(24)
         postgres = run("postgres", "-p", "127.0.0.1::5432", "-e", "POSTGRES_PASSWORD=" + pg_password,
@@ -135,7 +142,6 @@ def main():
         import test_api as fixture
         container_dsn = "postgresql://openvpn:" + app_password + "@postgres/openvpn"
         policy_dsn = "postgresql://relay_policy:" + policy_password + "@postgres/openvpn"
-        subnet = json.loads(command("docker", "network", "inspect", network))[0]["IPAM"]["Config"][0]["Subnet"]
         relay = run("relay", "-p", "127.0.0.1::8080", "-e", "RELAY_TRUSTED_PROXIES=" + subnet,
                     "openvpn-apple-relay:relay-test")
         (folder / "dynamic.yml").write_text('''tcp:
@@ -191,7 +197,7 @@ tls:
             "openvpn-profile-signer:relay-test")
         # UI and relay share a network namespace, matching production host networking.
         ui_name = prefix + "-ui"
-        command("docker", "run", "-d", "--name", ui_name, "--network", "container:" + relay,
+        command("docker", "run", "-d", "--name", ui_name, "--restart", "unless-stopped", "--network", "container:" + relay,
                 "-v", f"{fixture.TMP}:/etc/openvpn", "-v", f"{folder}:/fixture:ro",
                 "-e", "SSL_CERT_FILE=/fixture/identity/ca.pem", "-e", "MGMT_PORT=1", "-e", "OVPN_BACKUP_KEEP=0",
                 "-e", "OVPN_DATABASE_URL=" + container_dsn, "-e", "OPENVPN_ADMIN_PASSWORD=" + password, "openvpn-ui:relay-test")
@@ -261,6 +267,31 @@ tls:
         page = command(*curl, "http://" + address + ":8080/")
         assert "OpenVPN" in page
         print("PASS: signed profile verified; real HTTP/2 CONNECT through Docker Traefik reaches LAN")
+        # Reboot-style startup: policy/UI/relay come up before PostgreSQL. Use
+        # only the already downloaded profile, never issue a replacement grant.
+        original_grant = fixture.db.get_setting("relay_client:alice")
+        original_instance = fixture.db.get_setting("relay_instance")
+        command("docker", "stop", "-t", "5", ui_name, policy_name)
+        command("docker", "stop", "-t", "5", relay, postgres)
+        command("docker", "start", relay, policy_name, ui_name)
+        readiness = subprocess.run(["docker", "exec", relay, "wget", "-qO-", "http://127.0.0.1:8446/readyz"], capture_output=True)
+        assert readiness.returncode != 0, "Relay reported ready while persistent database was stopped"
+        command("docker", "start", postgres)
+        for _ in range(60):
+            restored = subprocess.run([*curl, "http://" + address + ":8080/"], capture_output=True)
+            if restored.returncode == 0 and b"OpenVPN" in restored.stdout:
+                break
+            time.sleep(0.5)
+        else:
+            raise AssertionError("Original installed profile did not recover after reboot-style startup")
+        # Docker reallocates randomly published fixture ports on restart.
+        # Production's fixed host ports do not change on reboot.
+        api_url = "http://127.0.0.1:" + published(relay, 8080)
+        restarted_dsn = "postgresql://openvpn:" + app_password + "@127.0.0.1:" + published(postgres, 5432) + "/openvpn"
+        restarted_db = type(fixture.db)(restarted_dsn, schema=fixture.db.schema)
+        assert restarted_db.get_setting("relay_client:alice") == original_grant
+        assert restarted_db.get_setting("relay_instance") == original_instance
+        print("PASS: original signed profile works after relay/UI/policy/database restart; credentials and identifiers persist; startup waits for database")
         api("/api/clients/alice/access", {"guest": True}, "PUT")
         time.sleep(2)  # The authorization cache expires after one second.
         denied = subprocess.run([*curl, "http://" + address + ":8080/"], capture_output=True)

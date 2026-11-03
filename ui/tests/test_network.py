@@ -110,3 +110,82 @@ def test_ui_policy_changes_reach_relay_authorization(config, monkeypatch):
     config["portal"]["enabled"] = False
     network.save_settings(network.NetworkSettings(**config))
     assert relay.authorize(DB(), "Bearer guest:token")["portal"] is None
+
+
+class SavedSettings:
+    def __init__(self, **values):
+        self.values = {key: json.dumps(value) for key, value in values.items()}
+
+    def get_setting(self, key, default=None):
+        return self.values.get(key, default)
+
+
+def test_existing_urls_prefill_gateway_without_exposing_signing_token(config, monkeypatch):
+    monkeypatch.setattr(settings, "profile_base_url", "")
+    monkeypatch.setattr(settings, "relay_signer_url", "")
+    config["gateway"] = network.Gateway(openvpn_backend="http://192.0.2.20:8080").model_dump()
+    config["portal"].update(enabled=False, host="")
+    network.save_settings(network.NetworkSettings(**config))
+    db = SavedSettings(apple_relay={"url": "https://example.test:8443"},
+                       relay_signing={"url": "https://vpn.example.test/internal/relay-sign", "token": "private-token"})
+    saved = network.get_settings(db)
+    assert saved["gateway"]["domain"] == "example.test"
+    assert saved["gateway"]["openvpn_host"] == "vpn.example.test"
+    assert saved["portal"]["host"] == "vpn.example.test"
+    assert saved["gateway"]["relay_host"] == "example.test"
+    assert saved["gateway"]["relay_backend"] == "192.0.2.20:8444"
+    assert saved["gateway"]["trusted_cidrs"] == []  # Guest blocks never grant admin access.
+    assert "private-token" not in json.dumps(saved)
+
+
+def test_shared_defaults_preserve_custom_gateway_addresses(config, monkeypatch):
+    network.save_settings(network.NetworkSettings(**config))
+    monkeypatch.setattr(settings, "profile_base_url", "https://other.example.test")
+    db = SavedSettings(apple_relay={"url": "https://another.example.test:8443"})
+    assert network.get_settings(db)["gateway"] == network.Gateway(**config["gateway"]).model_dump()
+
+
+def test_legacy_relay_lan_blocks_are_carried_into_shared_form(config):
+    network.save_settings(network.NetworkSettings(**config))
+    db = SavedSettings(apple_relay={"allowed_cidrs": ["192.0.2.0/24", "198.51.100.0/24", "fd00::/64"]})
+    saved = network.get_settings(db)
+    assert saved["lan_cidrs"] == ["192.0.2.0/24", "198.51.100.0/24"]
+    assert network.validate(network.NetworkSettings(**saved))["lan_cidrs"] == saved["lan_cidrs"]
+
+
+def test_portal_reuses_website_hostname_and_rejects_conflicts(config):
+    config["portal"]["host"] = ""
+    saved = network.save_settings(network.NetworkSettings(**config))
+    assert saved["settings"]["portal"]["host"] == "vpn.example.test"
+    config["portal"]["host"] = "different.example.test"
+    before = settings.network_file.read_bytes()
+    with pytest.raises(pki.PkiError, match="same hostname"):
+        network.save_settings(network.NetworkSettings(**config))
+    assert settings.network_file.read_bytes() == before
+
+
+def test_relay_uses_shared_lan_blocks_without_duplicate_input(config):
+    from app import relay
+    network.save_settings(network.NetworkSettings(**config))
+    body = relay.RelaySettings(enabled=True, url="https://relay.example.test:8443", allowed_cidrs=[])
+    assert relay.validate_settings(body)["enabled"]
+    with pytest.raises(pki.PkiError, match="LAN networks"):
+        relay.validate_settings(body, lan_cidrs=[])
+
+
+def test_export_names_missing_fields(config):
+    config["gateway"]["openvpn_backend"] = ""
+    network.save_settings(network.NetworkSettings(**config))
+    with pytest.raises(pki.PkiError, match="OpenVPN UI backend URL"):
+        network.export_gateway()
+
+
+@pytest.mark.parametrize("host,domain", [("vpn.example.test", "example.test"), ("example.test", "example.test"), ("192.0.2.20", "")])
+def test_existing_vpn_endpoint_can_prefill_domain_without_using_ip_as_domain(config, monkeypatch, host, domain):
+    monkeypatch.setattr(settings, "profile_base_url", "")
+    monkeypatch.setattr(settings, "relay_signer_url", "")
+    monkeypatch.setattr(pki, "get_remote", lambda: {"host": host})
+    config["gateway"] = network.Gateway().model_dump()
+    config["portal"].update(host="", enabled=False)
+    network.save_settings(network.NetworkSettings(**config))
+    assert network.get_settings(SavedSettings())["gateway"]["domain"] == domain

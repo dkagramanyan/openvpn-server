@@ -1006,3 +1006,50 @@ def test_network_api_is_admin_only_and_private(client):
         assert client.get("/api/network/traefik.json").status_code == 401
     finally:
         client.cookies.update(cookies)
+
+
+def test_combined_network_and_relay_save_validates_before_writing(client, monkeypatch, tmp_path):
+    from app.settings import settings
+    monkeypatch.setattr(settings, "network_file", tmp_path / "network/settings.conf")
+    server_conf = tmp_path / "server.conf"
+    server_conf.write_text(settings.server_conf.read_text())
+    monkeypatch.setattr(settings, "server_conf", server_conf)
+    body = client.get("/api/network/settings").json()
+    body["lan_cidrs"] = ["192.0.2.0/24"]
+    previous_relay = db.get_setting("apple_relay")
+    client_conf = pki.config_path("client")
+    previous_client = client_conf.read_bytes()
+    regenerated = []
+    monkeypatch.setattr(pki, "regenerate_profiles", lambda: regenerated.append(True))
+    try:
+        body["relay"] = {"enabled": True, "url": "http://invalid.example.test", "allowed_cidrs": []}
+        before = server_conf.read_bytes()
+        response = client.put("/api/network/settings", json=body, headers=H)
+        assert response.status_code == 400
+        assert server_conf.read_bytes() == before
+        assert not settings.network_file.exists()
+        assert db.get_setting("apple_relay") == previous_relay
+        body["relay"]["url"] = "https://relay.example.test:8443"
+        body["remote"] = {"host": "invalid host", "ports": {}}
+        assert client.put("/api/network/settings", json=body, headers=H).status_code == 400
+        assert not settings.network_file.exists()
+        remote = pki.get_remote()
+        body["remote"] = {"host": remote["host"], "ports": {r["proto"]: int(r["port"]) for r in remote["remotes"]}}
+        response = client.put("/api/network/settings", json=body, headers=H)
+        assert response.status_code == 200, response.text
+        assert response.json()["relay"]["enabled"]
+        assert client.get("/api/relay/settings").json()["url"] == body["relay"]["url"]
+        assert "\"relay\":" not in settings.network_file.read_text()
+        assert regenerated == []
+        body["remote"]["host"] = "vpn.shared.example.test"
+        assert client.put("/api/network/settings", json=body, headers=H).status_code == 200
+        assert pki.get_remote()["host"] == "vpn.shared.example.test"
+        assert len(regenerated) == 1
+        assert client.put("/api/network/settings", json=body, headers=H).status_code == 200
+        assert len(regenerated) == 1
+    finally:
+        client_conf.write_bytes(previous_client)
+        if previous_relay is None:
+            db.execute("DELETE FROM settings WHERE key = ?", ("apple_relay",))
+        else:
+            db.set_setting("apple_relay", previous_relay)

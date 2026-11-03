@@ -186,11 +186,13 @@ To enable it:
    docker compose up -d --build
    ```
 
-4. In the existing UI, open **Settings → Apple Network Relay**. Set the public
-   URL (e.g. `https://relay.example.com:8443`) and LAN CIDRs (e.g.
-   `192.0.2.0/24`) that guests must not reach. Access follows each client’s
+4. In **Settings → Network and private portal**, enable Apple relay profiles.
+   The relay uses the gateway domain and port 8443 by default; **Custom addresses
+   and ports** supports another hostname or port. Enter LAN CIDRs (e.g.
+   `192.0.2.0/24`) in **LAN networks blocked for guests**, shared by VPN and relay.
+   Access follows each client’s
    OpenVPN role: guests have internet only; full-access clients have internet
-   and LAN. Enable and save. Names such as `nas.home.arpa` must resolve to the intended
+   and LAN. Save settings. Names such as `nas.home.arpa` must resolve to the intended
    LAN addresses **from the relay container**; configure its DNS in Compose if
    your Docker DNS does not resolve your LAN names.
 5. Configure **Relay → Profile signing** using the existing Traefik signing
@@ -308,6 +310,15 @@ only the relay without restarting OpenVPN:
 ```shell
 docker compose up -d --build --no-deps apple-relay
 ```
+
+Installed profiles keep their credentials and identifiers across container
+restarts and server reboots. Keep the same Compose project, `.env`, PKI and
+PostgreSQL volume. HTTP/2 accepts connections only after policy/database readiness;
+on a planned stop it sends GOAWAY before closing old tunnels. Existing TCP
+connections reconnect after a restart; restarting services does not require
+downloading another profile. Docker must start at boot, and containers explicitly
+stopped with `docker compose stop` need `docker compose up -d` to start again.
+Automatic recovery on a particular Apple OS/device still needs deployment testing.
 
 For HTTP/2, verify WAN TCP 8443 reaches Traefik, its TCP router forwards to the
 backend's TCP 8444, and the trusted proxy CIDRs in Settings match the gateway source address.
@@ -476,9 +487,19 @@ and out of Git. Installed profiles remain valid when the hostname stays the same
 
 ## Private network configuration
 
-Use **Settings → Network and private portal** for VPN addressing, DNS, LAN and
-additional guest blocks, trusted reverse proxies, the private portal, and gateway
-services. Values are saved in `config/network/settings.conf` with mode 0600. This
+Use **Settings → Network and private portal** for public VPN endpoints, relay,
+VPN addressing, DNS, guest blocks, trusted reverse proxies, the portal, and gateway
+services. Set the gateway domain once: VPN profiles and relay use that domain,
+while the website and portal share `openvpn.<domain>`. Existing profile, signing
+and relay URLs prefill the form. Existing custom addresses are preserved and can
+be edited under **Custom addresses and ports**. The relay backend defaults to the
+UI backend host on port 8444. One LAN list supplies VPN and relay guest blocks;
+private-service access networks remain a separate allowlist.
+
+**Save settings** applies the combined form. VPN profiles regenerate only when
+their endpoint changes. **Save and download Traefik settings** saves current edits
+before exporting. VPN/firewall settings are saved in
+`config/network/settings.conf` with mode 0600. This
 directory is excluded from Git and container build contexts. Network changes also
 update your installed `server.conf`; save and restart OpenVPN to apply them.
 Runtime `server.conf` and `config/client.conf` are ignored; only generic `.example`

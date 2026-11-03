@@ -1026,34 +1026,58 @@ function relayButton(c, small = false, portal = false) {
     } }, icon('download'), 'Apple relay');
 }
 
-function relaySettingsCard(s) {
-  const enabled = h('input', { type: 'checkbox', checked: s.enabled });
-  const url = h('input', { class: 'input', value: s.url, placeholder: 'https://relay.example.com:8443' });
-  const networks = h('input', { class: 'input', value: s.allowed_cidrs.join(', '), placeholder: '192.0.2.0/24' });
-  const split = input => input.value.split(/[\s,]+/).filter(Boolean);
-  return card('Apple Network Relay', h('div', { class: 'form' },
-    h('label', { class: 'row' }, enabled, 'Enable Apple relay profiles'),
-    h('p', { class: 'small muted' }, s.transport === 'http2' ? 'HTTP/2 via Traefik: Traefik manages TLS and forwards connections through a TCP router to this server. No certificate files are needed on the OpenVPN host.' : 'Direct HTTP/3: the relay needs its own TLS certificate and a reachable UDP port.'),
-    field('Public relay URL', url, s.transport === 'http2' ? 'HTTPS hostname and TCP port served by the Traefik relay router, for example https://example.com:8443.' : 'HTTPS hostname and UDP port of the apple-relay service.'),
-    h('p', null, 'Relay access follows OpenVPN: guests get internet access and the private portal when enabled; full-access clients get internet and LAN. Access changes update installed relay profiles automatically.'),
-    field('LAN networks', networks, 'Comma-separated IPv4 or IPv6 CIDRs blocked for guests, alongside the OpenVPN LAN and VPN networks. LAN service names must resolve correctly on the relay server.'),
-    h('p', { class: 'small muted' }, 'Each profile contains a personal access credential. OpenVPN passwords and 2FA do not apply. Certificate renewal through the UI preserves relay access. See the Relay page for profile signing and connection activity.'),
-    h('p', { class: 'small muted' }, 'Start all services on the server with docker compose up -d --build. Downloading a profile does not check connectivity. The relay does not provide a VPN address, ping or Bonjour discovery. After changing transport, download and reinstall profiles.'),
-    h('div', null, h('button', { class: 'btn primary', onClick: async () => {
-      await withToast(api('/api/relay/settings', { method: 'PUT', body: { enabled: enabled.checked, url: url.value.trim(), allowed_cidrs: split(networks) } }), 'Relay settings saved; reinstall profiles if the relay URL or transport changed');
-    } }, 'Save relay settings'))));
-}
-
-function networkSettingsCard(s) {
+function networkSettingsCard(s, relay, publicSettings) {
   const inputs = {};
   const listKeys = new Set(['dns_servers', 'routes', 'lan_cidrs', 'blocked_cidrs', 'proxy_cidrs', 'portal.destinations', 'gateway.trusted_cidrs', 'gateway.portal_cidrs']);
-  const valueAt = key => key.split('.').reduce((obj, part) => obj[part], s);
   const input = (key, label, hint = '') => {
-    const value = valueAt(key);
+    const value = key.split('.').reduce((obj, part) => obj[part], s);
     inputs[key] = h('input', { class: 'input', value: Array.isArray(value) ? value.join(', ') : value, autocomplete: 'off' });
     return field(label, inputs[key], hint);
   };
+  const details = (title, ...children) => h('details', { class: 'settings-details' }, h('summary', null, title), h('div', { class: 'form' }, ...children));
+  const parseURL = value => { try { return new URL(value); } catch (_) { return null; } };
+  const domainField = input('gateway.domain', 'Gateway domain', 'Used for dashboard.<domain> and the default website and relay addresses.');
+  const backendField = input('gateway.openvpn_backend', 'OpenVPN UI backend URL', 'The address Traefik uses to reach this server, including its UI port.');
+  const defaultWebsite = () => inputs['gateway.domain'].value.trim() ? `openvpn.${inputs['gateway.domain'].value.trim()}` : '';
+  const website = h('input', { class: 'input', value: s.gateway.openvpn_host === defaultWebsite() ? '' : s.gateway.openvpn_host });
+  const websiteHost = () => website.value.trim() || defaultWebsite();
+  const vpnHost = h('input', { class: 'input', value: publicSettings.remote.host === s.gateway.domain ? '' : publicSettings.remote.host });
+  const vpnEndpoint = () => vpnHost.value.trim() || inputs['gateway.domain'].value.trim();
+  const vpnPorts = publicSettings.listen.map(listener => ({ listener, input: h('input', { class: 'input', type: 'number', min: 1, max: 65535,
+    value: (publicSettings.remote.remotes.find(remote => remote.proto === listener.proto) || listener).port }) }));
+  const defaultRelayBackend = () => {
+    const host = parseURL(inputs['gateway.openvpn_backend'].value.trim())?.hostname;
+    return host ? `${host}:8444` : '';
+  };
+  const relayBackend = h('input', { class: 'input', value: s.gateway.relay_backend === defaultRelayBackend() ? '' : s.gateway.relay_backend });
+  const savedRelay = parseURL(relay.url);
+  const relayPort = h('input', { class: 'input', type: 'number', min: 1, max: 65535, value: savedRelay ? savedRelay.port || '443' : '8443' });
+  const customRelay = h('input', { class: 'input', value: savedRelay ? (savedRelay.hostname === s.gateway.domain ? '' : relay.url) : (s.gateway.relay_host && s.gateway.relay_host !== s.gateway.domain ? `https://${s.gateway.relay_host}:8443` : '') });
+  const relayURL = () => {
+    if (customRelay.value.trim()) return customRelay.value.trim();
+    const domain = inputs['gateway.domain'].value.trim();
+    // Keep the exact saved origin, including an omitted default port, so an
+    // unrelated settings save cannot change installed relay profile URLs.
+    if (savedRelay && savedRelay.hostname === domain && Number(savedRelay.port || '443') === Number(relayPort.value)) return relay.url;
+    return domain ? `https://${domain}:${relayPort.value}` : '';
+  };
+  const relayEnabled = h('input', { type: 'checkbox', checked: relay.enabled });
   const portalEnabled = h('input', { type: 'checkbox', checked: s.portal.enabled });
+  const addressSummary = h('dl', { class: 'kv' });
+  const refreshAddresses = () => {
+    website.placeholder = defaultWebsite() || 'Set the gateway domain above';
+    vpnHost.placeholder = inputs['gateway.domain'].value.trim() || 'Set the gateway domain above';
+    relayBackend.placeholder = defaultRelayBackend() || 'Set the UI backend URL above';
+    customRelay.placeholder = inputs['gateway.domain'].value.trim() ? `https://${inputs['gateway.domain'].value.trim()}:${relayPort.value}` : 'https://relay.example.com:8443';
+    relayPort.disabled = !!customRelay.value.trim();
+    addressSummary.replaceChildren(
+      h('dt', null, 'VPN profiles'), h('dd', null, vpnEndpoint() ? `${vpnEndpoint()} (${vpnPorts.map(({ listener, input }) => `${input.value}/${listener.proto}`).join(', ')})` : 'Set a gateway domain or VPN host'),
+      h('dt', null, 'Website and portal'), h('dd', null, websiteHost() ? `https://${websiteHost()}` : 'Set a gateway domain or website hostname'),
+      h('dt', null, 'Apple relay'), h('dd', null, relayURL() || 'Set a gateway domain or custom relay URL'),
+      h('dt', null, 'Relay backend'), h('dd', null, relayBackend.value.trim() || defaultRelayBackend() || 'Set the UI backend URL'));
+  };
+  for (const control of [inputs['gateway.domain'], inputs['gateway.openvpn_backend'], website, vpnHost, ...vpnPorts.map(port => port.input), relayBackend, relayPort, customRelay]) control.addEventListener('input', refreshAddresses);
+  refreshAddresses();
   const services = h('div', { class: 'stack' });
   const rows = [];
   const addService = (service = {}) => {
@@ -1077,43 +1101,73 @@ function networkSettingsCard(s) {
       const target = parts.reduce((obj, part) => obj[part], result);
       target[leaf] = listKeys.has(key) ? control.value.split(/[\s,]+/).filter(Boolean) : control.value.trim();
     }
+    result.gateway.openvpn_host = websiteHost();
+    result.gateway.relay_host = parseURL(relayURL())?.hostname || '';
+    result.gateway.relay_backend = relayBackend.value.trim() || defaultRelayBackend();
+    if (vpnEndpoint()) result.remote = { host: vpnEndpoint(), ports: Object.fromEntries(vpnPorts.map(({ listener, input }) => [listener.proto, Number(input.value)])) };
     result.portal.enabled = portalEnabled.checked;
+    result.portal.host = websiteHost();
     result.gateway.services = rows.filter(row => !row.removed).map(row => ({ name: row.name.value.trim(), host: row.host.value.trim(), url: row.url.value.trim(), paths: row.paths.value.split(/[\s,]+/).filter(Boolean), public: row.public.checked, insecure_tls: row.insecure_tls.checked }));
+    // LAN blocks are shared by VPN and relay; keep only one editable list.
+    result.relay = { ...relay, enabled: relayEnabled.checked, url: relayURL(), allowed_cidrs: relay.allowed_cidrs.filter(value => value.includes(':')) };
     return result;
   };
   const save = async restart => {
-    await withToast(api('/api/network/settings', { method: 'PUT', body: collect() }), 'Network settings saved privately');
-    if (restart) await withToast(api('/api/server/restart', { method: 'POST' }), 'VPN restarting; clients will reconnect');
-    else toast('Restart OpenVPN to apply VPN and firewall changes');
+    await api('/api/network/settings', { method: 'PUT', body: collect() });
+    if (restart) await api('/api/server/restart', { method: 'POST' });
   };
-  return card('Network and private portal', h('div', { class: 'form' },
-    h('p', { class: 'small muted' }, 'These settings are stored privately on this server and excluded from Git. VPN and firewall changes require an OpenVPN restart. Relay policy updates automatically.'),
+  const busy = async (button, action) => {
+    button.disabled = true;
+    try { await action(); } catch (error) { toast(error.message, 'err'); }
+    finally { button.disabled = false; }
+  };
+  return card('Network and private portal', h('div', { class: 'form network-settings' },
+    h('p', { class: 'small muted' }, 'VPN profiles, website, portal and relay share the addresses below. Existing public URLs are reused. VPN and firewall changes need a VPN restart.'),
+    h('h3', null, 'Public addresses and backends'),
+    h('div', { class: 'form cols' }, domainField, backendField), addressSummary,
+    details('Custom addresses and ports',
+      field('VPN profile host override', vpnHost, 'Optional. Defaults to the gateway domain. Keep a different hostname or IP here when VPN clients use a separate endpoint.'),
+      h('div', { class: 'form cols' }, vpnPorts.map(({ listener, input }) => field(`Public ${listener.proto.toUpperCase()} port`, input, `OpenVPN listens on ${listener.port}/${listener.proto}; use a different port only with a matching port forward.`))),
+      h('p', { class: 'small muted' }, 'Changing the VPN endpoint regenerates client profiles. Download them again if their public address or ports change.'),
+      field('Website hostname override', website, 'Optional. Defaults to openvpn.<gateway domain>; also used by the private portal.'),
+      field('Public relay port', relayPort, 'Uses the gateway domain unless a custom relay URL is entered.'),
+      field('Custom relay URL', customRelay, 'Optional HTTPS origin for a different relay hostname or port.'),
+      field('Relay backend override', relayBackend, 'Optional. Defaults to the UI backend host on port 8444.')),
+    h('label', { class: 'row' }, relayEnabled, 'Enable Apple relay profiles'),
+    h('p', { class: 'small muted' }, relay.transport === 'http2' ? 'Traefik handles relay TLS and forwards HTTP/2 to the backend. Relay access follows each client’s VPN role.' : 'Direct HTTP/3 requires a certificate on the relay server and a reachable UDP port.'),
+    h('h3', null, 'Access and guest isolation'),
     h('div', { class: 'form cols' },
+      input('lan_cidrs', 'LAN networks blocked for guests', 'Shared by OpenVPN and Apple relay. Existing relay LAN blocks are included.'),
+      input('blocked_cidrs', 'Other networks blocked for guests', 'Include public ingress addresses that could loop back into your LAN.'),
+      input('proxy_cidrs', 'Trusted reverse proxy CIDRs', 'Actual proxy source addresses; also used by the relay HTTP/2 listener.'),
+      input('gateway.trusted_cidrs', 'Networks allowed into private services', 'Administrator/full-access source networks. These are separate from guest LAN blocks.')),
+    details('VPN addressing, DNS and routes', h('div', { class: 'form cols' },
       input('vpn_subnet', 'VPN subnet'), input('guest_subnet', 'Guest subnet'),
       input('pool_first', 'First dynamic client address'), input('pool_last', 'Last dynamic client address'),
-      input('dns_servers', 'VPN DNS servers'), input('routes', 'Additional VPN routes'),
-      input('lan_cidrs', 'LAN networks blocked for guests'), input('blocked_cidrs', 'Other networks blocked for guests', 'Include public ingress addresses that could loop back into your LAN.'),
-      input('proxy_cidrs', 'Trusted reverse proxy CIDRs', 'The actual source addresses of your proxy; also used by the relay HTTP/2 listener.')),
+      input('dns_servers', 'VPN DNS servers'), input('routes', 'Additional VPN routes'))),
+    h('h3', null, 'Private portal'),
+    h('p', { class: 'small muted' }, 'Uses the website hostname shown above. Deploy the dedicated Traefik listener before enabling guest access.'),
     h('label', { class: 'row' }, portalEnabled, 'Allow guests to use the private portal'),
-    h('div', { class: 'form cols' }, input('portal.host', 'Portal hostname'), input('portal.target', 'Dedicated portal listener', 'LAN IPv4:port, for example 192.0.2.10:9443. This listener must serve only portal paths.'), input('portal.destinations', 'Portal DNS IPv4 addresses')),
-    h('p', { class: 'small muted' }, 'Keep the dedicated portal port private. Deploy its Traefik configuration before enabling guest access.'),
-    h('div', { class: 'form cols' }, input('gateway.domain', 'Gateway domain'), input('gateway.openvpn_host', 'OpenVPN website hostname'),
-      input('gateway.openvpn_backend', 'OpenVPN UI backend URL'), input('gateway.relay_host', 'Relay TLS hostname'), input('gateway.relay_backend', 'Relay HTTP/2 backend address:port'),
-      input('gateway.trusted_cidrs', 'Networks allowed into private services'), input('gateway.portal_cidrs', 'Networks allowed into the portal', 'Include the VPN/relay server source address; empty uses the private-service networks.')),
-    h('p', null, 'Additional gateway services'), services,
-    h('div', null, h('button', { class: 'btn', onClick: () => addService() }, 'Add service')),
-    h('div', { class: 'row' }, h('button', { class: 'btn', onClick: () => save(false) }, 'Save network settings'),
-      h('button', { class: 'btn primary', onClick: () => save(true) }, 'Save and restart VPN'),
-      h('button', { class: 'btn', onClick: async () => {
-        try {
-          const response = await fetch('/api/network/traefik.json');
-          if (!response.ok) { const error = await response.json(); throw new Error(error.detail || 'Export failed'); }
-          const url = URL.createObjectURL(await response.blob());
-          const link = h('a', { href: url, download: 'network.private.json' }); document.body.append(link); link.click(); link.remove();
-          setTimeout(() => URL.revokeObjectURL(url), 60000);
-        } catch (error) { toast(error.message, 'err'); }
-      } }, 'Download saved Traefik settings')),
-    h('p', { class: 'small muted' }, 'On the gateway, import the downloaded file with ./manage setup --network-file /path/to/network.private.json, then recreate Traefik. The export contains your network details; keep it private.')));
+    details('Guest portal listener and access', h('div', { class: 'form cols' },
+      input('portal.target', 'Dedicated portal listener', 'LAN IPv4:port, for example 192.0.2.10:9443. Keep this portal-only listener private.'),
+      input('portal.destinations', 'Portal DNS IPv4 addresses'),
+      input('gateway.portal_cidrs', 'Networks allowed into the portal', 'Include the VPN/relay server source address; empty uses the private-service networks.'))),
+    details('Additional gateway services',
+      h('p', { class: 'small muted' }, 'Include every service you want the gateway export to manage. Importing it replaces the legacy service inventory.'), services,
+      h('div', null, h('button', { class: 'btn', onClick: () => addService() }, 'Add service'))),
+    h('div', { class: 'row' },
+      h('button', { class: 'btn', onClick: e => busy(e.currentTarget, async () => { await save(false); toast('Network and relay settings saved; restart VPN to apply firewall changes'); }) }, 'Save settings'),
+      h('button', { class: 'btn primary', onClick: e => busy(e.currentTarget, async () => { await save(true); toast('Settings saved; VPN restarting and clients will reconnect'); }) }, 'Save and restart VPN'),
+      h('button', { class: 'btn', onClick: e => busy(e.currentTarget, async () => {
+        await save(false);
+        const response = await fetch('/api/network/traefik.json');
+        if (!response.ok) { const error = await response.json(); throw new Error(error.detail || 'Export failed'); }
+        const url = URL.createObjectURL(await response.blob());
+        const link = h('a', { href: url, download: 'network.private.json' }); document.body.append(link); link.click(); link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 60000);
+        toast('Settings saved and Traefik file downloaded');
+      }) }, 'Save and download Traefik settings')),
+    h('p', { class: 'small muted' }, 'Copy network.private.json to the gateway, run ./manage setup --network-file ./network.private.json there, then recreate Traefik. Keep the file private.')));
 }
 
 function settingsView(el) {
@@ -1124,12 +1178,6 @@ function settingsView(el) {
     let relay;
     let network;
     try { [s, relay, network] = await Promise.all([api('/api/settings'), api('/api/relay/settings'), api('/api/network/settings')]); } catch (e) { toast(e.message, 'err'); return; }
-    const host = h('input', { class: 'input', value: s.remote.host, placeholder: 'vpn.example.com or public IP' });
-    const ports = s.listen.map(l => ({ l, input: h('input', { class: 'input', type: 'number', min: 1, max: 65535, value: (s.remote.remotes.find(r => r.proto === l.proto) || l).port, onInput: () => checkPort() }) }));
-    const mismatch = h('div');
-    const checkPort = () => mismatch.replaceChildren(warnings(ports.filter(({ l, input }) => input.value && input.value !== String(l.port))
-      .map(({ l, input }) => `OpenVPN listens on ${l.port}/${l.proto}. Use ${input.value} only if a router or relay forwards ${input.value} to it.`)) || '');
-    checkPort();
     const cur = h('input', { class: 'input', type: 'password', autocomplete: 'current-password' });
     const nw = h('input', { class: 'input', type: 'password', autocomplete: 'new-password', minlength: 8 });
     const nw2 = h('input', { class: 'input', type: 'password', autocomplete: 'new-password' });
@@ -1137,17 +1185,11 @@ function settingsView(el) {
     const curTheme = localStorage.getItem('theme') || 'system';
     for (const t of ['system', 'light', 'dark']) theme.append(h('button', { class: t === curTheme ? 'active' : '', onClick: e => { localStorage.setItem('theme', t); applyTheme(); theme.querySelectorAll('button').forEach(b => b.classList.toggle('active', b === e.currentTarget)); } }, t));
     body.append(
+      networkSettingsCard(network, relay, s),
       h('div', { class: 'grid two' },
-        card('Public address for client profiles', h('div', { class: 'form' }, h('div', { class: 'form cols' }, h('div', { class: 'full' }, field('Host', host)),
-          ports.map(({ l, input }) => field(`${l.proto.toUpperCase()} port`, input, ports.length < 2 ? null : l.proto === 'udp' ? 'tried first' : 'fallback when UDP is blocked'))),
-          mismatch,
-          h('p', { class: 'small muted', style: 'margin:0' }, 'The address clients dial: one "remote" line per protocol OpenVPN listens on (the "local" lines of server.conf), UDP first. It is the public one, which differs from the listening address whenever a router or relay forwards the port. Protocols are not set here: a forward can remap a port but never change UDP into TCP. Saving regenerates every profile; hand them out again if the address changed.'),
-          h('div', null, h('button', { class: 'btn primary', onClick: async () => { const r = await withToast(api('/api/settings', { method: 'PUT', body: { host: host.value.trim(), ports: Object.fromEntries(ports.map(({ l, input }) => [l.proto, Number(input.value)])) } }), 'Saved and profiles regenerated'); s = r; checkPort(); } }, 'Save')))),
         card('Change password', h('div', { class: 'form' }, field('Current password', cur), field('New password', nw, 'At least 8 characters'), field('Repeat new password', nw2),
-          h('div', null, h('button', { class: 'btn primary', onClick: async () => { if (nw.value !== nw2.value) { toast('Passwords do not match', 'err'); return; } await withToast(api('/api/me/password', { method: 'POST', body: { current: cur.value, new: nw.value } }), 'Password changed'); cur.value = nw.value = nw2.value = ''; } }, 'Change password'))))),
-      h('div', { class: 'grid two' },
-        card('Appearance', h('div', { class: 'row' }, theme)),
-        card('About', h('dl', { class: 'kv' }, h('dt', null, 'UI version'), h('dd', null, s.version), h('dt', null, 'Signed in as'), h('dd', null, state.user.username), h('dt', null, 'Poll interval'), h('dd', null, `${s.poll_interval} s`), h('dt', null, '2FA issuer'), h('dd', null, s.tfa_issuer)))), networkSettingsCard(network), relaySettingsCard(relay));
+          h('div', null, h('button', { class: 'btn primary', onClick: async () => { if (nw.value !== nw2.value) { toast('Passwords do not match', 'err'); return; } await withToast(api('/api/me/password', { method: 'POST', body: { current: cur.value, new: nw.value } }), 'Password changed'); cur.value = nw.value = nw2.value = ''; } }, 'Change password')))), card('Appearance', h('div', { class: 'row' }, theme))),
+      card('About', h('dl', { class: 'kv' }, h('dt', null, 'UI version'), h('dd', null, s.version), h('dt', null, 'Signed in as'), h('dd', null, state.user.username), h('dt', null, 'Poll interval'), h('dd', null, `${s.poll_interval} s`), h('dt', null, '2FA issuer'), h('dd', null, s.tfa_issuer))));
   })();
   return null;
 }

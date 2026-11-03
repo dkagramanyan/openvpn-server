@@ -631,21 +631,25 @@ def server_listen() -> list[dict[str, str]]:
     return [{"port": p or port, "proto": pr or proto} for p, pr in local] or [{"port": port, "proto": proto}]
 
 
-@_locked
-def set_remote(host: str, ports: dict[str, int | str] | None = None) -> None:
-    """Point client profiles at <host>, with one "remote" line per listening socket, UDP first
-    so the client falls back to TCP. A port forward can remap a port but never the protocol, so
-    the protocols always follow server.conf; <ports> sets the public port per protocol."""
+def validate_remote(host: str, ports: dict[str, int | str] | None = None) -> list[str]:
+    """Validate the public endpoint without changing files or client profiles."""
     host = host.strip()
     if not HOST_RE.match(host):
         raise PkiError("Invalid host name or IP address")
     current = {r["proto"]: r["port"] for r in get_remote()["remotes"]}
     remotes = []
     for sock in sorted(server_listen(), key=lambda l: l["proto"] != "udp"):
-        port = str((ports or {}).get(sock["proto"]) or current.get(sock["proto"]) or sock["port"])
+        port = str((ports or {}).get(sock["proto"], current.get(sock["proto"]) or sock["port"]))
         if not port.isdigit() or not 1 <= int(port) <= 65535:
             raise PkiError(f"Invalid {sock['proto'].upper()} port")
         remotes.append(f"remote {host} {port} {sock['proto']}")
+    return remotes
+
+
+@_locked
+def set_remote(host: str, ports: dict[str, int | str] | None = None) -> None:
+    """Update public profile endpoints; protocols always follow server.conf."""
+    remotes = validate_remote(host, ports)
     lines = [l for l in read_config("client").splitlines() if not re.match(r"^\s*(remote|proto)\s+", l)]
     at = next((i + 1 for i, l in enumerate(lines) if l.strip() == "client"), 0)   # keep "client" first
     write_config("client", "\n".join(lines[:at] + remotes + lines[at:]) + "\n")
