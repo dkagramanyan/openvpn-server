@@ -167,6 +167,11 @@ class Database:
             if col not in have:
                 conn.execute(f"ALTER TABLE vpn_sessions ADD COLUMN {col} {kind}")
         conn.execute("CREATE INDEX IF NOT EXISTS vpn_sessions_grp ON vpn_sessions (grp)")
+        have_users = {r["name"] for r in conn.execute("PRAGMA table_info(users)")}
+        for column in ("client_name", "client_serial"):
+            if column not in have_users:
+                conn.execute(f"ALTER TABLE users ADD COLUMN {column} TEXT")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_client ON users(client_name) WHERE client_name IS NOT NULL")
 
     # -- connection handling -------------------------------------------------
     def _conn(self) -> sqlite3.Connection:

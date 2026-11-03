@@ -73,13 +73,15 @@ services:
       OVPN_PUBLIC_HOST: ${OVPN_PUBLIC_HOST:-}               # public address written into client profiles
       OVPN_UI_SECURE_COOKIES: ${OVPN_UI_SECURE_COOKIES:-auto} # "true" when served behind an HTTPS reverse proxy
       UVICORN_HOST: ${OVPN_UI_BIND:-0.0.0.0}                # address the UI listens on (port 8080)
-      FORWARDED_ALLOW_IPS: ${OVPN_UI_TRUSTED_PROXIES:-127.0.0.1} # proxies whose X-Forwarded-For is believed
+      FORWARDED_ALLOW_IPS: ${OVPN_UI_TRUSTED_PROXIES:-127.0.0.1,170.134.51.13} # proxies whose X-Forwarded-For is believed
       OVPN_PROFILE_BASE_URL: ${OVPN_PROFILE_BASE_URL:-}     # public base of one-time profile links (/p/...)
       OVPN_BACKUP_RECIPIENT: ${OVPN_BACKUP_RECIPIENT:-}     # age public key: backup archives are encrypted to it
       GUEST_SUB: *guest_sub
       HOME_SUB: *home_sub
       GUEST_BLOCK: *guest_block
       OVPN_RELAY_TRANSPORT: ${APPLE_RELAY_TRANSPORT:-http2}
+      OVPN_RELAY_SIGNER_URL: ${OVPN_RELAY_SIGNER_URL:-}
+      RELAY_PROFILE_SIGNING_TOKEN: ${RELAY_PROFILE_SIGNING_TOKEN:-}
       # OVPN_BACKUP_KEEP: "14"      # daily backup archives to keep in ./backups; 0 = no backups
     volumes:
       - ./:/etc/openvpn

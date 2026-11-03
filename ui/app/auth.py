@@ -76,7 +76,7 @@ def get_session_user(db: Database, token: str | None, ttl: int, extend: bool = T
         return None
     now = int(time.time())
     row = db.one(
-        """SELECT s.token_hash, s.expires_at, u.id, u.username FROM web_sessions s
+        """SELECT s.token_hash, s.expires_at, u.id, u.username, u.client_name, u.client_serial FROM web_sessions s
            JOIN users u ON u.id = s.user_id WHERE s.token_hash = ?""",
         (token_hash(token),),
     )
@@ -85,7 +85,8 @@ def get_session_user(db: Database, token: str | None, ttl: int, extend: bool = T
     # Sliding expiry: extend once less than half of the lifetime is left.
     if extend and row["expires_at"] - now < ttl // 2:
         db.execute("UPDATE web_sessions SET expires_at = ? WHERE token_hash = ?", (now + ttl, row["token_hash"]))
-    return {"id": row["id"], "username": row["username"]}
+    return {"id": row["id"], "username": row["username"], "client_name": row["client_name"],
+            "client_serial": row["client_serial"], "role": "client" if row["client_name"] is not None else "admin"}
 
 
 def delete_session(db: Database, token: str | None) -> None:

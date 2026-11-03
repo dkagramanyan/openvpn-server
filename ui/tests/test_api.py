@@ -161,7 +161,7 @@ def test_login_is_throttled_per_user_and_per_address(client, monkeypatch):
 def test_every_route_needs_a_session_and_every_change_the_csrf_header(client):
     from fastapi.routing import APIRoute
     from app.main import app, limiter
-    public = {"/healthz", "/", "/p/{token}", "/p/{token}/download"}
+    public = {"/healthz", "/", "/portal", "/p/{token}", "/p/{token}/download"}
     cookies = dict(client.cookies)
     seen = 0
     try:
@@ -178,9 +178,9 @@ def test_every_route_needs_a_session_and_every_change_the_csrf_header(client):
                 r = client.request(method, path, json={}, headers=H)
                 if route.path == "/api/relay/authorize":
                     assert r.status_code == 403  # machine endpoint requires a relay bearer credential
-                elif route.path in public or route.path == "/api/logout":
+                elif route.path in public or route.path in ("/api/logout", "/api/portal/logout"):
                     assert r.status_code != 401, (method, path)
-                elif route.path == "/api/login":
+                elif route.path in ("/api/login", "/api/portal/login"):
                     assert r.status_code == 422, (method, path)      # an empty body
                 else:
                     assert r.status_code == 401, (method, path)
@@ -623,12 +623,12 @@ def test_profile_and_revoke(client, configured):
     profile, token = download(client)
     payload = profile["PayloadContent"][0]
     assert payload["PayloadType"] == "com.apple.relay.managed"
-    assert payload["MatchDomains"] == ["home.arpa"]
+    assert payload["MatchDomains"] == []
     assert payload["Relays"][0]["HTTP2RelayURL"].endswith("/{target_host}/{target_port}/")
     assert "HTTP3RelayURL" not in payload["Relays"][0]
     assert download(client) == (profile, token)  # repeat downloads don't break installed profiles
     auth = {"Authorization": token}
-    assert client.post("/api/relay/authorize", headers=auth).json()["allowed_cidrs"] == configured["allowed_cidrs"]
+    assert client.post("/api/relay/authorize", headers=auth).json()["allowed_cidrs"] == ["0.0.0.0/0", "::/0"]
     assert client.delete("/api/clients/alice/relay", headers=H).status_code == 200
     assert client.post("/api/relay/authorize", headers=auth).status_code == 403
     assert download(client)[1] != token
@@ -647,11 +647,11 @@ def test_full_access_relay_routes_internet_and_lan(client, configured):
     assert full_profile["PayloadContent"][0]["MatchDomains"] == []
     assert "Internet and LAN" in full_profile["PayloadDescription"]
     policy = client.post("/api/relay/authorize", headers={"Authorization": token}).json()
-    assert policy == {"guest": False, "allowed_cidrs": ["0.0.0.0/0", "::/0"],
+    assert policy == {"client": "alice", "guest": False, "allowed_cidrs": ["0.0.0.0/0", "::/0"],
                       "blocked_cidrs": [], "url": configured["url"]}
-    # Restoring LAN-only mode narrows server-side access for the existing grant.
-    assert client.put("/api/relay/settings", json=configured, headers=H).status_code == 200
-    assert client.post("/api/relay/authorize", headers={"Authorization": token}).json()["allowed_cidrs"] == configured["allowed_cidrs"]
+    # Legacy split-routing settings cannot diverge from the OpenVPN access role.
+    assert client.put("/api/relay/settings", json={**configured, "route_all": False}, headers=H).json()["route_all"] is True
+    assert client.post("/api/relay/authorize", headers={"Authorization": token}).json()["allowed_cidrs"] == ["0.0.0.0/0", "::/0"]
     assert download(client)[0] == lan_profile
 
 
@@ -693,7 +693,7 @@ def test_auth_and_csrf(client, configured):
     assert client.post("/api/relay/authorize", headers={"Authorization": token + "x"}).status_code == 403
 
 
-@pytest.mark.parametrize("change", ["expired", "revoked", "renewed", "guest", "missing", "disabled"])
+@pytest.mark.parametrize("change", ["expired", "revoked", "renewed", "missing", "disabled"])
 def test_lifecycle_denies_existing_credentials(client, configured, monkeypatch, change):
     _, token = download(client)
     from app.settings import settings
@@ -722,7 +722,7 @@ def test_lifecycle_denies_existing_credentials(client, configured, monkeypatch, 
     {"url": "http://relay.example.com"}, {"url": "https://u:p@relay.example.com"},
     {"url": "https://relay.example.com/path"}, {"url": "https://relay.example.com:70000"},
     {"url": "https://relay.example.com?token=secret"}, {"url": ""},
-    {"match_domains": []}, {"match_domains": ["*.home.arpa"]},
+    {"match_domains": ["*.home.arpa"]},
     {"allowed_cidrs": []}, {"allowed_cidrs": ["192.168.1.12/24"]},
 ])
 def test_settings_validation(client, configured, updates):
@@ -752,8 +752,9 @@ def test_guest_and_non_guest_relay_profiles(client, configured, route_all):
     _, full_token = download(client)
     try:
         assert client.put("/api/clients/alice/access", json={"guest": True}, headers=H).status_code == 200
-        assert client.post("/api/relay/authorize", headers={"Authorization": full_token}).status_code == 403
+        assert client.post("/api/relay/authorize", headers={"Authorization": full_token}).json()["guest"] is True
         profile, guest_token = download(client)
+        assert guest_token == full_token
         assert profile["PayloadContent"][0]["MatchDomains"] == []
         assert "Guest" in profile["PayloadDisplayName"]
         policy = client.post("/api/relay/authorize", headers={"Authorization": guest_token}).json()
@@ -766,10 +767,131 @@ def test_guest_and_non_guest_relay_profiles(client, configured, route_all):
         client.put("/api/clients/alice/access", json={"guest": True}, headers=H)
         assert client.post("/api/relay/authorize", headers={"Authorization": guest_token}).status_code == 200
         client.put("/api/clients/alice/access", json={"guest": False}, headers=H)
-        assert client.post("/api/relay/authorize", headers={"Authorization": guest_token}).status_code == 403
-        assert download(client)[0]["PayloadContent"][0]["MatchDomains"] == ([] if route_all else ["home.arpa"])
+        assert client.post("/api/relay/authorize", headers={"Authorization": guest_token}).json()["guest"] is False
+        assert download(client)[1] == full_token
+        assert download(client)[0]["PayloadContent"][0]["MatchDomains"] == []
     finally:
         pki.set_guest("alice", False)
+
+
+def test_ui_certificate_renewal_preserves_relay_profile(client, configured, monkeypatch):
+    original, token = download(client)
+    previous = relay.eligible("alice")
+    updated = {**previous, "serial": "RENEWED-SERIAL"}
+    monkeypatch.setattr(pki, "renew_client", lambda name, days: None)
+    monkeypatch.setattr(relay, "eligible", lambda name: updated)
+    response = client.post("/api/clients/alice/renew", json={"days": 365}, headers=H)
+    assert response.status_code == 200, response.text
+    assert client.post("/api/relay/authorize", headers={"Authorization": token}).status_code == 200
+    assert download(client)[1] == token
+    assert download(client)[0]["PayloadIdentifier"] == original["PayloadIdentifier"]
+
+
+@pytest.fixture
+def portal(client):
+    from fastapi.testclient import TestClient
+    assert client.put("/api/clients/alice/portal", json={"username": "alice-login", "password": "portal-test-password"}, headers=H).status_code == 200
+    browser = TestClient(app)
+    assert browser.post("/api/portal/login", json={"username": "alice-login", "password": "portal-test-password"}, headers=H).status_code == 200
+    yield browser
+    browser.close()
+    client.delete("/api/clients/alice/portal", headers=H)
+
+
+def test_portal_downloads_only_own_profiles(client, configured, portal):
+    assert portal.get("/api/portal").json()["name"] == "alice"
+    me = portal.get("/api/portal/me").json()
+    assert me["role"] == "client" and me["client_name"] == "alice"
+    ovpn = portal.get("/api/portal/ovpn")
+    assert ovpn.status_code == 200 and "alice.ovpn" in ovpn.headers["content-disposition"]
+    response = portal.post("/api/portal/relay.mobileconfig", headers=H)
+    assert response.status_code == 200
+    assert "alice" in plistlib.loads(response.content)["PayloadDisplayName"]
+    assert portal.post("/api/portal/relay.mobileconfig").status_code == 403
+    assert portal.get("/api/portal?name=bob").json()["name"] == "alice"
+    assert portal.get("/api/portal/bob/ovpn").status_code == 404
+
+
+def test_portal_cannot_access_any_administrative_api(portal):
+    from fastapi.routing import APIRoute
+    personal = {"/api/login", "/api/logout", "/api/me", "/api/me/password", "/api/relay/authorize"}
+    checked = 0
+    for route in app.routes:
+        if not isinstance(route, APIRoute) or not route.path.startswith("/api/") or route.path in personal or route.path.startswith("/api/portal"):
+            continue
+        path = route.path.replace("{name}", "alice").replace("{which}", "server")
+        for method in route.methods - {"HEAD", "OPTIONS"}:
+            response = portal.request(method, path, json={}, headers=H)
+            assert response.status_code == 403, (method, path, response.status_code)
+            checked += 1
+    assert checked >= 30
+    assert portal.post("/api/relay/authorize").status_code == 403
+
+
+def test_portal_password_reset_disable_and_admin_collision(client, portal):
+    assert client.put("/api/clients/alice/portal", json={"username": "admin", "password": "replacement-password"}, headers=H).status_code == 400
+    assert portal.post("/api/portal/password", json={"current": "portal-test-password", "new": "my-new-test-password"}, headers=H).status_code == 200
+    assert portal.get("/api/portal").status_code == 200
+    assert client.put("/api/clients/alice/portal", json={"username": "alice-login", "password": "admin-reset-password"}, headers=H).status_code == 200
+    assert portal.get("/api/portal").status_code == 401
+    assert portal.post("/api/portal/login", json={"username": "alice-login", "password": "admin-reset-password"}, headers=H).status_code == 200
+    assert client.delete("/api/clients/alice/portal", headers=H).status_code == 200
+    assert portal.get("/api/portal").status_code == 401
+    assert portal.post("/api/portal/login", json={"username": "alice-login", "password": "admin-reset-password"}, headers=H).status_code == 401
+
+
+def test_portal_rejects_revoked_or_replaced_client(client, portal, monkeypatch):
+    cert = relay.eligible("alice")
+    monkeypatch.setattr(relay, "eligible", lambda name: {**cert, "serial": "UNEXPECTED-REPLACEMENT"})
+    assert portal.get("/api/portal").status_code == 401
+    assert portal.post("/api/portal/login", json={"username": "alice-login", "password": "portal-test-password"}, headers=H).status_code == 401
+
+
+def test_portal_survives_normal_ui_renewal(client, portal, monkeypatch):
+    cert = relay.eligible("alice")
+    monkeypatch.setattr(pki, "renew_client", lambda name, days: None)
+    monkeypatch.setattr(relay, "eligible", lambda name: {**cert, "serial": "NORMAL-RENEWAL"})
+    assert client.post("/api/clients/alice/renew", json={"days": 365}, headers=H).status_code == 200
+    assert portal.get("/api/portal").status_code == 200
+
+
+def test_portal_signer_failure_never_returns_unsigned_profile(client, configured, portal, monkeypatch):
+    from app.settings import settings
+    monkeypatch.setattr(settings, "relay_signer_url", "https://signer.example.com/internal/relay-sign")
+    def failed(*args):
+        raise pki.PkiError("Signing service is offline")
+    monkeypatch.setattr(relay, "sign_profile", failed)
+    response = portal.post("/api/portal/relay.mobileconfig", headers=H)
+    assert response.status_code == 503
+    assert "contact the administrator" in response.json()["detail"]
+    assert not response.content.startswith(b"<?xml")
+    response = client.post("/api/clients/alice/relay.mobileconfig", headers=H)
+    assert response.status_code == 400 and "Signing service is offline" in response.json()["detail"]
+
+
+def test_public_portal_login_rejects_admin_credentials(client):
+    from fastapi.testclient import TestClient
+    browser = TestClient(app)
+    try:
+        assert browser.post("/api/portal/login", json={"username": "admin", "password": "test-password"}, headers=H).status_code == 401
+        assert not browser.cookies
+    finally:
+        browser.close()
+
+
+def test_relay_diagnostics_require_admin_session(client, monkeypatch):
+    from app import relay_services
+    monkeypatch.setattr(relay_services, "runtime_status", lambda: {"ready": True, "active": [], "events": []})
+    monkeypatch.setattr(relay_services, "signing_status", lambda: {"ready": True, "configured": True})
+    assert client.get("/api/relay/status").json()["ready"] is True
+    assert client.get("/api/relay/signing").json()["ready"] is True
+    cookies = dict(client.cookies)
+    client.cookies.clear()
+    try:
+        assert client.get("/api/relay/status").status_code == 401
+        assert client.get("/api/relay/signing").status_code == 401
+    finally:
+        client.cookies.update(cookies)
 
 
 def test_guest_relay_denies_when_network_configuration_unreadable(client, configured, monkeypatch):

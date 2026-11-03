@@ -19,7 +19,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Str
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import __version__, auth, backup, pki, relay, watchdog
+from . import __version__, auth, backup, pki, relay, relay_services, watchdog
 from .collector import Collector, Maintenance
 from .db import Database
 from .mgmt import Management, ManagementError
@@ -155,10 +155,22 @@ def cookie_secure(request: Request) -> bool:
     return request.url.scheme == "https"
 
 
-def current_user(request: Request) -> dict[str, Any]:
+def signed_in_user(request: Request) -> dict[str, Any]:
     user = auth.get_session_user(db, request.cookies.get(COOKIE), settings.session_ttl)
     if user is None:
         raise HTTPException(401, "Not authenticated")
+    if user["role"] == "client":
+        cert = relay.eligible(user["client_name"])
+        if not cert or cert["serial"] != user["client_serial"]:
+            auth.delete_session(db, request.cookies.get(COOKIE))
+            raise HTTPException(401, "Client access is no longer valid")
+    return user
+
+
+def current_user(request: Request) -> dict[str, Any]:
+    user = signed_in_user(request)
+    if user["role"] != "admin":
+        raise HTTPException(403, "Administrator access required")
     return user
 
 
@@ -172,6 +184,7 @@ def csrf_check(request: Request) -> None:
 
 
 Authed = Depends(current_user)
+SignedIn = Depends(signed_in_user)
 Csrf = Depends(csrf_check)
 
 
@@ -230,6 +243,11 @@ class TfaEnforceBody(BaseModel):
 
 class AccessBody(BaseModel):
     guest: bool
+
+
+class PortalBody(BaseModel):
+    username: str = Field(min_length=1, max_length=64, pattern=r"^[a-zA-Z0-9_.@-]+$")
+    password: str = Field(min_length=8, max_length=256)
 
 
 class ShareBody(BaseModel):
@@ -342,6 +360,7 @@ def event(kind: str, user: dict[str, Any] | None, client: str | None = None, det
 
 # -- auth endpoints -------------------------------------------------------------
 @app.post("/api/login", dependencies=[Csrf])
+@app.post("/api/portal/login", dependencies=[Csrf])
 def login(body: LoginBody, request: Request, response: Response):
     ip = client_ip(request)
     key = f"{ip}|{body.username.lower()}"
@@ -351,7 +370,12 @@ def login(body: LoginBody, request: Request, response: Response):
     row = db.one("SELECT * FROM users WHERE username = ?", (body.username,))
     if row is None:
         auth.verify_unknown_user(body.password)
-    if row is None or not auth.verify_password(body.password, row["password_hash"]):
+    valid_client = True
+    if row is not None and row["client_name"] is not None:
+        cert = relay.eligible(row["client_name"])
+        valid_client = bool(cert and cert["serial"] == row["client_serial"])
+    portal_admin = request.url.path == "/api/portal/login" and row is not None and row["client_name"] is None
+    if row is None or not auth.verify_password(body.password, row["password_hash"]) or not valid_client or portal_admin:
         db.add_event("login_failed", None, body.username[:64], ip)
         raise HTTPException(401, "Invalid username or password")
     limiter.success(ip)
@@ -364,10 +388,12 @@ def login(body: LoginBody, request: Request, response: Response):
     db.add_event("login", None, row["username"], client_ip(request))
     response.set_cookie(COOKIE, token, max_age=settings.session_ttl, httponly=True, samesite="strict",
                         secure=cookie_secure(request), path="/")
-    return {"username": row["username"], "guest_sub": settings.guest_sub}
+    return {"username": row["username"], "guest_sub": settings.guest_sub,
+            "role": "client" if row["client_name"] is not None else "admin", "client_name": row["client_name"]}
 
 
 @app.post("/api/logout", dependencies=[Csrf])
+@app.post("/api/portal/logout", dependencies=[Csrf])
 def logout(request: Request, response: Response):
     auth.delete_session(db, request.cookies.get(COOKIE))
     response.delete_cookie(COOKIE, path="/")
@@ -375,12 +401,15 @@ def logout(request: Request, response: Response):
 
 
 @app.get("/api/me")
-def me(user: dict[str, Any] = Authed):
-    return {"username": user["username"], "version": __version__, "guest_sub": settings.guest_sub}
+@app.get("/api/portal/me")
+def me(user: dict[str, Any] = SignedIn):
+    return {"username": user["username"], "version": __version__, "guest_sub": settings.guest_sub,
+            "role": user["role"], "client_name": user["client_name"]}
 
 
 @app.post("/api/me/password", dependencies=[Csrf])
-def change_password(body: PasswordBody, request: Request, user: dict[str, Any] = Authed):
+@app.post("/api/portal/password", dependencies=[Csrf])
+def change_password(body: PasswordBody, request: Request, user: dict[str, Any] = SignedIn):
     row = db.one("SELECT password_hash FROM users WHERE id = ?", (user["id"],))
     if row is None or not auth.verify_password(body.current, row["password_hash"]):
         raise HTTPException(400, "Current password is incorrect")
@@ -388,6 +417,89 @@ def change_password(body: PasswordBody, request: Request, user: dict[str, Any] =
     auth.delete_user_sessions(db, user["id"], keep_token=request.cookies.get(COOKIE))
     event("password_changed", user)
     return {"ok": True}
+
+
+def disable_portal(name):
+    row = db.one("SELECT id FROM users WHERE client_name = ?", (name,))
+    if row:
+        auth.delete_user_sessions(db, row["id"])
+        db.execute("DELETE FROM users WHERE id = ?", (row["id"],))
+
+
+@app.get("/api/clients/{name}/portal")
+def portal_account(name: str, user: dict[str, Any] = Authed):
+    find_client(name)
+    row = db.one("SELECT username FROM users WHERE client_name = ?", (name,))
+    return {"enabled": bool(row), "username": row["username"] if row else name}
+
+
+@app.put("/api/clients/{name}/portal", dependencies=[Csrf])
+def set_portal_account(name: str, body: PortalBody, user: dict[str, Any] = Authed):
+    find_client(name)
+    cert = relay.eligible(name)
+    if not cert:
+        raise HTTPException(400, "Portal access requires a valid client certificate")
+    password_hash = auth.hash_password(body.password)
+    with db.tx() as conn:
+        existing = conn.execute("SELECT client_name FROM users WHERE username = ?", (body.username,)).fetchone()
+        if existing is not None and existing["client_name"] != name:
+            raise HTTPException(400, "This username is already in use")
+        row = conn.execute("SELECT id FROM users WHERE client_name = ?", (name,)).fetchone()
+        if row:
+            conn.execute("DELETE FROM web_sessions WHERE user_id = ?", (row["id"],))
+            conn.execute("UPDATE users SET username = ?, password_hash = ?, client_serial = ? WHERE id = ?",
+                         (body.username, password_hash, cert["serial"], row["id"]))
+        else:
+            conn.execute("INSERT INTO users (username, password_hash, created_at, client_name, client_serial) VALUES (?, ?, ?, ?, ?)",
+                         (body.username, password_hash, int(time.time()), name, cert["serial"]))
+    event("portal_access_set", user, name)
+    return {"enabled": True, "username": body.username}
+
+
+@app.delete("/api/clients/{name}/portal", dependencies=[Csrf])
+def remove_portal_account(name: str, user: dict[str, Any] = Authed):
+    find_client(name)
+    disable_portal(name)
+    event("portal_access_disabled", user, name)
+    return {"enabled": False}
+
+
+@app.get("/api/portal")
+def own_profile_info(user: dict[str, Any] = SignedIn):
+    if user["role"] != "client":
+        raise HTTPException(400, "This page is for client accounts")
+    cert = relay.eligible(user["client_name"])
+    if not cert:
+        raise HTTPException(401, "Client access is no longer valid")
+    return {"name": user["client_name"], "guest": relay.is_guest(user["client_name"]), "expires_at": cert["not_after"],
+            "relay_available": relay.get_settings(db)["enabled"], "signed_profiles": bool(settings.relay_signer_url)}
+
+
+@app.get("/api/portal/ovpn")
+def own_openvpn_profile(user: dict[str, Any] = SignedIn):
+    if user["role"] != "client":
+        raise HTTPException(400, "This page is for client accounts")
+    name = user["client_name"]
+    content = pki.build_profile(name)
+    event("portal_openvpn_downloaded", user, name)
+    return Response(content, media_type="application/x-openvpn-profile",
+                    headers={"Content-Disposition": f'attachment; filename="{name}.ovpn"'})
+
+
+@app.post("/api/portal/relay.mobileconfig", dependencies=[Csrf])
+def own_relay_profile(user: dict[str, Any] = SignedIn):
+    if user["role"] != "client":
+        raise HTTPException(400, "This page is for client accounts")
+    name = user["client_name"]
+    try:
+        content = relay.profile(db, name)
+    except PkiError:
+        if settings.relay_signer_url:
+            raise HTTPException(503, "Signed relay profiles are temporarily unavailable. Please retry or contact the administrator.")
+        raise
+    event("portal_relay_downloaded", user, name)
+    return Response(content, media_type="application/x-apple-aspen-config",
+                    headers={"Content-Disposition": f'attachment; filename="{name}-relay.mobileconfig"'})
 
 
 # -- overview / live --------------------------------------------------------------
@@ -574,6 +686,16 @@ def get_relay_settings(user: dict[str, Any] = Authed):
     return relay.get_settings(db)
 
 
+@app.get("/api/relay/status")
+def relay_status(user: dict[str, Any] = Authed):
+    return relay_services.runtime_status()
+
+
+@app.get("/api/relay/signing")
+def relay_signing(user: dict[str, Any] = Authed):
+    return relay_services.signing_status()
+
+
 @app.put("/api/relay/settings", dependencies=[Csrf])
 def put_relay_settings(body: relay.RelaySettings, user: dict[str, Any] = Authed):
     config = relay.save_settings(db, body)
@@ -643,6 +765,11 @@ def renew(name: str, body: DaysBody, user: dict[str, Any] = Authed):
     if row["state"] == "revoked":
         raise HTTPException(400, "Cannot renew a revoked certificate; create a new client instead")
     pki.renew_client(name, body.days)
+    relay.renewed(db, name, row["cert"]["serial"])
+    cert = relay.eligible(name)
+    if cert:
+        db.execute("UPDATE users SET client_serial = ? WHERE client_name = ? AND client_serial = ?",
+                   (cert["serial"], name, row["cert"]["serial"]))
     event("client_renewed", user, name)
     return {"client": find_client(name)}
 
@@ -663,6 +790,7 @@ def delete_client(name: str, user: dict[str, Any] = Authed):
     if row["state"] != "revoked":
         raise HTTPException(400, "Revoke the certificate before deleting the client")
     pki.remove_client(name)
+    disable_portal(name)
     relay.revoke(db, name)
     drop_share_links(name)
     serials = [row["cert"]["serial"]] + [h["serial"] for h in row["history"]]
@@ -694,12 +822,10 @@ def static_ip(name: str, body: StaticIpBody, user: dict[str, Any] = Authed):
 
 @app.put("/api/clients/{name}/access", dependencies=[Csrf])
 def set_access(name: str, body: AccessBody, user: dict[str, Any] = Authed):
-    previous = find_client(name)
+    find_client(name)
     pki.set_guest(name, body.guest)
-    if previous["guest"] != body.guest:
-        relay.revoke(db, name)
     event("access_changed", user, name, "guest" if body.guest else "full")
-    return {"guest": body.guest, "note": "Applies the next time a device connects"}
+    return {"guest": body.guest, "note": "OpenVPN applies on reconnect; relay access updates within seconds"}
 
 
 @app.post("/api/clients/{name}/share", dependencies=[Csrf])
@@ -950,6 +1076,7 @@ def healthz():
 
 
 @app.get("/")
+@app.get("/portal")
 def index():
     # Deployments can change assets without changing the release version.
     # Hash their contents so the browser cannot reuse a previous build's UI.

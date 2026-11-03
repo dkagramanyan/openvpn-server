@@ -11,6 +11,14 @@
 
 http:
   routers:
+    # Public download portal. Administrative API routes retain trusted-only.
+    user-portal:
+      rule: "Host(`openvpn.dgkagramanyan.ru`) && (Path(`/portal`) || Path(`/api/portal`) || PathPrefix(`/api/portal/`) || PathPrefix(`/static/`))"
+      priority: 200
+      entryPoints: [websecure]
+      service: openvpn
+      tls: {}
+
     # ---------------------------------------------------------------- public
     status:
       rule: "Host(`status.dgkagramanyan.ru`)"

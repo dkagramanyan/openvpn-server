@@ -112,3 +112,30 @@ func TestConcurrentAuthorizationCoalescesAndExpires(t *testing.T) {
 		t.Fatal("failed checks must not be cached")
 	}
 }
+
+func TestAuthorizationRetriesTransientOutageButNotDenial(t *testing.T) {
+	for _, deny := range []bool{false, true} {
+		var calls atomic.Int32
+		api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			n := calls.Add(1)
+			if deny {
+				w.WriteHeader(403)
+				return
+			}
+			if n < 3 {
+				w.WriteHeader(503)
+				return
+			}
+			json.NewEncoder(w).Encode(policy{CIDRs: []string{"192.168.1.0/24"}})
+		}))
+		s := &relayServer{api: api.URL, client: api.Client()}
+		_, err := s.authorize(context.Background(), "Bearer alice:test")
+		api.Close()
+		if deny && (err == nil || calls.Load() != 1) {
+			t.Fatal("retried explicit denial")
+		}
+		if !deny && (err != nil || calls.Load() != 3) {
+			t.Fatal("did not recover from transient outage")
+		}
+	}
+}

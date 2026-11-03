@@ -83,19 +83,38 @@ func (s *relayServer) authorizeBackend(ctx context.Context, token string) (polic
 	if !strings.HasPrefix(token, "Bearer ") || len(token) > 512 {
 		return p, errors.New("missing credential")
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.api, nil)
-	if err != nil {
-		return p, err
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	for attempt := range 3 {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.api, nil)
+		if err != nil {
+			return p, err
+		}
+		req.Header.Set("Authorization", token)
+		resp, err := s.client.Do(req)
+		if err == nil {
+			if resp.StatusCode == http.StatusOK {
+				err := json.NewDecoder(io.LimitReader(resp.Body, 32768)).Decode(&p)
+				resp.Body.Close()
+				return p, err
+			}
+			resp.Body.Close()
+			if resp.StatusCode != 502 && resp.StatusCode != 503 && resp.StatusCode != 504 {
+				return p, errors.New("access denied")
+			}
+		}
+		if attempt == 2 {
+			return p, errors.New("authorization service unavailable")
+		}
+		// Retry short transport/proxy outages within the same deadline. An
+		// explicit denial is final and expired cached policy is never reused.
+		timer := time.NewTimer(time.Duration(150+attempt*250) * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return p, ctx.Err()
+		case <-timer.C:
+		}
 	}
-	req.Header.Set("Authorization", token)
-	resp, err := s.client.Do(req)
-	if err != nil {
-		return p, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return p, errors.New("access denied")
-	}
-	err = json.NewDecoder(io.LimitReader(resp.Body, 32768)).Decode(&p)
-	return p, err
+	return p, errors.New("authorization service unavailable")
 }

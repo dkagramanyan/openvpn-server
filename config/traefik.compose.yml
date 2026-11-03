@@ -1,0 +1,97 @@
+# Complete Compose configuration for this Raspberry Pi deployment.
+# Keep existing DNS-provider credentials in .env; no passwords belong in this file.
+services:
+  traefik:
+    image: traefik:v3.7.15
+    container_name: traefik
+    restart: unless-stopped
+    env_file: [.env]
+    ports:
+      - "80:80"
+      - "443:443"
+      - "8443:8443/tcp"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./dynamic:/etc/traefik/dynamic:ro
+      - ./letsencrypt:/letsencrypt
+      - ./certs:/certs:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+      - "openwrt:171.134.51.1"
+    networks: [proxy]
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.dashboard.rule=Host(`dashboard.${DOMAIN:-dgkagramanyan.ru}`)
+      - traefik.http.routers.dashboard.entrypoints=websecure
+      - traefik.http.routers.dashboard.service=api@internal
+      - traefik.http.routers.dashboard.tls=true
+      - traefik.http.routers.dashboard.tls.certresolver=letsencrypt
+      - traefik.http.routers.dashboard.tls.domains[0].main=${DOMAIN:-dgkagramanyan.ru}
+      - traefik.http.routers.dashboard.tls.domains[0].sans=*.${DOMAIN:-dgkagramanyan.ru}
+      - traefik.http.routers.dashboard.middlewares=dashboard-auth
+      - traefik.http.middlewares.dashboard-auth.basicauth.users=${DASHBOARD_AUTH:?Set DASHBOARD_AUTH in .env}
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./kuma_api_key:/etc/prometheus/kuma_api_key:ro
+      - prometheus-data:/prometheus
+    networks: [proxy]
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?Set GRAFANA_ADMIN_PASSWORD in .env}
+      GF_FEATURE_TOGGLES_ENABLE: publicDashboards
+      GF_SERVER_ROOT_URL: https://grafana.dgkagramanyan.ru
+      GF_PUBLIC_DASHBOARDS_ENABLED: publicDashboards
+      GF_CACHING_ENABLED: "false"
+    volumes:
+      - grafana-data:/var/lib/grafana
+    networks: [proxy]
+
+  profile-signer:
+    image: openvpn-profile-signer:local
+    build:
+      context: ${PROFILE_SIGNER_SOURCE:-../openvpn-relay-source}
+      dockerfile: signer/Dockerfile
+    restart: unless-stopped
+    environment:
+      PROFILE_SIGNER_TOKEN: ${RELAY_PROFILE_SIGNING_TOKEN:?Set the same random signing token on both hosts}
+      PROFILE_SIGNER_HOSTNAME: dgkagramanyan.ru
+      PROFILE_SIGNER_RELAY_URL: https://dgkagramanyan.ru:8443
+    volumes:
+      - ./letsencrypt:/letsencrypt:ro
+    networks: [proxy]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    tmpfs: [/tmp]
+    logging:
+      driver: json-file
+      options: {max-size: "5m", max-file: "2"}
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.relay-profile-signer.rule=Host(`openvpn.dgkagramanyan.ru`) && Path(`/internal/relay-sign`)
+      - traefik.http.routers.relay-profile-signer.entrypoints=websecure
+      - traefik.http.routers.relay-profile-signer.priority=1000
+      - traefik.http.routers.relay-profile-signer.tls=true
+      - traefik.http.routers.relay-profile-signer.middlewares=relay-signer-source
+      - traefik.http.middlewares.relay-signer-source.ipallowlist.sourcerange=170.134.51.30/32
+      - traefik.http.services.relay-profile-signer.loadbalancer.server.port=8085
+
+networks:
+  proxy:
+    name: proxy
+
+volumes:
+  prometheus-data:
+  grafana-data:

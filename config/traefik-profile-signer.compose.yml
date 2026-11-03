@@ -1,0 +1,32 @@
+# Merge with the existing Compose file on the Raspberry Pi. Build from a
+# checkout of this repository at ~/openvpn-relay-source; no host port is published.
+services:
+  profile-signer:
+    image: openvpn-profile-signer:local
+    build:
+      context: ${PROFILE_SIGNER_SOURCE:-../openvpn-relay-source}
+      dockerfile: signer/Dockerfile
+    restart: unless-stopped
+    environment:
+      PROFILE_SIGNER_TOKEN: ${RELAY_PROFILE_SIGNING_TOKEN:?Set the same random signing token on both hosts}
+      PROFILE_SIGNER_HOSTNAME: dgkagramanyan.ru
+      PROFILE_SIGNER_RELAY_URL: https://dgkagramanyan.ru:8443
+    volumes:
+      - ./letsencrypt:/letsencrypt:ro
+    networks: [proxy]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    tmpfs: [/tmp]
+    logging:
+      driver: json-file
+      options: {max-size: "5m", max-file: "2"}
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.relay-profile-signer.rule=Host(`openvpn.dgkagramanyan.ru`) && Path(`/internal/relay-sign`)
+      - traefik.http.routers.relay-profile-signer.entrypoints=websecure
+      - traefik.http.routers.relay-profile-signer.priority=1000
+      - traefik.http.routers.relay-profile-signer.tls=true
+      - traefik.http.routers.relay-profile-signer.middlewares=relay-signer-source
+      - traefik.http.middlewares.relay-signer-source.ipallowlist.sourcerange=170.134.51.30/32
+      - traefik.http.services.relay-profile-signer.loadbalancer.server.port=8085

@@ -10,6 +10,7 @@ import (
 )
 
 type policy struct {
+	Client  string   `json:"client"`
 	CIDRs   []string `json:"allowed_cidrs"`
 	URL     string   `json:"url"`
 	Guest   bool     `json:"guest"`
@@ -109,7 +110,7 @@ func dialTCP(ctx context.Context, addresses []netip.AddrPort) (net.Conn, netip.A
 				return
 			case <-timer.C:
 			}
-			conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", addr.String())
+			conn, err := (&net.Dialer{KeepAlive: 30 * time.Second}).DialContext(ctx, "tcp", addr.String())
 			select {
 			case results <- result{conn, addr, err}:
 			case <-ctx.Done():

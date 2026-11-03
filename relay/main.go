@@ -32,6 +32,7 @@ type relayServer struct {
 	policyTTL time.Duration
 	authMu    sync.Mutex
 	policies  map[[32]byte]*policyEntry
+	activity  *activityLog
 }
 
 // Revalidate live tunnels as well as new requests. Policy changes, expiry,
@@ -46,7 +47,12 @@ func (s *relayServer) watch(ctx context.Context, token string, addr netip.Addr, 
 			return
 		case <-ticker.C:
 			p, err := s.authorize(ctx, token)
+			if ctx.Err() != nil {
+				closeFlow()
+				return
+			}
 			if err != nil || p.URL != origin || !p.allows(addr) {
+				flowFrom(ctx).reason("access_revoked_or_unavailable")
 				closeFlow()
 				return
 			}
@@ -59,18 +65,26 @@ func (s *relayServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "CONNECT required", 405)
 		return
 	}
+	flow := s.activity.begin()
+	defer flow.finish()
+	r = r.WithContext(context.WithValue(r.Context(), flowKey{}, flow))
 	select {
 	case s.slots <- struct{}{}:
 		defer func() { <-s.slots }()
 	default:
+		flow.reason("capacity_reached")
 		http.Error(w, "Relay busy", 503)
 		return
 	}
 	token := r.Header.Get("Authorization")
 	p, err := s.authorize(r.Context(), token)
 	if err != nil {
+		flow.reason("authorization_denied")
 		http.Error(w, "Relay access denied", 403)
 		return
+	}
+	if flow != nil {
+		flow.event.Client, flow.event.Guest = p.Client, p.Guest
 	}
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
@@ -81,6 +95,9 @@ func (s *relayServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		protocol = r.Header.Get(":protocol")
 	}
 	if protocol == "connect-udp" {
+		if flow != nil {
+			flow.event.Protocol = "UDP"
+		}
 		template, err := uritemplate.New(p.URL + udpPath)
 		if err != nil {
 			http.Error(w, "Invalid relay configuration", 503)
@@ -97,9 +114,18 @@ func (s *relayServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	} else if !((r.ProtoMajor == 2 && protocol == "") || r.Proto == "HTTP/3.0") {
 		http.Error(w, "Unsupported CONNECT protocol", 400)
 		return
+	} else if flow != nil {
+		flow.event.Protocol = "TCP"
+	}
+	if flow != nil {
+		if host, port, err := net.SplitHostPort(target); err == nil && len(host) <= 253 && len(port) <= 5 {
+			flow.event.Target = net.JoinHostPort(host, port)
+		}
+		flow.event.Counted = udpReq == nil
 	}
 	addresses, err := resolveAll(ctx, target, p)
 	if err != nil {
+		flow.reason("destination_denied_or_dns_failed")
 		http.Error(w, "Destination unavailable or denied", 403)
 		return
 	}
@@ -115,10 +141,12 @@ func (s *relayServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if err != nil {
+			flow.reason("destination_unreachable")
 			http.Error(w, "Destination unavailable", 502)
 			return
 		}
 		defer conn.Close()
+		flow.connected()
 		if r.ProtoMajor == 2 {
 			s.proxyHTTP2UDP(w, r, conn, token, addr.Addr(), p.URL)
 			return
@@ -133,10 +161,12 @@ func (s *relayServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	conn, addr, err := dialTCP(ctx, addresses)
 	if err != nil {
+		flow.reason("destination_unreachable")
 		http.Error(w, "Destination unavailable", 502)
 		return
 	}
 	defer conn.Close()
+	flow.connected()
 	if r.ProtoMajor == 2 {
 		s.proxyHTTP2TCP(w, r, conn.(*net.TCPConn), token, addr.Addr(), p.URL)
 		return
@@ -158,18 +188,22 @@ func (s *relayServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_, err := io.Copy(conn, stream)
+		n, err := io.Copy(conn, stream)
+		flow.add(n, 0)
 		_ = conn.(*net.TCPConn).CloseWrite()
-		if err != nil {
+		if err != nil && !outputComplete.Load() {
 			closeFlow()
 		}
 	}()
-	if _, err := io.Copy(stream, conn); err != nil {
+	n, err := io.Copy(stream, conn)
+	flow.add(0, n)
+	if err != nil {
 		closeFlow()
 	} else {
 		outputComplete.Store(true)
 		_ = stream.Close()
 	}
+	conn.Close() // Release an upload that remains open after the destination's FIN.
 	<-done
 }
 
@@ -188,6 +222,12 @@ func main() {
 		slots: make(chan struct{}, 256), recheck: 5 * time.Second, policyTTL: time.Second,
 	}
 	mode := env("RELAY_TRANSPORT", "http2")
+	handler.activity = newActivity(mode)
+	admin, err := handler.activity.listen("127.0.0.1:8446")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer admin.Close()
 	if mode == "http2" {
 		if !strings.Contains(os.Getenv("GODEBUG"), "http2xconnect=1") {
 			log.Fatal("HTTP/2 relay requires GODEBUG=http2xconnect=1 (set by the Docker image)")

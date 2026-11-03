@@ -20,23 +20,26 @@ from pydantic import BaseModel, Field
 from . import pki
 from .pki import PkiError
 from .settings import settings
+from .relay_services import sign_profile
 
 
 class RelaySettings(BaseModel):
     enabled: bool = False
     url: str = Field(default="", max_length=2048)
-    route_all: bool = True
+    route_all: bool = True  # Accepted for old API clients; roles now always route all domains.
     match_domains: list[str] = Field(default_factory=lambda: ["home.arpa"], max_length=100)
     allowed_cidrs: list[str] = Field(default_factory=lambda: [settings.home_sub], max_length=100)
 
 
 def get_settings(db) -> dict:
     config = RelaySettings(**json.loads(db.get_setting("apple_relay", "{}"))).model_dump()
+    config["route_all"] = True  # Relay access now follows the OpenVPN role for every profile.
     return {**config, "transport": settings.relay_transport}
 
 
 def save_settings(db, body: RelaySettings) -> dict:
     config = body.model_dump()
+    config["route_all"] = True
     url = body.url.strip().rstrip("/")
     try:
         parsed = urlsplit(url)
@@ -63,8 +66,6 @@ def save_settings(db, body: RelaySettings) -> dict:
         raise PkiError("Allowed networks must be valid CIDRs, e.g. 192.168.1.0/24")
     if body.enabled and (not url or not config["allowed_cidrs"]):
         raise PkiError("Enabling the relay requires an HTTPS URL and LAN networks to block for guests")
-    if body.enabled and not body.route_all and not domains:
-        raise PkiError("LAN-only routing requires at least one LAN domain")
     db.set_setting("apple_relay", json.dumps(config))
     return {**config, "transport": settings.relay_transport}
 
@@ -129,8 +130,8 @@ def profile(db, name: str) -> bytes:
     if not cert:
         raise PkiError("Relay profiles require a valid client certificate")
     guest = is_guest(name)
-    # Serial binds a grant to a particular certificate: renewal or recreation
-    # cannot silently inherit a credential from an earlier identity.
+    # Unexpected certificate replacement cannot inherit an earlier credential.
+    # An explicit UI renewal updates this binding without changing the secret.
     with db.tx() as conn:
         instance_key = "relay_instance"
         instance = conn.execute("SELECT value FROM settings WHERE key = ?", (instance_key,)).fetchone()
@@ -140,8 +141,8 @@ def profile(db, name: str) -> bytes:
         key = "relay_client:" + name
         row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
         grant = json.loads(row["value"]) if row else None
-        if not grant or grant["serial"] != cert["serial"] or grant.get("guest", False) != guest:
-            grant = {"serial": cert["serial"], "guest": guest, "secret": secrets.token_urlsafe(32)}
+        if not grant or grant["serial"] != cert["serial"]:
+            grant = {"serial": cert["serial"], "secret": secrets.token_urlsafe(32)}
             conn.execute("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                          (key, json.dumps(grant)))
     token = name + ":" + grant["secret"]
@@ -154,19 +155,32 @@ def profile(db, name: str) -> bytes:
                 "PayloadUUID": str(uuid.uuid5(uuid.NAMESPACE_URL, identifier + suffix)).upper(),
                 "PayloadDisplayName": title}
 
-    title = ("Guest Relay · " if guest else "Full Access Relay · " if config["route_all"] else "LAN Relay · ") + name
+    title = ("Guest Relay · " if guest else "Full Access Relay · ") + name
     relay = payload("com.apple.relay.managed", ".relay", title)
     url_key = "HTTP2RelayURL" if config["transport"] == "http2" else "HTTP3RelayURL"
     relay.update({"Relays": [{url_key: config["url"] + "/.well-known/masque/udp/{target_host}/{target_port}/",
                               "AdditionalHTTPHeaderFields": {"Authorization": "Bearer " + token}}],
-                  "MatchDomains": [] if guest or config["route_all"] else config["match_domains"]})
+                  "MatchDomains": []})
     result = payload("Configuration", "", title)
     result.update({"PayloadContent": [relay], "PayloadDescription":
-                   ("Internet-only guest access. " if guest else
-                    "Internet and LAN access through your server. " if config["route_all"] else
-                    "Access selected LAN domains. ")
+                   ("Internet-only guest access. " if guest else "Internet and LAN access through your server. ")
                    + "This profile contains a personal access credential."})
-    return plistlib.dumps(result, sort_keys=False)
+    return sign_profile(plistlib.dumps(result, sort_keys=False), urlsplit(config["url"]).hostname)
+
+
+def renewed(db, name, previous_serial):
+    """An explicit UI renewal preserves this client's installed relay credential."""
+    cert = eligible(name)
+    if not cert:
+        return
+    with db.tx() as conn:
+        key = "relay_client:" + name
+        row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        if row:
+            grant = json.loads(row["value"])
+            if grant["serial"] == previous_serial:
+                grant["serial"] = cert["serial"]
+                conn.execute("UPDATE settings SET value = ? WHERE key = ?", (json.dumps(grant), key))
 
 
 def authorize(db, authorization: str) -> dict | None:
@@ -184,8 +198,7 @@ def authorize(db, authorization: str) -> dict | None:
     cert = eligible(name)
     config = get_settings(db)
     guest = is_guest(name)
-    if (not config["enabled"] or not cert or cert["serial"] != grant["serial"]
-            or guest != grant.get("guest", False)):
+    if not config["enabled"] or not cert or cert["serial"] != grant["serial"]:
         return None
     try:
         blocked = guest_blocks(config) if guest else []
@@ -193,6 +206,6 @@ def authorize(db, authorization: str) -> dict | None:
         return None
     # Full-access users may reach internet and LAN destinations. Keep the
     # configured LAN list separate so guest exclusions never become 0.0.0.0/0.
-    allowed = ["0.0.0.0/0"] if guest else ["0.0.0.0/0", "::/0"] if config["route_all"] else config["allowed_cidrs"]
-    return {"allowed_cidrs": allowed,
+    allowed = ["0.0.0.0/0"] if guest else ["0.0.0.0/0", "::/0"]
+    return {"client": name, "allowed_cidrs": allowed,
             "blocked_cidrs": blocked, "guest": guest, "url": config["url"]}

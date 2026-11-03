@@ -127,13 +127,15 @@ func (s *relayServer) proxyHTTP2TCP(w http.ResponseWriter, r *http.Request, conn
 	var responseDone atomic.Bool
 	go func() {
 		defer close(done)
-		_, err := io.Copy(conn, r.Body)
+		n, err := io.Copy(conn, r.Body)
+		flowFrom(r.Context()).add(n, 0)
 		_ = conn.CloseWrite()
 		if err != nil && !responseDone.Load() {
 			abort()
 		}
 	}()
-	_, err := io.Copy(flushedWriter{w, rc}, conn)
+	n, err := io.Copy(flushedWriter{w, rc}, conn)
+	flowFrom(r.Context()).add(0, n)
 	responseDone.Store(true)
 	if err != nil {
 		abort()
@@ -180,6 +182,7 @@ func capsulesToUDP(reader io.Reader, conn *net.UDPConn) error {
 		if _, err := conn.Write(payload); err != nil {
 			return err
 		}
+		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Minute))
 	}
 }
 
@@ -201,6 +204,7 @@ func (s *relayServer) proxyHTTP2UDP(w http.ResponseWriter, r *http.Request, conn
 		conn.Close()
 	}()
 	buffer := make([]byte, 65536)
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Minute))
 	writer := quicvarint.NewWriter(w)
 	for {
 		n, err := conn.Read(buffer[1:])
@@ -210,6 +214,7 @@ func (s *relayServer) proxyHTTP2UDP(w http.ResponseWriter, r *http.Request, conn
 		if n > maxUDPPayload {
 			continue
 		}
+		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Minute))
 		if err := http3.WriteCapsule(writer, 0, buffer[:n+1]); err != nil {
 			break
 		}

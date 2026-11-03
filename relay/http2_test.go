@@ -156,7 +156,7 @@ func TestHTTP2TCPUDPAndRevocation(t *testing.T) {
 			}))
 			defer auth.Close()
 			s := &relayServer{api: auth.URL, client: auth.Client(), slots: make(chan struct{}, 32),
-				recheck: 30 * time.Millisecond, policyTTL: 15 * time.Millisecond}
+				recheck: 30 * time.Millisecond, policyTTL: 15 * time.Millisecond, activity: newActivity("http2")}
 			trusted, _ := parseTrustedProxies("127.0.0.1/32")
 			go serveHTTP2(listener, s, trusted)
 			tcp, err := net.Listen("tcp", net.JoinHostPort(ip, "0"))

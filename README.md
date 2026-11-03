@@ -89,10 +89,9 @@ To enable it:
 
 4. In the existing UI, open **Settings → Apple Network Relay**. Set the public
    URL (e.g. `https://relay.example.com:8443`) and LAN CIDRs (e.g.
-   `170.134.51.0/24`) that guests must not reach. Leave **Route all domains for
-   non-guests (internet + LAN)** enabled for full access. To route only selected
-   LAN domains instead, turn it off and enter domains such as `home.arpa`.
-   Enable and save. Names such as `nas.home.arpa` must resolve to the intended
+   `170.134.51.0/24`) that guests must not reach. Access follows each client’s
+   OpenVPN role: guests have internet only; full-access clients have internet
+   and LAN. Enable and save. Names such as `nas.home.arpa` must resolve to the intended
    LAN addresses **from the relay container**; configure its DNS in Compose if
    your Docker DNS does not resolve your LAN names.
 5. Under **Clients**, download **Apple relay** beside that client's OpenVPN
@@ -114,12 +113,10 @@ Manual installation is supported; Apple marks this payload deprecated starting
 with OS 27 in favor of declarative device management. Device interoperability
 still needs to be verified on your target Apple OS version.
 
-Non-guests route all domains through the relay by default, with access to both
-internet and LAN destinations. This also becomes the default for settings saved
-before the routing option existed; **download and reinstall existing non-guest
-profiles** to replace their old LAN-only domain selection. Turning off all-domain
-routing restores LAN-only access: only selected domain names and their subdomains
-use the relay, and the server restricts destinations to the configured LAN CIDRs.
+All new profiles route all domains through the relay. Full-access clients can
+reach internet and LAN destinations; guest destinations remain restricted on
+the server. Legacy LAN-only settings no longer override the OpenVPN access role.
+Download and reinstall old LAN-only profiles once to update their domain selection.
 Guest profiles route all domains
 through the relay, allowing public IPv4 internet destinations only. IPv6 guest
 egress is blocked, consistent with the OpenVPN setup. The relay proxies TCP/UDP
@@ -130,9 +127,7 @@ access. OpenVPN statistics show OpenVPN traffic only.
 
 The server checks **resolved destination IPs**, then connects to those exact
 addresses to prevent DNS rebinding around the CIDR policy. Loopback, link-local,
-unspecified and multicast destinations are always blocked. In full-access mode,
-non-guests can reach all other destinations; in LAN-only mode they can reach
-TCP/UDP services inside the configured CIDRs. Guests can download
+unspecified and multicast destinations are always blocked. Full-access clients can reach all other destinations. Guests can download
 relay profiles too, but cannot reach private, VPN, configured LAN, directly
 attached or special-purpose networks. `HOME_SUB` and `GUEST_BLOCK` are shared
 between the OpenVPN and UI services; pushed routes and the relay's allowed LAN
@@ -147,15 +142,16 @@ that address.
 | Access type | OpenVPN | Apple relay |
 |---|---|---|
 | Guest | Internet and configured DNS; no LAN | Public IPv4 internet; no LAN |
-| Non-guest (Full access) | Internet and LAN | Internet and LAN by default; optional LAN-only routing |
+| Non-guest (Full access) | Internet and LAN | Internet and LAN |
 
 Each profile contains a separate random bearer credential. It does not use the
 OpenVPN key passphrase or TOTP challenge. Repeated downloads reuse the current
 credential. **Revoke relay access** on the client page invalidates installed
 relay profiles without touching OpenVPN; the next download creates a new
-credential. Revocation, expiry and deletion deny relay access. Changing between
-guest and non-guest access or renewing a certificate invalidates the old relay
-profile; download a new one. Active flows recheck access every five seconds
+credential. Revocation, expiry and deletion deny relay access. Guest/full-access
+changes update the existing credential's permissions automatically. Renewal
+through the UI preserves the same client's relay credential; an unexpected
+certificate replacement outside the UI still requires a new download. Active flows recheck access every five seconds
 (up to about nine seconds including the one-second policy cache and three-second
 authorization timeout), and fail closed if the UI becomes unavailable. OpenVPN
 access-type changes take effect when devices reconnect.
@@ -171,6 +167,9 @@ reply. QUIC keepalives run every 20 seconds in direct HTTP/3 mode. Both modes
 use a 90-second idle-connection timeout and preserve responses after a client
 half-closes its TCP upload. HTTP/2 transports UDP as RFC 9297 datagram capsules;
 packet loss can stall its shared TCP connection, while HTTP/3 uses QUIC datagrams.
+Short authorization transport failures and HTTP 502/503/504 responses are retried
+within the same three-second deadline; explicit access denials are never retried
+and expired policy is never reused during an outage.
 
 If quic-go reports a low UDP receive buffer, the host's socket buffer limits can
 limit throughput under load. Check the
@@ -180,8 +179,7 @@ before adjusting host settings. The application does not modify host sysctls.
 The relay authenticates against the UI over host loopback and has no access to
 the PKI or UI database. If `OVPN_UI_BIND` excludes loopback, set
 `APPLE_RELAY_AUTH_URL` to the UI's address on the same host. Changing the
-transport, routing mode, public URL or LAN
-domains requires redistributing profiles; CIDR changes and disabling relay
+transport or public URL requires redistributing profiles; CIDR changes and disabling relay
 access take effect on existing connections without redistributing them.
 
 Installing a profile or enabling its download does **not** verify that the relay
@@ -213,6 +211,113 @@ Set `TRAEFIK_BIN` to a Traefik executable to include real TLS-termination tests
 (CI downloads a checksum-verified binary and runs them). The Docker image sets
 `GODEBUG=http2xconnect=1` to enable extended CONNECT in Go's HTTP/2 implementation.
 API and profile tests are included in `python -m pytest ui/tests -q`.
+
+### Automatic signed profiles
+
+The UI can return CMS-signed `.mobileconfig` downloads using the certificate
+Traefik already manages. The signer runs on the Raspberry Pi with read-only
+access to `letsencrypt/acme.json`; private keys never move to the OpenVPN host.
+It selects a valid, publicly trusted identity for the configured hostname,
+includes its intermediate chain, and reloads renewed certificates without a
+restart. The UI verifies the signature, certificate chain, hostname and exact
+profile contents before returning a download. When signing is configured,
+an unavailable signer fails the download with an error rather than silently
+returning an unsigned profile. Installed profiles continue using their relay
+credentials independently of the signer.
+
+On the Raspberry Pi, clone the signer source separately from any old VPN checkout:
+
+```shell
+git clone https://github.com/dkagramanyan/openvpn-server.git ~/openvpn-relay-source
+cd ~/traefik
+cp ~/openvpn-relay-source/config/traefik-profile-signer.compose.yml docker-compose.override.yml
+openssl rand -hex 32
+```
+
+If an override file already exists, merge the `profile-signer` service into it.
+Put the generated value in the Pi's existing `.env`:
+
+```dotenv
+RELAY_PROFILE_SIGNING_TOKEN=YOUR_GENERATED_VALUE
+```
+
+Start the signer with the same command as the other Traefik services:
+
+```shell
+sudo docker compose up -d --build
+```
+
+The override publishes no additional host port. Its Traefik route is
+`https://openvpn.dgkagramanyan.ru/internal/relay-sign`, restricted to requests
+from the OpenVPN server at `170.134.51.30` and authenticated by the shared token.
+The existing website certificate secures requests containing personal profile
+credentials. Adjust the route, source address, signing hostname and relay URL
+in the override for another deployment. Mount the whole ACME directory so that
+atomic file replacement during renewal remains visible. Keep the source checkout
+updated when upgrading the signer.
+
+Alternatively, [the complete Pi Compose file](config/traefik.compose.yml) contains
+Traefik, Prometheus, Grafana and the signer together, including the required
+TCP 8443 mapping. Use that full file instead of a separate signer override.
+It references `GRAFANA_ADMIN_PASSWORD`, `DASHBOARD_AUTH` and
+`RELAY_PROFILE_SIGNING_TOKEN` from the existing Pi `.env`, with no embedded
+passwords. Keep the existing DNS-provider variables. Grafana's password variable
+initializes a new instance; an existing instance manages its password in Grafana.
+
+On the OpenVPN host, add to the existing `.env`:
+
+```dotenv
+OVPN_RELAY_SIGNER_URL=https://openvpn.dgkagramanyan.ru/internal/relay-sign
+RELAY_PROFILE_SIGNING_TOKEN=THE_SAME_GENERATED_VALUE
+```
+
+Then run `sudo docker compose up -d --build`. Open **Relay** in the UI and check
+**Signed downloads enabled**. Download a new profile and verify the signer on
+your target iPhone before distributing profiles. Apple still asks users to
+confirm installation; signing identifies the source rather than hiding what
+the profile does. Apple may require removing an older signed profile before
+installing a replacement signed with a renewed identity.
+
+All operator credentials belong in `.env` or the UI's existing account settings.
+No signing token or private key is returned by diagnostic APIs. Certificates
+must chain to a root trusted by both the server and the Apple device; self-signed
+identities do not remove the trust warning on unmanaged devices. See
+[Apple's profile signing example](https://developer.apple.com/library/archive/documentation/NetworkingInternet/Conceptual/iPhoneOTAConfiguration/profile-service/profile-service.html)
+and [profile replacement rules](https://developer.apple.com/documentation/devicemanagement/configuring-multiple-devices-using-profiles).
+
+### Relay activity and reliability checks
+
+The **Relay** page shows backend availability, active TCP/UDP destinations,
+client names, access roles, denials, connection duration, completed TCP traffic
+and profile signing status. It refreshes every five seconds. The last 500 events
+are held in a bounded in-memory ring since relay startup; older events remain
+in rotated container logs. UDP traffic byte counts are not currently reported.
+Credentials and profile contents are never logged. Diagnostic data is exposed
+only through authenticated UI endpoints; the relay's internal status server binds
+to host loopback at `127.0.0.1:8446`. Keep that port free and do not proxy it.
+The Docker health check monitors the relay process through that local endpoint.
+HTTP/2 UDP flows with no traffic expire after two minutes to release resources;
+the OS can establish a new flow when traffic resumes. TCP sockets use keepalives,
+and completed responses release uploads that a peer leaves open.
+
+Real-container integration can be reproduced with the UI's test dependencies
+plus `pytest` and `httpx` installed on the host:
+
+```shell
+docker build -f signer/Dockerfile -t openvpn-profile-signer:relay-test .
+docker build -f relay/Dockerfile -t openvpn-apple-relay:relay-test .
+docker build -f ui/Dockerfile -t openvpn-ui:relay-test .
+python tests/relay-stack.py
+```
+
+It starts isolated UI, signer, relay and Traefik containers with temporary
+certificates and credentials, verifies a signed download, sends a real HTTP/2
+CONNECT request to a LAN service, tests role changes without replacing the
+profile, checks the activity API and denies revoked access. Containers and test
+networks are removed afterwards. The Go tests separately exercise UDP capsules,
+concurrent transfers, half-closes and revocation through real Traefik with the
+race detector enabled. No application can guarantee connectivity during a DNS,
+ISP, proxy, authorization-service or server outage.
 
 ### Traefik HTTP/2 setup
 
@@ -319,6 +424,35 @@ After a Traefik certificate renewal, repeat export/transfer/install and run
 `sudo docker compose restart apple-relay`. The relay does not automatically
 read the certificate store on the other machine. Downloads already installed
 on devices remain valid when the hostname stays the same.
+
+## User download portal
+
+Administrators can create or reset a personal website login from
+**Clients → client → Portal access** and disable it from the same dialog.
+Passwords are hashed with scrypt, never returned by the API, and existing sessions
+are invalidated on an admin reset. Each account is bound to one current client
+identity. The same certificate validity and guest/full-access role apply to its
+OpenVPN and relay downloads. Revocation, expiry, deletion or an unexpected
+certificate replacement denies portal access; renewal through the UI preserves it.
+These website passwords are separate from OpenVPN key passphrases and TOTP.
+
+Users sign in at **`https://openvpn.dgkagramanyan.ru/portal`** to download their
+own OpenVPN config and automatically signed Apple relay profile, and change
+their own password. They have no access to other clients, server settings,
+relay logs, credentials or administrator endpoints. The backend enforces this
+for every administrative API, including direct requests outside the frontend.
+Admin credentials are rejected by the public portal login endpoint.
+
+Deploy the updated [complete Traefik native services](config/traefik-native-services.yml)
+to make `/portal`, `/api/portal` and static assets reachable from outside the home
+network. This is necessary for guests and first-time users who do not yet have
+a VPN profile. The administrative website and APIs retain the existing
+`trusted-only` rule. Sign-in throttling, CSRF checks and secure cookie settings
+apply to both interfaces. Keep the existing `OVPN_UI_SECURE_COOKIES` and trusted
+proxy settings appropriate for your HTTPS reverse proxy.
+For this Pi, include `170.134.51.13` in `OVPN_UI_TRUSTED_PROXIES` and serve cookies
+securely over HTTPS. Correct proxy trust also gives each user's real source IP
+to the login limiter instead of combining all users under the proxy's IP.
 
 ## Layout
 
