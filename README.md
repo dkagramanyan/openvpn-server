@@ -202,7 +202,7 @@ docker compose up -d --build --no-deps apple-relay
 
 For HTTP/2, verify WAN TCP 8443 reaches Traefik, its TCP router forwards to the
 backend's TCP 8444, and `APPLE_RELAY_TRUSTED_PROXIES` matches the Pi's source IP.
-An ordinary Traefik HTTP router rejects CONNECT; use the supplied TCP router.
+An ordinary Traefik HTTP router rejects CONNECT; use a TCP router with TLS termination.
 A successful profile download in the UI logs only confirms profile generation;
 `POST /api/relay/authorize` requests show that relay traffic is reaching the UI.
 
@@ -225,44 +225,18 @@ an unavailable signer fails the download with an error rather than silently
 returning an unsigned profile. Installed profiles continue using their relay
 credentials independently of the signer.
 
-On the Raspberry Pi, clone the signer source separately from any old VPN checkout:
+The Raspberry Pi deployment lives in the separate
+[Traefik repository](https://github.com/dkagramanyan/traefik#automatic-profile-signing).
+It owns the Pi's Compose stack, routes, monitoring and certificate paths. Follow
+its migration instructions to retain the existing ACME store and Docker volumes.
+The optional `profile-signing` Compose profile builds the signer from a pinned
+revision of this public application's source; the Pi needs no OpenVPN checkout.
 
-```shell
-git clone https://github.com/dkagramanyan/openvpn-server.git ~/openvpn-relay-source
-cd ~/traefik
-cp ~/openvpn-relay-source/config/traefik-profile-signer.compose.yml docker-compose.override.yml
-openssl rand -hex 32
-```
-
-If an override file already exists, merge the `profile-signer` service into it.
-Put the generated value in the Pi's existing `.env`:
-
-```dotenv
-RELAY_PROFILE_SIGNING_TOKEN=YOUR_GENERATED_VALUE
-```
-
-Start the signer with the same command as the other Traefik services:
-
-```shell
-sudo docker compose up -d --build
-```
-
-The override publishes no additional host port. Its Traefik route is
-`https://openvpn.dgkagramanyan.ru/internal/relay-sign`, restricted to requests
-from the OpenVPN server at `170.134.51.30` and authenticated by the shared token.
-The existing website certificate secures requests containing personal profile
-credentials. Adjust the route, source address, signing hostname and relay URL
-in the override for another deployment. Mount the whole ACME directory so that
-atomic file replacement during renewal remains visible. Keep the source checkout
-updated when upgrading the signer.
-
-Alternatively, [the complete Pi Compose file](config/traefik.compose.yml) contains
-Traefik, Prometheus, Grafana and the signer together, including the required
-TCP 8443 mapping. Use that full file instead of a separate signer override.
-It references `GRAFANA_ADMIN_PASSWORD`, `DASHBOARD_AUTH` and
-`RELAY_PROFILE_SIGNING_TOKEN` from the existing Pi `.env`, with no embedded
-passwords. Keep the existing DNS-provider variables. Grafana's password variable
-initializes a new instance; an existing instance manages its password in Grafana.
+Generate a shared token with `openssl rand -hex 32`. In the Pi's existing `.env`,
+set `COMPOSE_PROFILES=profile-signing` and `RELAY_PROFILE_SIGNING_TOKEN` to that
+value, then run `sudo docker compose up -d --build` from its deployment folder.
+The HTTPS signing route publishes no additional host port and accepts only the
+OpenVPN host at `170.134.51.30`, authenticated with the shared token.
 
 On the OpenVPN host, add to the existing `.env`:
 
@@ -321,59 +295,26 @@ ISP, proxy, authorization-service or server outage.
 
 ### Traefik HTTP/2 setup
 
-On the Raspberry Pi, merge the following into the existing `entryPoints` in
-`~/traefik/traefik.yml`:
+Production Pi configuration is maintained in
+[dkagramanyan/traefik](https://github.com/dkagramanyan/traefik#network-paths),
+separately from this VPN application. Keep the working relay URL
+**`https://dgkagramanyan.ru:8443`** and WAN **TCP 8443 forwarded to the Pi**.
+That repository includes the entry point, Docker port mapping and TCP route to
+`170.134.51.30:8444`, plus the existing websites, access rules and Zoraxy fallback.
+Use its migration helper to adopt the existing deployment directory.
 
-```yaml
-entryPoints:
-  apple-relay:
-    address: ":8443"
-```
-
-Add `"8443:8443/tcp"` to Traefik's existing Compose `ports` list if it uses
-bridge networking. Download the supplied dynamic configuration:
-
-```shell
-cd ~/traefik
-curl -fsSL https://raw.githubusercontent.com/dkagramanyan/openvpn-server/main/config/traefik-relay.yml -o dynamic/apple-relay.yml
-sudo docker compose up -d
-sudo docker compose restart traefik
-```
-
-Use the actual Compose service name if it differs from `traefik`. Recreating
-applies the port mapping and restarting loads changes to static `traefik.yml`.
-The dynamic file routes SNI `dgkagramanyan.ru` to `170.134.51.30:8444`, negotiates
-HTTP/2, and uses Traefik's existing certificate for that name. The public relay
-URL remains **`https://dgkagramanyan.ru:8443`**. Forward WAN **TCP 8443 to the Pi**.
-Existing website routers remain on port 443. Remove any older relay UDP router
-from Traefik's dynamic directory when switching to this setup.
-
-For this deployment, [the complete native-services.yml](config/traefik-native-services.yml)
-also includes all the existing website routes and the new relay. Use it as a
-replacement for `dynamic/native-services.yml` **instead of** adding the separate
-`dynamic/apple-relay.yml`; keep only one definition of the relay router/service.
-Back up the current file outside the watched `dynamic` directory before replacing
-it. The static entryPoint, Docker port mapping and WAN forwarding above are still
-required. This full example preserves the supplied `trusted-only` middleware,
-Zoraxy fallback and existing certificate resolver settings.
-
-This must be a **TCP router with TLS termination**, not an HTTP router or TLS
-passthrough. [Traefik's TCP TLS documentation](https://doc.traefik.io/traefik/reference/routing-configuration/tcp/tls/)
+For another proxy deployment, the relay requires a TCP router that terminates
+TLS, negotiates ALPN `h2` and forwards decrypted HTTP/2 to the relay backend.
+Set `APPLE_RELAY_TRUSTED_PROXIES` to the proxy's actual source address. Keep the
+backend on the trusted LAN. Website routes stay on port 443.
+[Traefik's TCP TLS documentation](https://doc.traefik.io/traefik/reference/routing-configuration/tcp/tls/)
 describes termination; its [CONNECT guidance](https://doc.traefik.io/traefik/migrate/v3/#connect-requests)
 directs forward-proxy tunnels through TCP routers.
 
-On the OpenVPN host:
-
-```shell
-cd ~/openvpn-server
-git pull
-sudo docker compose up -d --build
-sudo docker compose logs --tail=30 apple-relay
-```
-
-The log should report an HTTP/2 backend listening on TCP 8444. In the UI,
-save the relay URL and download fresh profiles. Traefik certificate renewals
-need no relay restart or new profile.
+On the OpenVPN host, run `sudo docker compose up -d --build`. The relay log
+should report an HTTP/2 backend listening on TCP 8444. In the UI, save the relay
+URL and download fresh profiles after changing transport or URL. Traefik
+certificate renewals need no relay restart or new profile.
 
 ### Direct HTTP/3 mode (optional)
 
@@ -382,48 +323,13 @@ For direct QUIC access, set `APPLE_RELAY_TRANSPORT=http3` in `.env`, supply
 forward WAN **UDP 8443 directly to the OpenVPN host**. `APPLE_RELAY_BIND` controls
 that UDP listener. Rebuild/recreate with `docker compose up -d --build` so both
 the UI and relay switch transport, then download and reinstall profiles.
-This mode requires a certificate on the relay host; the default HTTP/2 mode
-does not. If you choose HTTP/3 and want to reuse a Traefik certificate:
-
-On the Raspberry Pi, find the **host** path mounted as `/letsencrypt/acme.json`
-in Traefik. If the file lives inside `~/traefik`, list its location with:
-
-```shell
-sudo find "$HOME/traefik" -type f -name acme.json -print
-```
-
-Use the returned path below in place of `/HOST/PATH/acme.json`. Download the
-helper from this repository (or use `bin/export-relay-cert.py` from a checkout):
-
-```shell
-curl -fsSL https://raw.githubusercontent.com/dkagramanyan/openvpn-server/main/bin/export-relay-cert.py -o /tmp/export-relay-cert.py
-sudo python3 /tmp/export-relay-cert.py --acme /HOST/PATH/acme.json --hostname dgkagramanyan.ru --output "$HOME/relay-tls-export"
-scp -r "$HOME/relay-tls-export" david@170.134.51.30:
-```
-
-The helper requires Python 3 and OpenSSL. It selects a matching identity,
-checks its hostname, validity dates and matching private key, then writes
-only `fullchain.pem` and `privkey.pem` with private permissions. It leaves
-`acme.json` untouched and never prints key material. When run via sudo, the
-export belongs to the invoking user so their usual SSH credentials work for
-the transfer. Do not share the whole ACME store or the exported private key.
-
-On the OpenVPN host, install those two files and start all services:
-
-```shell
-cd ~/openvpn-server
-git pull
-sudo install -d -o 65532 -g 65532 -m 700 relay-tls
-sudo install -o 65532 -g 65532 -m 600 ~/relay-tls-export/fullchain.pem relay-tls/fullchain.pem
-sudo install -o 65532 -g 65532 -m 600 ~/relay-tls-export/privkey.pem relay-tls/privkey.pem
-sudo docker compose up -d --build
-sudo docker compose logs --tail=30 apple-relay
-```
-
-After a Traefik certificate renewal, repeat export/transfer/install and run
-`sudo docker compose restart apple-relay`. The relay does not automatically
-read the certificate store on the other machine. Downloads already installed
-on devices remain valid when the hostname stays the same.
+This mode requires a valid certificate on the relay host and a process to
+refresh it before expiry. The optional [certificate export helper](bin/export-relay-cert.py)
+can export a matching identity from an operator-provided ACME store after
+checking the hostname, dates and private-key match. It never modifies that
+store. Follow your proxy deployment's certificate-transfer procedure, then
+restart `apple-relay` after installing renewed files. Keep private keys local
+and out of Git. Installed profiles remain valid when the hostname stays the same.
 
 ## User download portal
 
@@ -443,7 +349,7 @@ relay logs, credentials or administrator endpoints. The backend enforces this
 for every administrative API, including direct requests outside the frontend.
 Admin credentials are rejected by the public portal login endpoint.
 
-Deploy the updated [complete Traefik native services](config/traefik-native-services.yml)
+Deploy [the portal route from the Traefik repository](https://github.com/dkagramanyan/traefik/blob/main/dynamic/portal.yml)
 to make `/portal`, `/api/portal` and static assets reachable from outside the home
 network. This is necessary for guests and first-time users who do not yet have
 a VPN profile. The administrative website and APIs retain the existing
