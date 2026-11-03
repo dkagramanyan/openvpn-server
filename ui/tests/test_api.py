@@ -856,7 +856,7 @@ def test_portal_survives_normal_ui_renewal(client, portal, monkeypatch):
 def test_portal_signer_failure_never_returns_unsigned_profile(client, configured, portal, monkeypatch):
     from app.settings import settings
     monkeypatch.setattr(settings, "relay_signer_url", "https://signer.example.com/internal/relay-sign")
-    def failed(*args):
+    def failed(*args, **kwargs):
         raise pki.PkiError("Signing service is offline")
     monkeypatch.setattr(relay, "sign_profile", failed)
     response = portal.post("/api/portal/relay.mobileconfig", headers=H)
@@ -880,7 +880,7 @@ def test_public_portal_login_rejects_admin_credentials(client):
 def test_relay_diagnostics_require_admin_session(client, monkeypatch):
     from app import relay_services
     monkeypatch.setattr(relay_services, "runtime_status", lambda: {"ready": True, "active": [], "events": []})
-    monkeypatch.setattr(relay_services, "signing_status", lambda: {"ready": True, "configured": True})
+    monkeypatch.setattr(relay_services, "signing_status", lambda db=None: {"ready": True, "configured": True})
     assert client.get("/api/relay/status").json()["ready"] is True
     assert client.get("/api/relay/signing").json()["ready"] is True
     cookies = dict(client.cookies)
@@ -927,3 +927,66 @@ def test_relay_index_cache_observes_revocation_on_disk(client, configured):
         assert client.post("/api/relay/authorize", headers={"Authorization": token}).status_code == 403
     finally:
         path.write_text(original)
+
+
+def test_admin_can_configure_signing_without_exposing_shared_token(client, monkeypatch):
+    from app import relay_services
+    key = 'relay_signing'
+    previous = db.get_setting(key)
+    secret = 'private-signing-token-sentinel-' * 3
+    monkeypatch.setattr(relay_services, 'signing_request', lambda **kwargs: json.dumps({
+        'ready':True, 'subject':'CN=relay.example.com', 'expires_at':2000000000, 'fingerprint':'public-fingerprint'}).encode())
+    try:
+        response = client.put('/api/relay/signing', headers=H, json={
+            'url':'https://relay.example.com/internal/relay-sign', 'token':secret, 'required':True})
+        assert response.status_code == 200 and response.json()['ready']
+        assert response.json()['required'] and response.json()['token_configured']
+        assert secret not in response.text
+        invalid = client.put('/api/relay/signing', headers=H, json={'url':'https://relay.example.com/internal/relay-sign', 'token':secret * 30})
+        assert invalid.status_code == 422 and secret not in invalid.text
+        assert secret not in client.get('/api/relay/signing').text
+        assert secret not in client.get('/api/events').text
+        assert json.loads(db.get_setting(key))['token'] == secret
+        assert db.one("SELECT 1 FROM relay_policy_settings WHERE key='relay_signing'") is None
+        # Blank input in the browser keeps the existing token.
+        assert client.put('/api/relay/signing', headers=H, json={
+            'url':'https://relay.example.com/internal/relay-sign', 'token':None, 'required':True}).status_code == 200
+        assert json.loads(db.get_setting(key))['token'] == secret
+        for bad in ('http://example.com/internal/relay-sign', 'https://user:pass@example.com/internal/relay-sign',
+                    'https://example.com/internal/relay-sign?secret=value', 'https://[bad/internal/relay-sign'):
+            assert client.put('/api/relay/signing', headers=H, json={'url':bad, 'token':secret}).status_code == 400
+        reset = client.put('/api/relay/signing', headers=H, json={'use_environment':True})
+        assert reset.status_code == 200 and reset.json()['source'] == 'environment'
+        assert db.get_setting(key) is None and secret not in reset.text
+    finally:
+        if previous is None: db.execute('DELETE FROM settings WHERE key=?', (key,))
+        else: db.set_setting(key, previous)
+
+
+def test_required_signing_blocks_unsigned_admin_and_portal_downloads(client, configured, portal, monkeypatch):
+    from app import relay_services
+    monkeypatch.setattr(relay_services.settings,'relay_signer_url','')
+    monkeypatch.setattr(relay_services.settings,'relay_signing_required',True)
+    for browser,path in ((client,'/api/clients/alice/relay.mobileconfig'),(portal,'/api/portal/relay.mobileconfig')):
+        response = browser.post(path, headers=H)
+        assert response.status_code == 503
+        assert not response.content.startswith(b'<?xml')
+        assert 'private' not in response.text
+
+
+def test_portal_relay_activity_never_exposes_another_client(client, portal, monkeypatch):
+    from app import relay_services
+    def status(client=None):
+        assert client == 'alice'
+        return {'ready':True,'policy_ready':True,
+                'clients':[{'client':'alice','active':2},{'client':'bob','active':3}],
+                'active':[{'client':'alice','target':'own.example:443'}, {'client':'bob','target':'private-bob.example:443'}],
+                'events':[{'client':'alice','kind':'closed'}, {'client':'bob','kind':'denied'}],
+                'metrics':{'sensitive':'not for portal'}}
+    monkeypatch.setattr(relay_services,'runtime_status',status)
+    response = portal.get('/api/portal/relay/status')
+    assert response.status_code == 200
+    assert response.json()['clients'] == [{'client':'alice','active':2}]
+    assert 'bob' not in response.text and 'metrics' not in response.text
+    assert portal.get('/api/relay/status').status_code == 403
+    assert portal.put('/api/relay/signing', headers=H, json={'url':'','required':False}).status_code == 403

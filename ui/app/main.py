@@ -15,6 +15,8 @@ from typing import Any, AsyncIterator
 from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi.exceptions import RequestValidationError
+from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -137,9 +139,21 @@ async def security_headers(request: Request, call_next):
     return response
 
 
+@app.exception_handler(RequestValidationError)
+async def validation_error(request: Request, exc: RequestValidationError):
+    if request.url.path == "/api/relay/signing":
+        return JSONResponse({"detail": "Invalid signing settings"}, status_code=422, headers={"Cache-Control": "no-store"})
+    return await request_validation_exception_handler(request, exc)
+
+
 @app.exception_handler(PkiError)
 async def pki_error(_: Request, exc: PkiError):
     return JSONResponse({"detail": str(exc)}, status_code=400)
+
+
+@app.exception_handler(relay_services.SigningUnavailable)
+async def signing_error(_: Request, exc: relay_services.SigningUnavailable):
+    return JSONResponse({"detail": str(exc)}, status_code=503, headers={"Cache-Control": "no-store", "Retry-After": "5"})
 
 
 @app.exception_handler(ManagementError)
@@ -477,7 +491,7 @@ def own_profile_info(user: dict[str, Any] = SignedIn):
     if not cert:
         raise HTTPException(401, "Client access is no longer valid")
     return {"name": user["client_name"], "guest": relay.is_guest(user["client_name"]), "expires_at": cert["not_after"],
-            "relay_available": relay.get_settings(db)["enabled"], "signed_profiles": bool(settings.relay_signer_url)}
+            "relay_available": relay.get_settings(db)["enabled"], "signed_profiles": bool(relay_services.signing_config(db)["url"])}
 
 
 @app.get("/api/portal/ovpn")
@@ -491,6 +505,19 @@ def own_openvpn_profile(user: dict[str, Any] = SignedIn):
                     headers={"Content-Disposition": f'attachment; filename="{name}.ovpn"'})
 
 
+@app.get("/api/portal/relay/status")
+def own_relay_status(user: dict[str, Any] = SignedIn):
+    if user["role"] != "client":
+        raise HTTPException(400, "This page is for client accounts")
+    name = user["client_name"]
+    status = relay_services.runtime_status(client=name)
+    # Filter again at the trust boundary, even when an older backend ignores
+    # the client query. Never send another client's destinations to this login.
+    return {"ready": bool(status.get("ready")), "policy_ready": status.get("policy_ready", False),
+            **{key: [row for row in status.get(key, []) if row.get("client") == name]
+               for key in ("clients", "active", "events")}}
+
+
 @app.post("/api/portal/relay.mobileconfig", dependencies=[Csrf])
 def own_relay_profile(user: dict[str, Any] = SignedIn):
     if user["role"] != "client":
@@ -499,12 +526,12 @@ def own_relay_profile(user: dict[str, Any] = SignedIn):
     try:
         content = relay.profile(db, name)
     except PkiError:
-        if settings.relay_signer_url:
+        if relay_services.signing_config(db)["required"] or relay_services.signing_config(db)["url"]:
             raise HTTPException(503, "Signed relay profiles are temporarily unavailable. Please retry or contact the administrator.")
         raise
     event("portal_relay_downloaded", user, name)
     return Response(content, media_type="application/x-apple-aspen-config",
-                    headers={"Content-Disposition": f'attachment; filename="{name}-relay.mobileconfig"'})
+                    headers={"Content-Disposition": f'attachment; filename="{name}-relay.mobileconfig"', "Cache-Control": "no-store", "X-Profile-Signed": "false" if content.startswith(b"<?xml") else "true"})
 
 
 # -- overview / live --------------------------------------------------------------
@@ -698,7 +725,14 @@ def relay_status(user: dict[str, Any] = Authed):
 
 @app.get("/api/relay/signing")
 def relay_signing(user: dict[str, Any] = Authed):
-    return relay_services.signing_status()
+    return relay_services.signing_status(db)
+
+
+@app.put("/api/relay/signing", dependencies=[Csrf])
+def save_relay_signing(body: relay_services.SigningSettings, user: dict[str, Any] = Authed):
+    status = relay_services.save_signing(db, body)
+    event("relay_signing_changed", user)  # No URL/token/profile contents in audit detail.
+    return status
 
 
 @app.put("/api/relay/settings", dependencies=[Csrf])
@@ -714,7 +748,7 @@ def download_relay_profile(name: str, user: dict[str, Any] = Authed):
     content = relay.profile(db, name)
     event("relay_profile_downloaded", user, name)
     return Response(content, media_type="application/x-apple-aspen-config",
-                    headers={"Content-Disposition": f'attachment; filename="{name}-relay.mobileconfig"'})
+                    headers={"Content-Disposition": f'attachment; filename="{name}-relay.mobileconfig"', "Cache-Control": "no-store", "X-Profile-Signed": "false" if content.startswith(b"<?xml") else "true"})
 
 
 @app.delete("/api/clients/{name}/relay", dependencies=[Csrf])

@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from urllib.error import HTTPError
 from urllib.request import build_opener, HTTPCookieProcessor, ProxyHandler, Request
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -45,6 +46,12 @@ def check_browser(api_url, portal_url, admin_password, folder):
         admin.get_by_role("link", name="Relay", exact=True).click()
         admin.get_by_text("Signed downloads enabled", exact=True).wait_for()
         admin.get_by_role("heading", name="Relay activity", exact=True).wait_for()
+        assert admin.get_by_label("Shared signing token", exact=True).input_value() == ""
+        admin.get_by_role("button", name="Save signing settings", exact=True).click()
+        admin.get_by_text("Signing settings saved", exact=True).wait_for()
+        # Open the grouped user row; detail rows keep their destination filter.
+        admin.locator('details summary').filter(has_text='alice').first.click()
+        admin.get_by_text("Signed downloads enabled", exact=True).wait_for()
         admin.screenshot(path="/tmp/ovpn-relay-activity.png", full_page=True)
         admin.goto(api_url + "/#/clients/alice")
         admin.get_by_role("button", name="Portal access", exact=True).click()
@@ -62,6 +69,10 @@ def check_browser(api_url, portal_url, admin_password, folder):
         user.locator('input[type=password]').fill(portal_password)
         user.get_by_role("button", name="Sign in", exact=True).click()
         user.get_by_role("heading", name="My profiles", exact=True).wait_for()
+        user.get_by_role("heading", name="My relay activity", exact=True).wait_for()
+        personal = user.evaluate("fetch('/api/portal/relay/status').then(r => r.json())")
+        assert all(row["client"] == "alice" for key in ("clients","active","events") for row in personal[key])
+        assert personal["clients"][0]["active"] > 0 and personal["clients"][0]["bytes_down"] > 0
         user.get_by_role("link", name="OpenVPN config", exact=True).wait_for()
         assert user.locator('a[href="#/server"]').count() == 0
         with user.expect_download() as download:
@@ -183,8 +194,7 @@ tls:
         command("docker", "run", "-d", "--name", ui_name, "--network", "container:" + relay,
                 "-v", f"{fixture.TMP}:/etc/openvpn", "-v", f"{folder}:/fixture:ro",
                 "-e", "SSL_CERT_FILE=/fixture/identity/ca.pem", "-e", "MGMT_PORT=1", "-e", "OVPN_BACKUP_KEEP=0",
-                "-e", "OVPN_DATABASE_URL=" + container_dsn, "-e", "OPENVPN_ADMIN_PASSWORD=" + password, "-e", "OVPN_RELAY_SIGNER_URL=https://traefik/internal/relay-sign",
-                "-e", "RELAY_PROFILE_SIGNING_TOKEN=" + signing_token, "openvpn-ui:relay-test")
+                "-e", "OVPN_DATABASE_URL=" + container_dsn, "-e", "OPENVPN_ADMIN_PASSWORD=" + password, "openvpn-ui:relay-test")
         containers.append(ui_name)
         api_url = "http://127.0.0.1:" + published(relay, 8080)
         client = build_opener(ProxyHandler({}), HTTPCookieProcessor(http.cookiejar.CookieJar()))
@@ -228,8 +238,14 @@ tls:
                 except psycopg.Error: pass
                 else: raise AssertionError("Policy role had excessive database permissions")
         api("/api/relay/settings", {"enabled": True, "url": origin, "allowed_cidrs": [subnet]}, "PUT")
-        status = json.loads(api("/api/relay/signing"))
-        assert status["ready"], status
+        try:
+            api("/api/clients/alice/relay.mobileconfig", {}, "POST")
+        except HTTPError as exc:
+            assert exc.code == 503 and not exc.read().startswith(b"<?xml")
+        else: raise AssertionError("Unconfigured signer returned an unsigned download")
+        status = json.loads(api("/api/relay/signing", {"url":"https://traefik/internal/relay-sign", "token":signing_token, "required":True}, "PUT"))
+        assert status["ready"] and status["token_configured"], status
+        assert signing_token not in json.dumps(status)
         signed = api("/api/clients/alice/relay.mobileconfig", {}, "POST")
         env = {**os.environ, "SSL_CERT_FILE": str(folder / "identity/ca.pem")}
         plain = command("openssl", "cms", "-verify", "-binary", "-inform", "DER", "-purpose", "any",
@@ -262,13 +278,13 @@ tls:
         assert "OpenVPN" in command(*curl, "http://" + address + ":8080/")
         runtime = json.loads(api("/api/relay/status"))
         assert runtime["total"] >= 2 and runtime["denied"] >= 1
+        user_stats = next(row for row in runtime["clients"] if row["client"] == "alice")
+        assert user_stats["accepted"] >= 2 and user_stats["denied"] >= 1 and user_stats["bytes_down"] > 0
         assert any(e["client"] == "alice" and e["kind"] == "closed" for e in runtime["events"])
         assert token not in json.dumps(runtime)
         public_check = ["curl", "--silent", "--show-error", "--max-time", "10", "--cacert", str(folder / "identity/ca.pem")]
         assert command(*public_check, portal_url + "/portal").startswith("<!doctype html>")
         assert command(*public_check, "--output", "/dev/null", "--write-out", "%{http_code}", portal_url + "/api/server") == "404"
-        if os.environ.get("RELAY_STACK_BROWSER"):
-            check_browser(api_url, portal_url, password, folder)
         # UI maintenance must not interrupt relay authorization. Use the private
         # signer HTTP backend as a destination while the UI is stopped.
         signer_address = json.loads(command("docker", "inspect", prefix + "-signer"))[0]["NetworkSettings"]["Networks"][network]["IPAddress"]
@@ -278,10 +294,10 @@ import time
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
-        self.send_header("Content-Length", "122880")
+        self.send_header("Content-Length", "307200")
         self.end_headers()
         try:
-            for _ in range(120):
+            for _ in range(300):
                 self.wfile.write(b"x" * 1024)
                 self.wfile.flush()
                 time.sleep(0.2)
@@ -297,11 +313,16 @@ HTTPServer(("0.0.0.0", 8089), Handler).serve_forever()
             time.sleep(0.2)
         else: raise AssertionError("Stream destination did not start")
         progress = folder / "download"
-        stream = subprocess.Popen([*curl, "--max-time", "40", "--output", str(progress), "http://" + stream_address + ":8089/"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        stream = subprocess.Popen([*curl, "--max-time", "90", "--output", str(progress), "http://" + stream_address + ":8089/"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         for _ in range(30):
             if progress.exists() and progress.stat().st_size > 0: break
             time.sleep(0.2)
         else: raise AssertionError("Long-lived CONNECT did not start")
+        live = json.loads(api("/api/relay/status"))
+        live_user = next(row for row in live["clients"] if row["client"] == "alice")
+        assert live_user["active"] > 0 and live_user["bytes_down"] > user_stats["bytes_down"]
+        if os.environ.get("RELAY_STACK_BROWSER"):
+            check_browser(api_url, portal_url, password, folder)
         command("docker", "stop", "-t", "3", ui_name)
         time.sleep(2)
         before = progress.stat().st_size

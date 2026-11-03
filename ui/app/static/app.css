@@ -282,3 +282,6 @@ dialog.modal .m-f { padding: 0 18px 16px; display: flex; gap: 8px; justify-conte
 .dot-live { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--good); margin-right: 6px; box-shadow: 0 0 0 3px rgba(12,163,12,.18); }
 .progress { height: 6px; background: var(--surface-2); border-radius: 3px; overflow: hidden; }
 .progress i { display: block; height: 100%; background: var(--accent); }
+
+.relay-toggle { display:inline-block; font-size:1.3em; transition:transform .12s; }
+.relay-user[open] > summary .relay-toggle { transform:rotate(90deg); }

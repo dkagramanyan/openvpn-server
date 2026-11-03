@@ -53,10 +53,13 @@ func (a *activityLog) metrics(w io.Writer) {
 	for reason, value := range a.reasons {
 		reasons[reason] = value
 	}
-	up, down := a.bytesUp, a.bytesDown
+	up, down, failed, suppressed := a.tcpUp, a.tcpDown, a.failed, a.logsSuppressed
+	payloadUp, payloadDown := a.bytesUp, a.bytesDown
 	a.mu.Unlock()
-	fmt.Fprintf(w, "# TYPE relay_active_flows gauge\nrelay_active_flows %d\n# TYPE relay_connections_total counter\nrelay_connections_total %d\n# TYPE relay_rejected_total counter\nrelay_rejected_total %d\n", active, total, denied)
+	fmt.Fprintf(w, "# TYPE relay_active_flows gauge\nrelay_active_flows %d\n# TYPE relay_connections_total counter\nrelay_connections_total %d\n# TYPE relay_rejected_total counter\nrelay_rejected_total %d\n", active, total, denied+failed)
 	fmt.Fprintf(w, "# TYPE relay_completed_tcp_bytes_total counter\nrelay_completed_tcp_bytes_total{direction=\"upload\"} %d\nrelay_completed_tcp_bytes_total{direction=\"download\"} %d\n", up, down)
+	fmt.Fprintf(w, "# TYPE relay_failures_total counter\nrelay_failures_total %d\n# TYPE relay_logs_suppressed_total counter\nrelay_logs_suppressed_total %d\n", failed, suppressed)
+	fmt.Fprintf(w, "# TYPE relay_completed_payload_bytes_total counter\nrelay_completed_payload_bytes_total{direction=\"upload\"} %d\nrelay_completed_payload_bytes_total{direction=\"download\"} %d\n", payloadUp, payloadDown)
 	fmt.Fprintln(w, "# TYPE relay_flow_endings_total counter")
 	for reason, value := range reasons {
 		fmt.Fprintf(w, "relay_flow_endings_total{reason=%q} %d\n", reason, value)

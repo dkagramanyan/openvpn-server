@@ -14,36 +14,46 @@ import (
 )
 
 type activityLog struct {
-	mu        sync.Mutex
-	started   int64
-	transport string
-	reasons   map[string]uint64
-	bytesUp   int64
-	bytesDown int64
-	runtime   *relayMetrics
-	limits    map[string]int
-	readiness func(context.Context) error
-	sequence  uint64
-	events    []flowEvent
-	next      int
-	active    map[uint64]*flowLog
-	total     uint64
-	denied    uint64
+	mu             sync.Mutex
+	started        int64
+	transport      string
+	reasons        map[string]uint64
+	bytesUp        int64
+	bytesDown      int64
+	tcpUp          int64
+	tcpDown        int64
+	runtime        *relayMetrics
+	limits         map[string]int
+	readiness      func(context.Context) error
+	clients        map[string]*clientActivity
+	sequence       uint64
+	events         []flowEvent
+	next           int
+	active         map[uint64]*flowLog
+	total          uint64
+	denied         uint64
+	failed         uint64
+	logSecond      int64
+	logCount       int
+	logsSuppressed uint64
 }
 
 type flowEvent struct {
-	ID        uint64 `json:"id"`
-	Time      int64  `json:"ts"`
-	Kind      string `json:"kind"`
-	Client    string `json:"client"`
-	Guest     bool   `json:"guest"`
-	Protocol  string `json:"protocol"`
-	Target    string `json:"target"`
-	Reason    string `json:"reason"`
-	Duration  int64  `json:"duration_ms"`
-	BytesUp   int64  `json:"bytes_up"`
-	BytesDown int64  `json:"bytes_down"`
-	Counted   bool   `json:"bytes_counted"`
+	ID            uint64 `json:"id"`
+	Method        string `json:"method"`
+	Status        int    `json:"status"`
+	UpstreamError string `json:"upstream_error,omitempty"`
+	Time          int64  `json:"ts"`
+	Kind          string `json:"kind"`
+	Client        string `json:"client"`
+	Guest         bool   `json:"guest"`
+	Protocol      string `json:"protocol"`
+	Target        string `json:"target"`
+	Reason        string `json:"reason"`
+	Duration      int64  `json:"duration_ms"`
+	BytesUp       int64  `json:"bytes_up"`
+	BytesDown     int64  `json:"bytes_down"`
+	Counted       bool   `json:"bytes_counted"`
 }
 
 type flowLog struct {
@@ -103,9 +113,14 @@ func (f *flowLog) connected() {
 	}
 	f.opened = true
 	f.event.Reason = "connection_closed"
+	f.event.Status = 200
 	f.log.mu.Lock()
 	f.log.active[f.event.ID] = f
 	f.log.total++
+	client := f.log.clientLocked(f.event)
+	client.Accepted++
+	client.open++
+	client.Guest = f.event.Guest
 	f.log.mu.Unlock()
 	f.log.record(f.snapshot("connected"))
 }
@@ -130,7 +145,23 @@ func (a *activityLog) record(e flowEvent) {
 		a.events[a.next] = e
 		a.next = (a.next + 1) % 500
 	}
+	// Keep every event in the bounded UI ring, but cap repeated failure logs.
+	second := time.Now().Unix()
+	if a.logSecond != second {
+		a.logSecond, a.logCount = second, 0
+	}
+	emit := e.Kind != "connected"
+	if emit && e.Kind != "closed" && a.logCount >= 20 {
+		a.logsSuppressed++
+		emit = false
+	}
+	if emit && e.Kind != "closed" {
+		a.logCount++
+	}
 	a.mu.Unlock()
+	if !emit {
+		return
+	}
 	data, _ := json.Marshal(e)
 	log.Printf("relay %s", data)
 }
@@ -140,18 +171,55 @@ func (f *flowLog) finish() {
 		return
 	}
 	f.mu.Lock()
+	if f.ended {
+		f.mu.Unlock()
+		return
+	}
 	f.ended = true
 	f.mu.Unlock()
 	kind := "closed"
 	f.log.mu.Lock()
 	delete(f.log.active, f.event.ID)
 	if !f.opened {
-		kind = "denied"
-		f.log.denied++
+		if f.event.Status >= 500 {
+			kind = "failed"
+			f.log.failed++
+		} else {
+			kind = "denied"
+			f.log.denied++
+		}
 	}
 	f.log.reasons[f.snapshot(kind).Reason]++
 	f.log.bytesUp += f.up.Load()
 	f.log.bytesDown += f.down.Load()
+	if f.event.Protocol == "TCP" {
+		f.log.tcpUp += f.up.Load()
+		f.log.tcpDown += f.down.Load()
+	}
+	client := f.log.clientLocked(f.event)
+	if kind != "closed" {
+		client.Guest = f.event.Guest
+	}
+	if kind == "denied" {
+		client.Denied++
+	} else if kind == "failed" {
+		client.Failed++
+	}
+	if f.event.Counted {
+		client.BytesUp += f.up.Load()
+		client.BytesDown += f.down.Load()
+	} else if f.opened {
+		client.Uncounted++
+	}
+	if kind != "closed" || f.event.Reason != "connection_closed" {
+		client.LastError, client.LastErrorAt = f.event.Reason, time.Now().Unix()
+	}
+	if f.opened {
+		client.open--
+	}
+	if len(f.log.clients) > maxClientHistory && client.open == 0 {
+		delete(f.log.clients, f.event.Client)
+	}
 	f.log.mu.Unlock()
 	f.log.record(f.snapshot(kind))
 }
@@ -183,21 +251,40 @@ func (a *activityLog) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]bool{"ok": true})
 		return
 	}
+	selected := r.URL.Query().Get("client")
 	a.mu.Lock()
 	events := append([]flowEvent{}, a.events[a.next:]...)
 	events = append(events, a.events[:a.next]...)
+	if selected != "" {
+		filtered := make([]flowEvent, 0)
+		for _, e := range events {
+			if e.Client == selected {
+				filtered = append(filtered, e)
+			}
+		}
+		events = filtered
+	}
 	flows := make([]*flowLog, 0, len(a.active))
 	for _, f := range a.active {
-		flows = append(flows, f)
+		if selected == "" || f.event.Client == selected {
+			flows = append(flows, f)
+		}
 	}
-	total, denied := a.total, a.denied
+	total, denied, failed, suppressed := a.total, a.denied, a.failed, a.logsSuppressed
+	history := make([]clientActivity, 0, len(a.clients))
+	for _, c := range a.clients {
+		if selected == "" || c.Client == selected {
+			history = append(history, *c)
+		}
+	}
 	a.mu.Unlock()
 	active := make([]flowEvent, 0, len(flows))
 	for _, f := range flows {
 		active = append(active, f.snapshot("connected"))
 	}
+	clients := summarizeClients(history, active)
 	json.NewEncoder(w).Encode(map[string]any{"ready": true, "transport": a.transport, "started_at": a.started,
-		"total": total, "denied": denied, "active": active, "events": events, "policy_ready": policyReady, "limits": a.limits, "metrics": a.runtime.snapshot()})
+		"total": total, "denied": denied, "failed": failed, "logs_suppressed": suppressed, "clients": clients, "active": active, "events": events, "policy_ready": policyReady, "limits": a.limits, "metrics": a.runtime.snapshot()})
 }
 
 func (a *activityLog) listen(address string) (*http.Server, error) {

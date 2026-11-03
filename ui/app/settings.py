@@ -42,6 +42,7 @@ class Settings:
         if self.relay_transport not in ("http2", "http3"):
             raise ValueError("OVPN_RELAY_TRANSPORT must be http2 or http3")
         self.relay_signer_url = _env("OVPN_RELAY_SIGNER_URL", "").strip()
+        self.relay_signing_required = _env("OVPN_RELAY_REQUIRE_SIGNED", "true").lower() not in ("0", "false")
         self.relay_signer_token = _env("RELAY_PROFILE_SIGNING_TOKEN", "").strip()
         self.guest_block = _env("GUEST_BLOCK", "10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16").strip()
         # Daily backup archives (PKI, profiles, configuration, database); keep 0 turns them off.

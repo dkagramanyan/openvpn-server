@@ -73,32 +73,36 @@ func (s *relayServer) watch(ctx context.Context, token string, addr netip.Addr, 
 }
 
 func (s *relayServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodConnect {
-		http.Error(w, "CONNECT required", 405)
-		return
-	}
 	flow := s.activity.begin()
 	defer flow.finish()
 	r = r.WithContext(context.WithValue(r.Context(), flowKey{}, flow))
+	if flow != nil {
+		flow.event.Method = r.Method
+		if len(flow.event.Method) > 32 {
+			flow.event.Method = "OTHER"
+		}
+	}
+	if r.Method != http.MethodConnect {
+		w.Header().Set("Allow", "CONNECT")
+		reject(w, r, 405, "unsupported_method", "CONNECT required", "http_request_error")
+		return
+	}
 	select {
 	case s.slots <- struct{}{}:
 		defer func() { <-s.slots }()
 	default:
-		flow.reason("capacity_reached")
 		w.Header().Set("Retry-After", "1")
-		http.Error(w, "Relay busy", 503)
+		reject(w, r, 503, "capacity_reached", "Relay busy", "connection_limit_reached")
 		return
 	}
 	token := r.Header.Get("Authorization")
 	p, err := s.authorize(r.Context(), token)
 	if err != nil {
 		if errors.Is(err, errAccessDenied) {
-			flow.reason("authorization_denied")
-			http.Error(w, "Relay access denied", 403)
+			reject(w, r, 403, "authorization_denied", "Relay access denied", "http_request_denied")
 		} else {
-			flow.reason("authorization_unavailable")
 			w.Header().Set("Retry-After", "1")
-			http.Error(w, "Relay authorization temporarily unavailable", 503)
+			reject(w, r, 503, "authorization_unavailable", "Relay authorization temporarily unavailable", "proxy_internal_error")
 		}
 		return
 	}
@@ -111,9 +115,8 @@ func (s *relayServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	release, ok := s.quota.acquire(identity)
 	if !ok {
-		flow.reason("client_capacity_reached")
 		w.Header().Set("Retry-After", "1")
-		http.Error(w, "Client relay capacity reached", 503)
+		reject(w, r, 503, "client_capacity_reached", "Client relay capacity reached", "connection_limit_reached")
 		return
 	}
 	defer release()
@@ -131,19 +134,19 @@ func (s *relayServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		template, err := uritemplate.New(p.URL + udpPath)
 		if err != nil {
-			http.Error(w, "Invalid relay configuration", 503)
+			reject(w, r, 503, "invalid_configuration", "Invalid relay configuration", "proxy_configuration_error")
 			return
 		}
 		request := r.Clone(ctx)
 		request.Proto = "connect-udp" // masque-go's HTTP/3 representation
 		udpReq, err = masque.ParseProxyRequest(request, template)
 		if err != nil {
-			http.Error(w, "Invalid UDP request", 400)
+			reject(w, r, 400, "invalid_udp_request", "Invalid UDP request", "http_request_error")
 			return
 		}
 		target = udpReq.Target
 	} else if !((r.ProtoMajor == 2 && protocol == "") || r.Proto == "HTTP/3.0") {
-		http.Error(w, "Unsupported CONNECT protocol", 400)
+		reject(w, r, 400, "unsupported_protocol", "Unsupported CONNECT protocol", "http_request_error")
 		return
 	} else if flow != nil {
 		flow.event.Protocol = "TCP"
@@ -152,7 +155,7 @@ func (s *relayServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if host, port, err := net.SplitHostPort(target); err == nil && len(host) <= 253 && len(port) <= 5 {
 			flow.event.Target = net.JoinHostPort(host, port)
 		}
-		flow.event.Counted = udpReq == nil
+		flow.event.Counted = udpReq == nil || r.ProtoMajor == 2
 	}
 	resolved := time.Now()
 	addresses, err := resolveAll(ctx, target, p)
@@ -160,14 +163,11 @@ func (s *relayServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		switch {
 		case errors.Is(err, errInvalidTarget):
-			flow.reason("invalid_target")
-			http.Error(w, "Invalid target", 400)
+			reject(w, r, 400, "invalid_target", "Invalid target", "http_request_error")
 		case errors.Is(err, errDNSFailed):
-			flow.reason("dns_failed")
-			http.Error(w, "Destination DNS unavailable", 502)
+			reject(w, r, 502, "dns_failed", "Destination DNS unavailable", "dns_error")
 		default:
-			flow.reason("destination_denied")
-			http.Error(w, "Destination denied", 403)
+			reject(w, r, 403, "destination_denied", "Destination denied", "destination_ip_prohibited")
 		}
 		return
 	}
@@ -183,8 +183,7 @@ func (s *relayServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if err != nil {
-			flow.reason("destination_unreachable")
-			http.Error(w, "Destination unavailable", 502)
+			reject(w, r, 502, "destination_unreachable", "Destination unavailable", connectionError(err))
 			return
 		}
 		defer conn.Close()
@@ -202,11 +201,10 @@ func (s *relayServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	dialStarted := time.Now()
-	conn, addr, err := dialTCP(ctx, addresses)
+	conn, addr, err := s.connectTCP(ctx, addresses)
 	s.metrics.observe("tcp_dials", dialStarted)
 	if err != nil {
-		flow.reason("destination_unreachable")
-		http.Error(w, "Destination unavailable", 502)
+		reject(w, r, 502, "destination_unreachable", "Destination unavailable", connectionError(err))
 		return
 	}
 	defer conn.Close()
@@ -232,15 +230,13 @@ func (s *relayServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		n, err := io.Copy(conn, stream)
-		flow.add(n, 0)
+		_, err := io.Copy(trafficWriter{conn, flow, true}, stream)
 		_ = conn.(*net.TCPConn).CloseWrite()
 		if err != nil && !outputComplete.Load() {
 			closeFlow()
 		}
 	}()
-	n, err := io.Copy(stream, conn)
-	flow.add(0, n)
+	_, err = io.Copy(trafficWriter{stream, flow, false}, conn)
 	if err != nil {
 		closeFlow()
 	} else {

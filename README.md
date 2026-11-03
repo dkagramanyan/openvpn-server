@@ -197,7 +197,10 @@ To enable it:
    and LAN. Enable and save. Names such as `nas.home.arpa` must resolve to the intended
    LAN addresses **from the relay container**; configure its DNS in Compose if
    your Docker DNS does not resolve your LAN names.
-5. Under **Clients**, download **Apple relay** beside that client's OpenVPN
+5. Configure **Relay → Profile signing** using the existing Traefik signing
+   endpoint and shared token (see [Automatic signed profiles](#automatic-signed-profiles)).
+   Signed downloads are required by default.
+6. Under **Clients**, download **Apple relay** beside that client's OpenVPN
    config. Transfer the file privately to the iPhone, iPad or Mac and install it
    in system Settings. On iOS/iPadOS, open the downloaded profile and complete
    installation under **General → VPN & Device Management**; on macOS use
@@ -324,9 +327,10 @@ access to `letsencrypt/acme.json`; private keys never move to the OpenVPN host.
 It selects a valid, publicly trusted identity for the configured hostname,
 includes its intermediate chain, and reloads renewed certificates without a
 restart. The UI verifies the signature, certificate chain, hostname and exact
-profile contents before returning a download. When signing is configured,
-an unavailable signer fails the download with an error rather than silently
-returning an unsigned profile. Installed profiles continue using their relay
+profile contents before returning a download. Signed relay downloads are
+required by default (`OVPN_RELAY_REQUIRE_SIGNED=true`). Missing signing setup
+or an unavailable signer returns 503 and never silently produces unsigned XML.
+An administrator can explicitly allow unsigned downloads for development. Installed profiles continue using their relay
 credentials independently of the signer.
 
 The Raspberry Pi deployment lives in the separate
@@ -342,16 +346,27 @@ value, then run `sudo docker compose up -d --build` from its deployment folder.
 The HTTPS signing route publishes no additional host port and accepts only the
 OpenVPN host at `170.134.51.30`, authenticated with the shared token.
 
-On the OpenVPN host, add to the existing `.env`:
+On the OpenVPN host, open **Relay → Profile signing**. Set the signer URL to
+`https://openvpn.dgkagramanyan.ru/internal/relay-sign` and paste the **existing**
+`RELAY_PROFILE_SIGNING_TOKEN` from the Traefik `.env`. Keep **Require signed
+relay profiles** checked, save, and check for **Signed downloads enabled**.
+The token field is write-only; blank input keeps the existing token. These UI
+settings are stored in PostgreSQL and take precedence over environment values.
+Use **Use environment settings** to clear the UI override when switching back.
+The policy service cannot read them. Keep tokens and downloaded profiles private.
+
+Alternatively, add to the OpenVPN host's existing `.env`:
 
 ```dotenv
 OVPN_RELAY_SIGNER_URL=https://openvpn.dgkagramanyan.ru/internal/relay-sign
 RELAY_PROFILE_SIGNING_TOKEN=THE_SAME_GENERATED_VALUE
 ```
 
-Then run `sudo docker compose up -d --build`. Open **Relay** in the UI and check
-**Signed downloads enabled**. Download a new profile and verify the signer on
-your target iPhone before distributing profiles. Apple still asks users to
+For environment changes, run `bin/upgrade-relay.sh --sudo-docker`. Open **Relay**
+and check **Signed downloads enabled**. Download a new profile and verify the signer on
+your target iPhone before distributing profiles. If iOS says **Not signed**, the installed file is still unsigned: after setup,
+download it again and replace the old installed profile. A previously downloaded
+file cannot acquire a signature automatically. Apple still asks users to
 confirm installation; signing identifies the source rather than hiding what
 the profile does. Apple may require removing an older signed profile before
 installing a replacement signed with a renewed identity.
@@ -365,15 +380,38 @@ and [profile replacement rules](https://developer.apple.com/documentation/device
 
 ### Relay activity and reliability checks
 
-The **Relay** page shows backend availability, active TCP/UDP destinations,
-client names, access roles, denials, connection duration, completed TCP traffic
-and profile signing status. It refreshes every five seconds. The last 500 events
-are held in a bounded in-memory ring since relay startup; older events remain
-in rotated container logs. UDP traffic byte counts are not currently reported.
+The **Relay** page groups active connections and recent activity by client
+across all devices. Expand a client to inspect destinations and individual
+results. Summaries show active TCP/UDP counts, accepted flows, denied requests,
+failed connections, traffic and the last issue. TCP and HTTP/2 UDP byte counters
+update during active transfers. HTTP/3 UDP payload bytes remain uncounted and
+are marked as such. Portal users can see their own aggregate activity; another
+client's destinations and signing credentials are never returned to that login.
+
+Counters reset on relay restart. History retains up to 2048 inactive clients
+plus active clients, and details use a 500-event ring. Container logs emit one
+terminal record per flow, with repeated failure records capped at 20 per second;
+all failures still update counters/the ring. Suppressed-log and transport-error
+counters are available in `/metrics`. Malformed HTTP/2 input is never echoed
+into logs.
 Credentials and profile contents are never logged. Diagnostic data is exposed
 only through authenticated UI endpoints; the relay's internal status server binds
 to host loopback at `127.0.0.1:8446`. Keep that port free and do not proxy it.
 The Docker health check monitors the relay process through that local endpoint.
+Responses and events distinguish policy denials (403) from destination DNS,
+connection-refused, unroutable and timeout failures. Error responses include
+fixed RFC 9209 `Proxy-Status` codes without raw errors or internal topology.
+A refused TCP setup is retried once after 150 ms, inside the existing five-second
+budget, using only validated numeric addresses and before sending application
+data. This does not replay an established application request.
+
+An iPhone can report a server error while other relayed connections work. In
+the reported iOS 26.6.2 logs, Apple gateway TCP destinations sometimes failed
+and later succeeded. That confirms partial destination failures; it does not
+prove which failed flow caused the Settings label. Inspect `upstream_error` and
+HTTP status in the expanded activity, then recheck the physical phone after
+updating. The server cannot directly set iOS's displayed status.
+
 HTTP/2 UDP flows with no traffic expire after two minutes to release resources;
 the OS can establish a new flow when traffic resumes. TCP sockets use keepalives,
 and completed responses release uploads that a peer leaves open.

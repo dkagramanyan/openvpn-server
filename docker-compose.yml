@@ -95,6 +95,7 @@ services:
       HOME_SUB: *home_sub
       GUEST_BLOCK: *guest_block
       OVPN_RELAY_TRANSPORT: ${APPLE_RELAY_TRANSPORT:-http2}
+      OVPN_RELAY_REQUIRE_SIGNED: ${OVPN_RELAY_REQUIRE_SIGNED:-true}
       OVPN_RELAY_SIGNER_URL: ${OVPN_RELAY_SIGNER_URL:-}
       RELAY_PROFILE_SIGNING_TOKEN: ${RELAY_PROFILE_SIGNING_TOKEN:-}
       # OVPN_BACKUP_KEEP: "14"      # daily backup archives to keep in ./backups; 0 = no backups

@@ -119,11 +119,33 @@ def test_ui_checks_signature_contents_and_hostname(signing, monkeypatch):
     signer, _, _ = signing
     signed = signer.sign(profile())
     monkeypatch.setattr(relay_services.settings, "relay_signer_url", "https://localhost/internal/relay-sign")
-    monkeypatch.setattr(relay_services, "signing_request", lambda content=None: signed)
+    monkeypatch.setattr(relay_services, "signing_request", lambda content=None, **kwargs: signed)
     with pytest.raises(relay_services.PkiError, match="changed"):
         relay_services.sign_profile(profile() + b"\n", "relay.example.com")
     with pytest.raises(relay_services.PkiError, match="verified"):
         relay_services.sign_profile(profile(), "wrong.example.com")
-    monkeypatch.setattr(relay_services, "signing_request", lambda content=None: signed[:-30] + bytes(30))
+    monkeypatch.setattr(relay_services, "signing_request", lambda content=None, **kwargs: signed[:-30] + bytes(30))
     with pytest.raises(relay_services.PkiError, match="verified"):
         relay_services.sign_profile(profile(), "relay.example.com")
+
+
+def test_unsigned_download_requires_explicit_opt_out(monkeypatch):
+    from app import relay_services
+    from app.settings import Settings
+    monkeypatch.delenv('OVPN_RELAY_REQUIRE_SIGNED', raising=False)
+    assert Settings().relay_signing_required is True
+    monkeypatch.setattr(relay_services.settings, 'relay_signer_url', '')
+    monkeypatch.setattr(relay_services.settings, 'relay_signing_required', True)
+    with pytest.raises(relay_services.SigningUnavailable, match='setup'):
+        relay_services.sign_profile(profile(), 'relay.example.com')
+    monkeypatch.setattr(relay_services.settings, 'relay_signing_required', False)
+    assert relay_services.sign_profile(profile(), 'relay.example.com') == profile()
+
+
+def test_environment_token_with_newline_is_rejected_without_exposure(monkeypatch):
+    from app import relay_services
+    secret = 'private-token-sentinel' * 3 + '\n'
+    config = {'url':'https://example.com/internal/relay-sign', 'token':secret}
+    with pytest.raises(relay_services.PkiError) as error:
+        relay_services.signing_request(config=config)
+    assert 'private-token-sentinel' not in str(error.value)

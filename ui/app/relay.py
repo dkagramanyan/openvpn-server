@@ -167,7 +167,7 @@ def profile(db, name: str) -> bytes:
     result.update({"PayloadContent": [relay], "PayloadDescription":
                    ("Internet-only guest access. " if guest else "Internet and LAN access through your server. ")
                    + "This profile contains a personal access credential."})
-    return sign_profile(plistlib.dumps(result, sort_keys=False), urlsplit(config["url"]).hostname)
+    return sign_profile(plistlib.dumps(result, sort_keys=False), urlsplit(config["url"]).hostname, db=db)
 
 
 def renewed(db, name, previous_serial):

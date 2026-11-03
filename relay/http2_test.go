@@ -259,6 +259,22 @@ func TestHTTP2TCPUDPAndRevocation(t *testing.T) {
 					t.Fatalf("UDP echo: %d bytes, %v", len(got), err)
 				}
 			}
+			// Check live payload counters before the UDP flow is closed.
+			var counted bool
+			for attempt := 0; attempt < 20; attempt++ {
+				for _, f := range readActivity(t, s.activity, "/status").Active {
+					if f.Protocol == "UDP" && f.Counted && f.BytesUp == 4104 && f.BytesDown == 4104 {
+						counted = true
+					}
+				}
+				if counted {
+					break
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			if !counted {
+				t.Fatal("live HTTP/2 UDP payload counts did not match echoed datagrams")
+			}
 			for _, udp := range []bool{false, true} {
 				for _, test := range []struct{ target, token string }{{"127.0.0.1:80", "Bearer alice:secret"}, {"8.8.8.8:53", "Bearer alice:secret"}, {tcp.Addr().String(), ""}} {
 					r, output, err := connect(test.target, udp, test.token)

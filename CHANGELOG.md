@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### 1.9: signing requirements and per-user relay activity
+
+* Require CMS-signed relay downloads by default. Add admin signing URL/token
+  settings with a write-only token field, safe validation errors, and explicit
+  unsigned opt-out. Existing unsigned installations need a new download.
+* Group active connections/activity by user, with live TCP/HTTP2 UDP traffic,
+  separate denied/failed counts and expandable details. Give portal logins
+  only their own counters and activity, including with an older backend.
+* Add fixed RFC 9209 Proxy-Status diagnostics, HTTP results and transport error
+  metrics. Retry a refused TCP setup once before any application data, within
+  the existing deadline. Rate-limit repeated failure logs and scrub quoted
+  HTTP/2 input from library errors. Destination failures are reported separately
+  from relay/policy failures; the iOS status label still needs device validation.
+
+
 * Recover permission-interrupted Git updates with a standalone helper: repair
   code/Git ownership, preserve existing stashes, save only incoming code
   collisions, and restore unambiguous runtime configuration from the user's

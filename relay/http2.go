@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/netip"
@@ -51,8 +52,10 @@ func serveHTTP2(listener net.Listener, handler http.Handler, trusted []netip.Pre
 	server := &http2.Server{MaxConcurrentStreams: 256, IdleTimeout: 90 * time.Second,
 		ReadIdleTimeout: 10 * time.Second, PingTimeout: 5 * time.Second, WriteByteTimeout: 15 * time.Second,
 		MaxUploadBufferPerConnection: 4 << 20, MaxUploadBufferPerStream: 256 << 10}
+	protocolLogs := &transportLog{}
 	maxConnections := 128
 	if relay, ok := handler.(*relayServer); ok {
+		protocolLogs.metrics = relay.metrics
 		if relay.h2ReadIdle > 0 {
 			server.ReadIdleTimeout = relay.h2ReadIdle
 		}
@@ -81,7 +84,7 @@ func serveHTTP2(listener net.Listener, handler http.Handler, trusted []netip.Pre
 			go func() {
 				defer func() { conn.Close(); <-connections }()
 				server.ServeConn(conn, &http2.ServeConnOpts{Handler: handler,
-					BaseConfig: &http.Server{MaxHeaderBytes: 8192, ReadHeaderTimeout: 10 * time.Second}})
+					BaseConfig: &http.Server{ErrorLog: log.New(protocolLogs, "", 0), MaxHeaderBytes: 8192, ReadHeaderTimeout: 10 * time.Second}})
 			}()
 		default:
 			conn.Close()
@@ -142,15 +145,13 @@ func (s *relayServer) proxyHTTP2TCP(w http.ResponseWriter, r *http.Request, conn
 	var responseDone atomic.Bool
 	go func() {
 		defer close(done)
-		n, err := io.Copy(conn, r.Body)
-		flowFrom(r.Context()).add(n, 0)
+		_, err := io.Copy(trafficWriter{conn, flowFrom(r.Context()), true}, r.Body)
 		_ = conn.CloseWrite()
 		if err != nil && !responseDone.Load() {
 			abort()
 		}
 	}()
-	n, err := io.Copy(flushedWriter{w, rc}, conn)
-	flowFrom(r.Context()).add(0, n)
+	_, err := io.Copy(trafficWriter{flushedWriter{w, rc}, flowFrom(r.Context()), false}, conn)
 	responseDone.Store(true)
 	if err != nil {
 		abort()
@@ -167,6 +168,10 @@ const maxUDPPayload = 65507
 // Unknown capsules/contexts and oversized UDP datagrams are discarded without
 // allocating according to an untrusted capsule length.
 func capsulesToUDP(reader io.Reader, conn *net.UDPConn) error {
+	return countedCapsulesToUDP(reader, conn, nil)
+}
+
+func countedCapsulesToUDP(reader io.Reader, conn *net.UDPConn, flow *flowLog) error {
 	parser := http3.NewCapsuleParser(reader)
 	buffer := make([]byte, maxUDPPayload)
 	for {
@@ -194,7 +199,9 @@ func capsulesToUDP(reader io.Reader, conn *net.UDPConn) error {
 		if _, err := io.ReadFull(capsule, payload); err != nil {
 			return err
 		}
-		if _, err := conn.Write(payload); err != nil {
+		n, err := conn.Write(payload)
+		flow.add(int64(n), 0)
+		if err != nil {
 			return err
 		}
 		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Minute))
@@ -215,7 +222,7 @@ func (s *relayServer) proxyHTTP2UDP(w http.ResponseWriter, r *http.Request, conn
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_ = capsulesToUDP(r.Body, conn)
+		_ = countedCapsulesToUDP(r.Body, conn, flowFrom(r.Context()))
 		conn.Close()
 	}()
 	buffer := make([]byte, 65536)
@@ -236,6 +243,7 @@ func (s *relayServer) proxyHTTP2UDP(w http.ResponseWriter, r *http.Request, conn
 		if rc.Flush() != nil {
 			break
 		}
+		flowFrom(r.Context()).add(0, int64(n))
 	}
 	r.Body.Close()
 	conn.Close()
