@@ -306,7 +306,17 @@ func main() {
 	handler.activity = newActivity(mode)
 	handler.activity.runtime = handler.metrics
 	handler.activity.limits = map[string]int{"flows": maximum, "per_client": perClient, "auth_checks": authChecks, "h2_connections": h2Connections, "h2_streams": h2Streams}
-	handler.activity.readiness = handler.checkReadiness
+	// Ready = the policy answers AND the client listener is open. /readyz
+	// opens before the listener, and waitForPolicy polls only once a second,
+	// so without the second condition a check could pass before the relay
+	// accepts connections.
+	var serving atomic.Bool
+	handler.activity.readiness = func(ctx context.Context) error {
+		if !serving.Load() {
+			return errAuthUnavailable
+		}
+		return handler.checkReadiness(ctx)
+	}
 	admin, err := handler.activity.listen("127.0.0.1:8446")
 	if err != nil {
 		log.Fatal(err)
@@ -330,6 +340,7 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
+		serving.Store(true)
 		log.Printf("Apple Network Relay HTTP/2 backend listening on %s; TLS terminates at the trusted proxy", listener.Addr())
 		if err := serveHTTP2Context(ctx, listener, handler, trusted); err != nil && ctx.Err() == nil {
 			log.Fatal(err)
@@ -349,6 +360,11 @@ func main() {
 		MaxHeaderBytes: 8192,
 		QUICConfig:     &quic.Config{KeepAlivePeriod: 20 * time.Second, MaxIdleTimeout: 90 * time.Second},
 	}
+	udp, err := net.ListenPacket("udp", server.Addr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	serving.Store(true)
 	log.Printf("Apple Network Relay listening on %s/udp", server.Addr)
-	log.Fatal(server.ListenAndServe())
+	log.Fatal(server.Serve(udp))
 }

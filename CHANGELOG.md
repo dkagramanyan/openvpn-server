@@ -11,6 +11,9 @@
   "the whole website". They reach the relay policy, the guest relay profiles
   (`MatchDomains`), the guests' portal page and the gateway file (`guest_links`).
 * The sign-in page showed no title on phones.
+* The relay's `/readyz` reported ready up to a second before its client
+  listener was open, so a check right after startup (CI, `bin/upgrade-relay.sh`)
+  could still see refused connections. It now waits for the listener too.
 
 ## 2.0.0 - 2026-11-04
 
