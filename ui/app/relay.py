@@ -3,12 +3,10 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import ipaddress
 import json
 import plistlib
 import re
 import secrets
-import shlex
 import time
 import uuid
 from functools import lru_cache
@@ -17,7 +15,7 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, Field
 
-from . import pki
+from . import network, pki
 from .pki import PkiError
 from .settings import settings
 from .relay_services import sign_profile
@@ -26,48 +24,32 @@ from .relay_services import sign_profile
 class RelaySettings(BaseModel):
     enabled: bool = False
     url: str = Field(default="", max_length=2048)
-    route_all: bool = True  # Accepted for old API clients; roles now always route all domains.
-    match_domains: list[str] = Field(default_factory=lambda: ["home.arpa"], max_length=100)
-    allowed_cidrs: list[str] = Field(default_factory=lambda: [settings.home_sub] if settings.home_sub else [], max_length=100)
 
 
 def get_settings(db) -> dict:
     config = RelaySettings(**json.loads(db.get_setting("apple_relay", "{}"))).model_dump()
-    config["route_all"] = True  # Relay access now follows the OpenVPN role for every profile.
     return {**config, "transport": settings.relay_transport}
 
 
-def validate_settings(body: RelaySettings, *, lan_cidrs=None) -> dict:
-    config = body.model_dump()
-    config["route_all"] = True
-    url = body.url.strip().rstrip("/")
+def validate_url(url: str) -> str:
+    """The relay's public HTTPS origin, e.g. https://relay.example.com:8443."""
+    url = url.strip().rstrip("/")
     try:
         parsed = urlsplit(url)
         port = parsed.port
-        if url and (parsed.scheme != "https" or not parsed.hostname or parsed.username is not None
-                    or parsed.password is not None or parsed.query or parsed.fragment
-                    or parsed.path or port == 0 or re.search(r"[\s{}\\]", url)):
-            raise ValueError()
+        if (parsed.scheme != "https" or not parsed.hostname or parsed.username is not None or parsed.password is not None
+                or parsed.query or parsed.fragment or parsed.path or port == 0 or re.search(r"[\s{}\\]", url)):
+            raise ValueError
     except ValueError:
-        raise PkiError("Relay URL must be an HTTPS origin, e.g. https://relay.example.com:8443")
-    config["url"] = url
-    domains = []
-    for domain in body.match_domains:
-        domain = domain.strip().lower().rstrip(".")
-        if len(domain) > 253 or not all(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
-                                        for label in domain.split(".")):
-            raise PkiError("Enter LAN domain names without wildcards or URLs")
-        domains.append(domain)
-    config["match_domains"] = list(dict.fromkeys(domains))
-    try:
-        config["allowed_cidrs"] = list(dict.fromkeys(str(ipaddress.ip_network(c.strip(), strict=True))
-                                                    for c in body.allowed_cidrs))
-    except ValueError:
-        raise PkiError("Allowed networks must be valid CIDRs, e.g. 192.168.1.0/24")
-    if lan_cidrs is None:
-        lan_cidrs = settings.read_network().get("lan_cidrs", [])
-    if body.enabled and (not url or not (config["allowed_cidrs"] or lan_cidrs)):
-        raise PkiError("Enabling the relay requires an HTTPS URL and LAN networks to block for guests")
+        raise PkiError("Relay URL must be an HTTPS origin, e.g. https://relay.example.com:8443") from None
+    return url
+
+
+def validate_settings(body: RelaySettings) -> dict:
+    config = body.model_dump()
+    config["url"] = validate_url(body.url) if body.url.strip() else ""
+    if body.enabled and not config["url"]:
+        raise PkiError("Enabling Apple relay profiles requires the relay's public HTTPS URL")
     return config
 
 
@@ -105,33 +87,6 @@ def is_guest(name: str) -> bool:
     return (settings.guests_dir / name).is_file()
 
 
-def guest_blocks(config: dict) -> list[str]:
-    """Mirror LAN/VPN exclusions, including LANs using public address space."""
-    network = settings.read_network()
-    networks = [settings.guest_sub, *config["allowed_cidrs"]]
-    if network:
-        networks += network["lan_cidrs"] + network["blocked_cidrs"]
-    else:
-        networks += ([settings.home_sub] if settings.home_sub else []) + settings.guest_block.split()
-    # Read errors or malformed relevant directives fail closed in authorize().
-    if settings.server_conf.stat().st_nlink == 0:
-        raise OSError("Bound server configuration was replaced; recreate relay-policy")
-    for line in settings.server_conf.read_text().splitlines():
-        words = shlex.split(line, comments=True)
-        if not words:
-            continue
-        if words[0] == "push" and len(words) > 1:
-            words = shlex.split(words[1])
-        if words and words[0] in ("server", "route", "route-ipv6", "server-ipv6"):
-            network = words[1]
-            if words[0] in ("server", "route") and len(words) > 2:
-                network += "/" + words[2]
-            subnet = ipaddress.ip_network(network, strict=False)
-            if subnet.prefixlen:  # a pushed default route is not a LAN
-                networks.append(str(subnet))
-    return sorted({str(ipaddress.ip_network(n, strict=False)) for n in networks})
-
-
 def revoke(db, name: str) -> None:
     db.execute("DELETE FROM settings WHERE key = ?", ("relay_client:" + name,))
 
@@ -149,6 +104,10 @@ def profile(db, name: str) -> bytes:
     if not cert:
         raise PkiError("Relay profiles require a valid client certificate")
     guest = is_guest(name)
+    portal = network.guest_portal()
+    if guest and not portal:
+        raise PkiError("Guest relay profiles open only the personal portal. Set the guest portal listener "
+                       "in Settings → Network first")
     # Unexpected certificate replacement cannot inherit an earlier credential.
     # An explicit UI renewal updates this binding without changing the secret.
     with db.tx() as conn:
@@ -174,15 +133,17 @@ def profile(db, name: str) -> bytes:
                 "PayloadUUID": str(uuid.uuid5(uuid.NAMESPACE_URL, identifier + suffix)).upper(),
                 "PayloadDisplayName": title}
 
-    title = ("Guest Relay · " if guest else "Full Access Relay · ") + name
+    title = ("Guest Portal Relay · " if guest else "Full Access Relay · ") + name
     relay = payload("com.apple.relay.managed", ".relay", title)
     url_key = "HTTP2RelayURL" if config["transport"] == "http2" else "HTTP3RelayURL"
     relay.update({"Relays": [{url_key: config["url"] + "/.well-known/masque/udp/{target_host}/{target_port}/",
                               "AdditionalHTTPHeaderFields": {"Authorization": "Bearer " + token}}],
-                  "MatchDomains": []})
+                  # Guests send only the portal through the relay; their other traffic stays
+                  # on the device's own connection. Full access routes everything.
+                  "MatchDomains": [portal["host"]] if guest else []})
     result = payload("Configuration", "", title)
     result.update({"PayloadContent": [relay], "PayloadDescription":
-                   ("Internet-only guest access. " if guest else "Internet and LAN access through your server. ")
+                   ("Guest access to your personal portal page only. " if guest else "Internet and LAN access through your server. ")
                    + "This profile contains a personal access credential."})
     return sign_profile(plistlib.dumps(result, sort_keys=False), urlsplit(config["url"]).hostname, db=db)
 
@@ -220,15 +181,13 @@ def authorize(db, authorization: str, *, strict_state: bool = False) -> dict | N
     if not config["enabled"] or not cert or cert["serial"] != grant["serial"]:
         return None
     try:
-        blocked = guest_blocks(config) if guest else []
-    except (OSError, ValueError, IndexError):
-        if strict_state: raise
+        portal = network.guest_portal() if guest else None
+    except (OSError, ValueError):
+        if strict_state:
+            raise   # the policy service answers 503: state unavailable, not "denied"
         return None
-    # Full-access users may reach internet and LAN destinations. Keep the
-    # configured LAN list separate so guest exclusions never become 0.0.0.0/0.
-    allowed = ["0.0.0.0/0"] if guest else ["0.0.0.0/0", "::/0"]
-    network = settings.read_network()
-    portal = network.get("portal", {})
-    return {"client": name, "credential_id": hashlib.sha256(grant["secret"].encode()).hexdigest(), "allowed_cidrs": allowed,
-            "blocked_cidrs": blocked, "guest": guest, "url": config["url"],
-            "portal": portal if guest and portal.get("enabled") and portal.get("target") else None}
+    # Full access: internet and LAN. Guests: nothing but the personal portal,
+    # which the relay pins to the gateway's portal listener.
+    return {"client": name, "credential_id": hashlib.sha256(grant["secret"].encode()).hexdigest(),
+            "guest": guest, "url": config["url"], "allowed_cidrs": [] if guest else ["0.0.0.0/0", "::/0"],
+            "portal": portal}

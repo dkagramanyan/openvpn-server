@@ -1,89 +1,72 @@
 <!-- Network addresses in examples are synthetic; deployment-specific notes are omitted. -->
 # Changelog
 
-## Unreleased
+## 2.0.0 - 2026-11-04
 
-* Make guest portal access a portal-only Traefik source allowlist by default.
-  Include the guest subnet in the export without granting private/admin access.
-  Move dedicated listener and DNS redirection fields into an optional advanced
-  section; preserve existing isolated routing and guest LAN restrictions.
+A large release: PostgreSQL, the Apple Network Relay, a personal portal for
+clients, and guests that reach nothing but that portal. Upgrade with
+`bin/upgrade-relay.sh` **and** `docker compose up -d --build` (see *Upgrading
+to 2.0* in the README), then apply the new gateway file.
 
-* Guide administrator setup through public addresses, detected internal IPs,
-  access/portal settings and deployment steps. Preserve edited values and public
-  ports; infer no private-service access grants. Allow staged portal listener
-  deployment and keep the gateway service inventory unless replacement is chosen.
-* Download Apple relay profiles through a native HTTP form with a session-bound
-  CSRF token. Handle plain-text/JSON gateway failures without Safari parser
-  errors. Add personal installation steps, inline feedback and simpler mobile
-  activity/password panels for client accounts.
+### Guests: the personal portal only
+* **Guests have no internet any more.** An OpenVPN or relay guest reaches
+  only its personal portal (`https://openvpn.<domain>/portal`: password and
+  profile downloads). Full-access clients are unchanged.
+* OpenVPN guests get the pushed DNS servers; every HTTPS connection they open
+  is redirected to the gateway's portal listener, everything else is dropped.
+  No list of the portal's DNS answers is needed any more.
+* Relay guests may open only the portal hostname on TCP 443, pinned to the
+  portal listener. Their profiles route only that hostname through the relay,
+  so the device keeps its own internet while the profile is installed.
+* The portal listener serves only the portal pages (`X-OpenVPN-Portal-Only`),
+  even to a browser with an administrator cookie.
 
-* Combine public VPN, gateway, portal and relay settings into one form. Reuse
-  existing URLs, share domain/website/LAN inputs, preserve custom endpoints,
-  and save current edits before downloading the private gateway export.
-* Wait for persistent relay policy/database readiness after startup and send
-  HTTP/2 GOAWAY on planned shutdown. Test reconnecting with the original signed
-  profile after restarting relay, UI, policy and PostgreSQL in boot order;
-  preserve credentials and profile identifiers without a replacement download.
+### Apple Network Relay
+* Per-client `.mobileconfig` profiles (`com.apple.relay.managed`) next to the
+  OpenVPN ones, for the relay service in `relay/`: CONNECT and CONNECT-UDP over
+  HTTP/2 behind Traefik, or direct HTTP/3.
+* Access follows the client's OpenVPN role, certificate validity and a
+  separate per-client credential (revocable on the client page); open flows
+  are re-checked every 5 seconds.
+* Downloads are CMS-signed by default with the gateway's certificate (the
+  signer runs on the gateway; private keys never leave it).
+* An independent `relay-policy` service with a read-only database login
+  authorizes the relay, so UI restarts do not interrupt it.
+* Relay page: sessions kept for a year, live connections per client, the
+  reason of every refusal or failure, limits and readiness.
 
-### 1.9: signing requirements and per-user relay activity
+### Personal portal
+* Portal logins per client (**Portal access** on the client page): download
+  the own OpenVPN and Apple relay profiles, see the own relay activity, change
+  the password. Every administrator API refuses portal sessions.
 
-* Require CMS-signed relay downloads by default. Add admin signing URL/token
-  settings with a write-only token field, safe validation errors, and explicit
-  unsigned opt-out. Existing unsigned installations need a new download.
-* Group active connections/activity by user, with live TCP/HTTP2 UDP traffic,
-  separate denied/failed counts and expandable details. Give portal logins
-  only their own counters and activity, including with an older backend.
-* Add fixed RFC 9209 Proxy-Status diagnostics, HTTP results and transport error
-  metrics. Retry a refused TCP setup once before any application data, within
-  the existing deadline. Rate-limit repeated failure logs and scrub quoted
-  HTTP/2 input from library errors. Destination failures are reported separately
-  from relay/policy failures; the iOS status label still needs device validation.
+### Network settings
+* One **Settings → Network** form for the public addresses, the guest portal
+  listener, the gateway addresses and the VPN network, with address detection
+  and a **Save and download gateway file** button. The gateway file
+  (`network.private.json`, version 2) is applied with
+  `./manage setup --network-file` in the Traefik repository.
+* Removed: the LAN and "blocked for guests" lists, the portal DNS answers,
+  the portal source list and the relay's LAN list. Settings saved by earlier
+  development builds are read and upgraded.
 
+### Storage and operations
+* PostgreSQL 18 replaces SQLite. `bin/upgrade-relay.sh` imports an existing
+  database in one verified transaction and keeps the SQLite file;
+  `bin/setup-env.py` generates the database passwords.
+* `bin/recover-checkout.py` repairs a `git pull` that stopped on permission errors.
+* Backups contain a PostgreSQL dump; older archives can still be restored.
 
-* Recover permission-interrupted Git updates with a standalone helper: repair
-  code/Git ownership, preserve existing stashes, save only incoming code
-  collisions, and restore unambiguous runtime configuration from the user's
-  earlier stash. Runtime credentials, guest markers and database ownership stay
-  unchanged; real Git and mixed-ownership Docker tests cover the recovery.
+### UI
+* The single 1,350-line `app.js` is split into `core.js`, `admin.js`,
+  `relay.js`, `settings.js`, `portal.js` and `app.js`; asset URLs carry
+  content hashes, so a rebuilt UI is never served from a stale cache.
 
-### 1.8: PostgreSQL and relay availability
-
-* Replace runtime SQLite with PostgreSQL 18. The upgrade helper imports legacy
-  accounts, sessions, settings, portal logins, relay credentials and traffic in
-  one transaction, verifies counts, resets ID sequences, refuses nonempty
-  targets and retains the original SQLite file. PostgreSQL dumps replace
-  SQLite copies in automatic/manual backups; legacy archives remain importable.
-* Generate missing database passwords in `.env`, with separate application and
-  read-only policy roles. Add an independent relay policy service so UI restarts
-  do not interrupt authorization. Hide private PKI key areas from that service.
-  Refresh the policy file mount automatically after external atomic config
-  replacements; UI saves continue to update the existing file in place.
-* Add configurable per-client/global flow budgets and HTTP/2 capacity/liveness
-  limits. Classify policy outages separately from credential denial and DNS
-  errors separately from destination blocking; add readiness and Prometheus
-  diagnostics and show policy availability/limits in the Relay page.
-* Exercise lost-path cleanup/reconnection, PostgreSQL imports and rollback,
-  real Traefik forwarding and policy-role isolation. Physical iPhone Wi-Fi ↔
-  cellular recovery still requires deployment testing.
-
-
-* Prefill new relay settings with the locally configured LAN networks,
-  preserving saved destination networks.
-* Static asset URLs follow their content hashes, so rebuilt UI assets refresh
-  even without a release-version bump. Static responses require revalidation.
-
-* Apple Network Relay support alongside OpenVPN: per-client `.mobileconfig`
-  downloads in the existing client list and detail page, LAN domain/CIDR
-  settings, and relay-only access revocation.
-* Optional unprivileged HTTP/3 relay service for TCP CONNECT and CONNECT-UDP.
-  Destination IPs are checked after DNS resolution. Guests receive internet-only
-  profiles, non-guests receive LAN profiles, and expired or revoked clients are denied. Active tunnels periodically recheck access.
-* Relay API/profile tests and Go integration tests cover TCP/UDP forwarding,
-  guest isolation, authentication, access-type changes and live revocation.
-* Reduce authorization work by sharing concurrent checks and caching the PKI
-  index until it changes. TCP destinations have staggered address fallback;
-  QUIC connections use keepalives. Fix final-packet truncation on TCP half-close,
-  verified with concurrent bulk-transfer tests.
+### Fixed
+* The relay-policy service restarted itself whenever `server.conf` was
+  replaced on disk; it no longer reads `server.conf` at all.
+* CI: the relay stack test failed on current Docker (static addresses need an
+  explicitly configured subnet).
 
 ## 1.6.0 - 2026-10-02
 

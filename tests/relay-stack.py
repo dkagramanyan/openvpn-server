@@ -77,7 +77,7 @@ def check_browser(api_url, portal_url, admin_password, folder):
         user.locator('details').filter(has=user.get_by_text('OpenVPN · all devices', exact=True)).evaluate('(node) => { node.open = true; }')
         assert user.locator('a[href="#/server"]').count() == 0
         with user.expect_download() as download:
-            user.get_by_role("link", name="Download OpenVPN config", exact=True).click()
+            user.get_by_role("link", name="Download OpenVPN profile", exact=True).click()
         assert download.value.suggested_filename == "alice.ovpn"
         user.get_by_text('Apple relay · iPhone, iPad and Mac', exact=True).click()
         with user.expect_download() as download:
@@ -125,6 +125,10 @@ def main():
         # Production uses stable host/LAN addresses. Keep fixture addresses
         # stable too when Docker releases and reattaches bridge endpoints.
         subnet = json.loads(command("docker", "network", "inspect", network))[0]["IPAM"]["Config"][0]["Subnet"]
+        # Recent Docker versions require an explicitly configured subnet for
+        # static fixture addresses. Reuse the free pool Docker just allocated.
+        command("docker", "network", "rm", network)
+        command("docker", "network", "create", "--subnet", subnet, network)
         addresses = iter(ipaddress.ip_network(subnet).hosts())
         next(addresses)  # Docker gateway.
         pg_password = secrets.token_urlsafe(24)
@@ -166,6 +170,12 @@ http:
       service: ui
       middlewares: [portal-boundary]
       tls: {}
+    guest-portal:
+      entryPoints: [portal]
+      rule: "Host(`openvpn.example.test`)"
+      service: ui
+      middlewares: [portal-boundary]
+      tls: {}
     signer:
       entryPoints: [websecure]
       rule: "Host(`traefik`) && Path(`/internal/relay-sign`)"
@@ -194,7 +204,7 @@ tls:
       keyFile: /fixture/identity/key.pem
 ''')
         proxy = run("traefik", "-p", "127.0.0.1::8443", "-p", "127.0.0.1::443", "-v", f"{folder}:/fixture:ro", "traefik:v3.7.15",
-                    "--entrypoints.relay.address=:8443", "--entrypoints.websecure.address=:443",
+                    "--entrypoints.relay.address=:8443", "--entrypoints.websecure.address=:443", "--entrypoints.portal.address=:9443",
                     "--providers.file.filename=/fixture/dynamic.yml", "--log.level=ERROR")
         origin = "https://localhost:" + published(proxy, 8443)
         portal_url = "https://localhost:" + published(proxy, 443)
@@ -229,7 +239,7 @@ tls:
         policy_name = prefix + "-policy"
         command("docker", "run", "-d", "--name", policy_name, "--restart", "unless-stopped", "--network", "container:" + relay,
                 "-v", f"{fixture.TMP}/pki:/etc/openvpn/pki:ro", "-v", f"{fixture.TMP}/guests:/etc/openvpn/guests:ro",
-                "-v", f"{fixture.TMP}/server.conf:/etc/openvpn/server.conf:ro",
+                "-v", f"{fixture.TMP}/config/network:/etc/openvpn/config/network:ro",
                 "--tmpfs", "/etc/openvpn/pki/private:mode=0700", "--tmpfs", "/etc/openvpn/pki/renewed:mode=0700",
                 "--tmpfs", "/etc/openvpn/pki/revoked:mode=0700", "--read-only", "--tmpfs", "/tmp",
                 "-e", "OVPN_DATABASE_URL=" + policy_dsn, "openvpn-ui:relay-test", "python", "-m", "app.policy_server")
@@ -250,7 +260,12 @@ tls:
                 try: connection.execute(statement)
                 except psycopg.Error: pass
                 else: raise AssertionError("Policy role had excessive database permissions")
-        api("/api/relay/settings", {"enabled": True, "url": origin, "allowed_cidrs": [subnet]}, "PUT")
+        api("/api/relay/settings", {"enabled": True, "url": origin}, "PUT")
+        # Guests reach the UI's portal pages through the gateway's portal listener.
+        gateway_ip = json.loads(command("docker", "inspect", proxy))[0]["NetworkSettings"]["Networks"][network]["IPAddress"]
+        network_settings = json.loads(api("/api/network/settings"))
+        network_settings["gateway"].update(domain="example.test", openvpn_host="openvpn.example.test", portal_listener=gateway_ip + ":9443")
+        api("/api/network/settings", network_settings, "PUT")
         try:
             api("/api/clients/alice/relay.mobileconfig", {}, "POST")
         except HTTPError as exc:
@@ -319,12 +334,19 @@ tls:
         assert denied.returncode != 0
         activity = json.loads(api("/api/relay/status"))["events"]
         assert any(e["guest"] and e["kind"] == "denied" and e["reason"] == "destination_denied" for e in activity)
-        internet = command(*curl, "https://example.com/")
-        assert "Example Domain" in internet
-        print("PASS: guest reaches public HTTPS internet while LAN access is denied")
+        assert subprocess.run([*curl, "https://example.com/"], capture_output=True).returncode != 0
+        # The portal host goes to the gateway's portal listener, which serves only portal pages.
+        inner_tls = ["--insecure"]   # the fixture certificate is for localhost
+        assert "OpenVPN" in command(*curl, *inner_tls, "https://openvpn.example.test/portal")
+        hidden = subprocess.run([*[x for x in curl if x != "--fail"], *inner_tls, "--output", "/dev/null", "--write-out", "%{http_code}",
+                                 "https://openvpn.example.test/api/clients"], capture_output=True, text=True)
+        assert hidden.stdout.endswith("404"), hidden.stdout
+        print("PASS: a relay guest reaches only the portal pages: no LAN, no internet, no admin API")
         guest_signed = api("/api/clients/alice/relay.mobileconfig", {}, "POST")
         guest_xml = command("openssl", "cms", "-verify", "-binary", "-inform", "DER", "-purpose", "any", data=guest_signed, env=env)
-        assert token == plistlib.loads(guest_xml.encode())["PayloadContent"][0]["Relays"][0]["AdditionalHTTPHeaderFields"]["Authorization"]
+        guest_payload = plistlib.loads(guest_xml.encode())["PayloadContent"][0]
+        assert token == guest_payload["Relays"][0]["AdditionalHTTPHeaderFields"]["Authorization"]
+        assert guest_payload["MatchDomains"] == ["openvpn.example.test"]
         api("/api/clients/alice/access", {"guest": False}, "PUT")
         time.sleep(2)
         assert "OpenVPN" in command(*curl, "http://" + address + ":8080/")
@@ -412,22 +434,10 @@ HTTPServer(("0.0.0.0", 8089), Handler).serve_forever()
             except Exception: time.sleep(1)
         assert "OpenVPN" in command(*curl, "http://" + address + ":8080/")
         print("PASS: relay works during UI outage; live role changes apply; policy outage returns retryable 503; policy cannot read admin data or keys")
-        restarts = json.loads(command("docker", "inspect", policy_name))[0]["RestartCount"]
         config = json.loads(api("/api/server/config/server"))["content"]
-        api("/api/server/config/server", {"content": config + "\n# Policy mount refresh test\n"}, "PUT")
+        api("/api/server/config/server", {"content": config + "\n# A UI save keeps relay access\n"}, "PUT")
         assert "OpenVPN" in command(*curl, "http://" + address + ":8080/")
-        # The UI deliberately writes in place. Editors/git-style replacements
-        # can unlink the bound inode: exercise that separate deployment case.
-        command("docker", "run", "--rm", "-v", f"{fixture.TMP}:/fixture", "--entrypoint", "python", "openvpn-ui:relay-test",
-                "-c", "from pathlib import Path; p=Path('/fixture/server.conf'); t=p.with_suffix('.new'); t.write_bytes(p.read_bytes()); t.replace(p)")
-        for _ in range(40):
-            restarted = json.loads(command("docker", "inspect", policy_name))[0]["RestartCount"] > restarts
-            health = subprocess.run(["docker", "exec", relay, "wget", "-qO-", "http://127.0.0.1:8446/readyz"], capture_output=True)
-            if restarted and health.returncode == 0: break
-            time.sleep(0.5)
-        else: raise AssertionError("Policy did not refresh the atomically replaced server configuration")
-        assert "OpenVPN" in command(*curl, "http://" + address + ":8080/")
-        print("PASS: UI config saves keep relay access; external atomic replacement refreshes the policy mount automatically")
+        print("PASS: UI config saves keep relay access")
         api("/api/clients/alice/relay", method="DELETE")
         time.sleep(2)
         denied = subprocess.run([*curl, "http://" + address + ":8080/"], capture_output=True)

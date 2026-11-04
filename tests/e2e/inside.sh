@@ -96,8 +96,6 @@ say "Start the service"
 up
 docker exec openvpn-ui python -c "from app.main import db; assert db.get_setting('legacy-preserved') == 'yes'; assert db.get_setting('migration:legacy_sqlite')"
 docker exec openvpn iptables -t mangle -S OVPN-MSS | grep -q 'set-mss 1400' || fail "no MSS clamp in the firewall"
-docker exec openvpn iptables -S OVPN-FORWARD | grep -q -- '-d 198.51.100.4/32 -j DROP' \
-    || fail "guests can loop back through the public reverse proxy"
 
 say "Create clients"
 mkdir -p /srv/e2e
@@ -146,16 +144,19 @@ say "Wait for the timeout and the collector"
 sleep 30
 api check || fail "the UI does not match what happened"
 
-say "A guest reaches the internet and nothing else; a full client reaches the home networks"
-# Three networks behind the server, each with a web server: the home LAN (HOME_SUB), a network
-# server.conf pushes a route to, and a public one that stands for the internet. "nat-unprotected"
-# makes Docker route into them like a plain LAN instead of dropping what comes from elsewhere.
+say "A guest reaches only the portal; a full client reaches the home networks and the internet"
+# Three networks behind the server, each with a web server: the home LAN, a network server.conf
+# pushes a route to, and a public one that stands for the internet. "nat-unprotected" makes
+# Docker route into them like a plain LAN instead of dropping what comes from elsewhere.
 for net in home:192.0.2 routed:203.0.113 inet:198.51.100; do
     docker network create -o com.docker.network.bridge.gateway_mode_ipv4=nat-unprotected \
         --subnet "${net#*:}.0/24" "${net%%:*}" >/dev/null
     docker run -d --name "web-${net%%:*}" --network "${net%%:*}" --ip "${net#*:}.10" --entrypoint python \
         openvpn-ui:local -m http.server 8000 >/dev/null
 done
+# The gateway's guest portal listener, on the home LAN.
+docker run -d --name portal-gw --network home --ip 192.0.2.20 --entrypoint python openvpn-ui:local -m http.server 9443 >/dev/null
+api portal 192.0.2.20:9443
 iptables -S DOCKER-USER | sed -n 2p | grep -q OVPN-FORWARD || fail "the guest rules do not run first"
 api create gina guest
 api profile gina > /srv/e2e/gina.ovpn
@@ -167,15 +168,18 @@ vpn_ip gina-phone | grep -qE '^10\.8\.0\.(1[3-9][0-9]|12[89]|2[0-4][0-9]|25[0-4]
 for target in 192.0.2.10:8000 203.0.113.10:8000 198.51.100.10:8000 10.8.0.1:8080 198.51.100.1:8080; do
     reaches alice-phone $target || fail "alice (full access) cannot reach $target"
 done
-reaches gina-phone 198.51.100.10:8000 || fail "the guest cannot reach the internet"
-# ... not the home networks, not the server host (its tunnel address or another one of its
-# addresses, reached through the tunnel), not a port the host publishes
-for target in 192.0.2.10:8000 203.0.113.10:8000 10.8.0.1:8080 198.51.100.1:8080 "$TARGET:8000"; do
+# HTTPS to any address lands on the portal listener, whatever the guest's DNS answered ...
+for target in 198.51.100.10:443 192.0.2.10:443; do
+    reaches gina-phone $target || fail "the guest's $target did not reach the portal listener"
+done
+# ... and nothing else: not the internet, not the home networks, not the listener directly,
+# not the server host (its tunnel address or another one of its addresses), not a published port
+for target in 198.51.100.10:8000 192.0.2.10:8000 203.0.113.10:8000 192.0.2.20:9443 10.8.0.1:8080 198.51.100.1:8080 "$TARGET:8000"; do
     reaches gina-phone $target && fail "the guest reaches $target"
 done
 docker exec gina-phone ping -c 1 -W 2 10.8.0.100 >/dev/null 2>&1 && fail "the guest can ping another client"
 docker exec openvpn ip6tables -S OVPN-INPUT | grep -q -- '-s fd00:8::/64 -i tun+ -j DROP' || fail "no IPv6 rule for the tunnel"
-echo "    guest $(vpn_ip gina-phone): internet only"
+echo "    guest $(vpn_ip gina-phone): the portal only"
 
 say "One certificate on two devices: the second gets an address of its own"
 client alice-laptop $NET.11 alice.ovpn --explicit-exit-notify 1
@@ -200,7 +204,7 @@ api dns 192.0.2.1 198.51.100.53
 for _ in $(seq 30); do fw -S OVPN-FORWARD | grep -q 198.51.100.53 && break; sleep 1; done    # 2 s pause, then the restart
 fw -S OVPN-FORWARD | grep -q -- '-d 198.51.100.53/32 .*--dport 53 -j ACCEPT' || fail "the guest DNS rule did not follow server.conf"
 fw -S OVPN-FORWARD | grep -q -- '-d 192.0.2.1/32 .*--dport 53' && fail "the old guest DNS rule is still there"
-fw -S OVPN-FORWARD | grep -q -- '-d 203.0.113.0/24 -j DROP' || fail "guests are not blocked from the pushed route"
+fw -S OVPN-FORWARD | grep -q -- '-s 10.8.0.128/25 -j DROP' || fail "guests are not blocked from everything else"
 
 say "Rules removed behind its back and a lease nobody holds are repaired within a minute"
 for _ in $(seq 40); do [ -n "$(docker exec openvpn ls /tmp/openvpn-leases)" ] && break; sleep 1; done    # the clients are back

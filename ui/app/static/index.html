@@ -13,6 +13,12 @@
   <noscript>This interface requires JavaScript.</noscript>
 </div>
 <div id="toasts" class="toasts" aria-live="polite"></div>
+<!-- Classic scripts sharing one global scope, run in this order; app.js starts the page. -->
+<script src="/static/core.js"></script>
+<script src="/static/admin.js"></script>
+<script src="/static/relay.js"></script>
+<script src="/static/settings.js"></script>
+<script src="/static/portal.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>

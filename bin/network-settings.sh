@@ -1,5 +1,6 @@
 #!/bin/bash
-# Read validated UI output as data. Never execute a settings file as shell code.
+# Sourced by the entrypoint. Reads config/network/settings.conf (written by the
+# UI) as KEY=value data; the file is never executed as shell code.
 load_network_settings() {
     local path="$OPENVPN_DIR/config/network/settings.conf" key value ip mask number=0 bits=0 octet
     if [[ -f $path ]]; then
@@ -7,15 +8,11 @@ load_network_settings() {
             case "$key" in
                 TRUST_SUB) TRUST_SUB=$value ;;
                 GUEST_SUB) GUEST_SUB=$value ;;
-                LAN_CIDRS) LAN_CIDRS=$value ;;
-                GUEST_BLOCK) GUEST_BLOCK=$value ;;
-                GUEST_PORTAL_HOST) GUEST_PORTAL_HOST=$value ;;
                 GUEST_PORTAL_TARGET) GUEST_PORTAL_TARGET=$value ;;
-                GUEST_PORTAL_DESTINATIONS) GUEST_PORTAL_DESTINATIONS=$value ;;
             esac
         done < "$path"
     fi
-    # Bootstrap from the installed server.conf, not a deployment-specific subnet.
+    # Before the first save: the tunnel network from server.conf, guests in its upper half.
     read -r ip mask < <(awk '$1 == "server" {print $2, $3; exit}' "$SERVER_CONF")
     TRUST_SUB=${TRUST_SUB:-$ip/$mask}
     if [[ -z ${GUEST_SUB:-} ]]; then

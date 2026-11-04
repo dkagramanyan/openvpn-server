@@ -1,4 +1,9 @@
-"""Private, UI-managed network configuration. Never store deployment data in Git."""
+"""Network settings edited in Settings → Network, and the gateway export.
+
+The settings are private deployment data. They are saved, mode 0600, in
+config/network/settings.conf (ignored by Git), which the OpenVPN entrypoint
+reads as data, and they also rewrite the network lines of server.conf.
+"""
 from __future__ import annotations
 
 import ipaddress
@@ -8,21 +13,20 @@ import re
 import shlex
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from . import pki
 from .pki import PkiError
 from .settings import settings
 
-
-class Portal(BaseModel):
-    enabled: bool = False
-    host: str = ""
-    target: str = ""
-    destinations: list[str] = Field(default_factory=list, max_length=100)
+EXPORT_VERSION = 2
+RELAY_BACKEND_PORT = 8444
+HOSTNAME = re.compile(r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+UNSAFE = re.compile(r"[\s`{}\\]")   # whitespace and template characters, for values used in Traefik templates
 
 
 class Service(BaseModel):
+    """An additional website routed by the gateway."""
     name: str
     host: str
     url: str
@@ -32,16 +36,17 @@ class Service(BaseModel):
 
 
 class Gateway(BaseModel):
+    """What the Traefik gateway needs to know; exported as network.private.json."""
     domain: str = ""
-    openvpn_host: str = ""
-    openvpn_backend: str = ""
+    openvpn_host: str = ""        # website and personal portal, e.g. openvpn.example.com
+    openvpn_backend: str = ""     # this server's web UI as the gateway reaches it, e.g. http://192.0.2.20:8080
     relay_host: str = ""
-    relay_backend: str = ""
+    relay_backend: str = ""       # this server's relay listener, e.g. 192.0.2.20:8444
     relay_public_url: str = ""
-    trusted_cidrs: list[str] = Field(default_factory=list, max_length=100)
-    portal_cidrs: list[str] = Field(default_factory=list, max_length=100)
-    services: list[Service] = Field(default_factory=list, max_length=100)
+    portal_listener: str = ""     # the gateway's guest portal listener, LAN IPv4:port; empty = guests reach nothing
+    trusted_cidrs: list[str] = Field(default_factory=list, max_length=100)   # empty keeps the gateway's own list
     replace_services: bool = False
+    services: list[Service] = Field(default_factory=list, max_length=100)
 
 
 class NetworkSettings(BaseModel):
@@ -51,112 +56,125 @@ class NetworkSettings(BaseModel):
     guest_subnet: str
     dns_servers: list[str] = Field(default_factory=list, max_length=10)
     routes: list[str] = Field(default_factory=list, max_length=100)
-    lan_cidrs: list[str] = Field(default_factory=list, max_length=100)
-    blocked_cidrs: list[str] = Field(default_factory=list, max_length=100)
     proxy_cidrs: list[str] = Field(default_factory=lambda: ["127.0.0.1/32", "::1/128"], max_length=100)
-    portal: Portal = Field(default_factory=Portal)
     gateway: Gateway = Field(default_factory=Gateway)
 
+    @model_validator(mode="before")
+    @classmethod
+    def upgrade(cls, data):
+        """Read settings saved by 1.9 development builds ("portal" object, LAN lists)."""
+        if isinstance(data, dict) and "portal" in data:
+            data = dict(data)
+            portal = data.pop("portal") or {}
+            gateway = dict(data.get("gateway") or {})
+            if portal.get("enabled") and portal.get("target") and not gateway.get("portal_listener"):
+                gateway["portal_listener"] = portal["target"]
+            data["gateway"] = gateway
+        return data
 
-def hostname(value):
+
+# -- validation helpers -------------------------------------------------------------
+def hostname(value: str) -> str:
     value = value.strip().lower().rstrip(".")
-    if len(value) > 253 or not re.fullmatch(r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", value):
+    if len(value) > 253 or not HOSTNAME.fullmatch(value):
         raise PkiError("Enter a DNS hostname without a scheme, path or port")
     return value
 
 
-def cidrs(values, *, ipv4=False):
+def cidrs(values: list[str], *, ipv4: bool = False) -> list[str]:
     try:
-        networks = [ipaddress.ip_network(v.strip(), strict=True) for v in values]
-        if any(n.prefixlen == 0 or (ipv4 and n.version != 4) for n in networks):
-            raise ValueError()
-        return list(dict.fromkeys(str(n) for n in networks))
+        networks = [ipaddress.ip_network(value.strip(), strict=True) for value in values]
+        if any(net.prefixlen == 0 or (ipv4 and net.version != 4) for net in networks):
+            raise ValueError
     except ValueError:
-        raise PkiError("Enter specific network CIDRs; /0 networks are not allowed")
+        raise PkiError("Enter network CIDRs such as 192.0.2.0/24; /0 networks are not allowed") from None
+    return list(dict.fromkeys(str(net) for net in networks))
 
 
-def endpoint(value, *, portal=False):
+def host_port(value: str) -> str:
+    host, _, port = value.rpartition(":")
+    if not host or not port.isdigit() or not 1 <= int(port) <= 65535 or re.search(r"[\s`{}\\/@?#]", host):
+        raise PkiError("Enter an address and port, such as 192.0.2.20:8444")
+    return f"{host}:{int(port)}"
+
+
+def portal_listener(value: str) -> str:
     try:
-        host, port = value.rsplit(":", 1)
-        port = int(port)
-        if not 1 <= port <= 65535 or re.search(r"[\s`{}\\/@?#]", host):
-            raise ValueError()
-        if portal:
-            ip = ipaddress.IPv4Address(host)
-            if int(ip) < 1 << 24 or int(ip) >= 224 << 24 or ip.is_loopback or ip.is_link_local or port < 1024:
-                raise ValueError()
-        elif not host:
-            raise ValueError()
-        return f"{host}:{port}"
+        host, _, port = value.rpartition(":")
+        ip = ipaddress.IPv4Address(host)
+        if not port.isdigit() or not 1024 <= int(port) <= 65535 or ip.packed[0] == 0 or ip.is_loopback \
+                or ip.is_link_local or ip.is_multicast or ip.is_reserved:
+            raise ValueError
     except ValueError:
-        raise PkiError("Enter an address:port; the portal target must be an IPv4 dedicated listener on port 1024 or higher")
+        raise PkiError("Guest portal listener: enter the gateway's LAN IPv4 address and a port of 1024 or "
+                       "higher, such as 192.0.2.10:9443") from None
+    return f"{ip}:{int(port)}"
 
 
-def backend_url(value):
+def backend_url(value: str) -> str:
     try:
         url = urlsplit(value)
-        if url.scheme not in ("http", "https") or not url.hostname or url.username or url.password or re.search(r"[\s`{}\\]", value):
-            raise ValueError()
+        if url.scheme not in ("http", "https") or not url.hostname or url.username or url.password or UNSAFE.search(value):
+            raise ValueError
         _ = url.port
     except ValueError:
-        raise PkiError("Enter an HTTP(S) backend URL without credentials")
+        raise PkiError("Enter an HTTP(S) address without credentials, such as http://192.0.2.20:8080") from None
     return value
 
 
-def shared_settings(data, db=None):
-    """Reuse existing public URLs; explicit gateway settings take precedence."""
+def is_ip(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False
+
+
+def url_host(url: str) -> str:
+    """The DNS name in a URL, or "" for an IP address, a malformed URL or no URL."""
+    try:
+        host = hostname(urlsplit(url).hostname or "")
+    except (ValueError, PkiError):
+        return ""
+    return "" if is_ip(host) else host
+
+
+# -- reading -----------------------------------------------------------------------
+def with_defaults(data: dict, db=None) -> dict:
+    """Fill empty gateway fields from what is already configured elsewhere."""
     from . import relay, relay_services
 
-    gateway, portal = data["gateway"], data["portal"]
-    relay_config = relay.get_settings(db) if db is not None else {}
-    if relay_config.get("url"):
-        gateway["relay_public_url"] = relay_config["url"]
-    signer = relay_services.signing_config(db)
-
-    def dns_host(url):
-        try:
-            parsed = urlsplit(url)
-            return hostname(parsed.hostname) if parsed.hostname else ""
-        except (ValueError, TypeError, AttributeError, PkiError):
-            return ""
-
-    website = (gateway["openvpn_host"] or portal["host"] or dns_host(settings.profile_base_url)
-               or dns_host(signer["url"]))
-    relay_host = gateway["relay_host"] or dns_host(relay_config.get("url", ""))
+    gateway = data["gateway"]
+    relay_url = relay.get_settings(db)["url"] if db is not None else ""
+    if relay_url:
+        gateway["relay_public_url"] = relay_url
+    gateway["relay_host"] = gateway["relay_host"] or url_host(relay_url)
+    gateway["openvpn_host"] = (gateway["openvpn_host"] or url_host(settings.profile_base_url)
+                               or url_host(relay_services.signing_config(db)["url"]))
     if not gateway["domain"]:
-        # Only remove familiar service prefixes, never guess a registrable domain.
-        if relay_host:
-            gateway["domain"] = relay_host.removeprefix("relay.")
-        elif website.startswith(("openvpn.", "vpn.")):
-            gateway["domain"] = website.split(".", 1)[1]
+        # Only drop a familiar service prefix; never guess a registrable domain.
+        if gateway["relay_host"]:
+            gateway["domain"] = gateway["relay_host"].removeprefix("relay.")
+        elif gateway["openvpn_host"].startswith(("openvpn.", "vpn.")):
+            gateway["domain"] = gateway["openvpn_host"].split(".", 1)[1]
         else:
             try:
-                candidate = hostname(pki.get_remote()["host"])
-                try:
-                    ipaddress.ip_address(candidate)
-                except ValueError:
-                    if candidate not in ("vpn.example.com", "example.com"):
-                        gateway["domain"] = candidate.removeprefix("openvpn.").removeprefix("vpn.")
+                profile_host = hostname(pki.get_remote()["host"])
+                if profile_host not in ("example.com", "vpn.example.com") and not is_ip(profile_host):
+                    gateway["domain"] = profile_host.removeprefix("openvpn.").removeprefix("vpn.")
             except (OSError, PkiError):
                 pass
-    gateway["openvpn_host"] = website or ("openvpn." + gateway["domain"] if gateway["domain"] else "")
-    gateway["relay_host"] = relay_host
-    if not portal["host"]:
-        portal["host"] = gateway["openvpn_host"]
+    if not gateway["openvpn_host"] and gateway["domain"]:
+        gateway["openvpn_host"] = "openvpn." + gateway["domain"]
     if not gateway["relay_backend"] and gateway["openvpn_backend"]:
-        backend_host = urlsplit(gateway["openvpn_backend"]).hostname
-        if backend_host:
-            gateway["relay_backend"] = (f"[{backend_host}]" if ":" in backend_host else backend_host) + ":8444"
-    # IPv6 is blocked for VPN guests altogether; preserve relay IPv6 blocks there.
-    relay_lans = [value for value in relay_config.get("allowed_cidrs", []) if ipaddress.ip_network(value).version == 4]
-    data["lan_cidrs"] = list(dict.fromkeys([*data["lan_cidrs"], *relay_lans]))
+        backend = urlsplit(gateway["openvpn_backend"]).hostname
+        if backend:
+            gateway["relay_backend"] = (f"[{backend}]" if ":" in backend else backend) + f":{RELAY_BACKEND_PORT}"
     return data
 
 
-def get_settings(db=None):
-    saved = settings.read_network()
-    if saved:
-        return shared_settings(NetworkSettings(**saved).model_dump(), db)
+def from_server_conf() -> dict:
+    """First-time settings: what server.conf and the environment say today."""
     subnet = pki.vpn_subnet()
     if not subnet:
         raise PkiError("Fix the server subnet and pool in Server → Configuration first")
@@ -166,83 +184,88 @@ def get_settings(db=None):
         words = shlex.split(line, comments=True)
         if len(words) < 2 or words[0] != "push":
             continue
-        words = shlex.split(words[1])
-        if words[:2] == ["dhcp-option", "DNS"]:
-            dns.append(words[2])
-        if words and words[0] == "route":
-            routes.append(str(ipaddress.ip_network(words[1] + "/" + (words[2] if len(words) > 2 else "32"), strict=False)))
-    return shared_settings(NetworkSettings(vpn_subnet=str(net), pool_first=str(ipaddress.IPv4Address(first)),
-        pool_last=str(ipaddress.IPv4Address(last)), guest_subnet=settings.guest_sub,
-        dns_servers=list(dict.fromkeys(dns)), routes=routes,
-        lan_cidrs=[settings.home_sub] if settings.home_sub else [],
-        blocked_cidrs=settings.guest_block.split(),
-        proxy_cidrs=cidrs(os.environ.get("FORWARDED_ALLOW_IPS", "127.0.0.1/32,::1/128").replace(",", " ").split())
-    ).model_dump(), db)
+        pushed = shlex.split(words[1])
+        if pushed[:2] == ["dhcp-option", "DNS"]:
+            dns.append(pushed[2])
+        elif pushed and pushed[0] == "route":
+            mask = pushed[2] if len(pushed) > 2 else "32"
+            routes.append(str(ipaddress.ip_network(pushed[1] + "/" + mask, strict=False)))
+    proxies = os.environ.get("FORWARDED_ALLOW_IPS", "127.0.0.1/32,::1/128").replace(",", " ").split()
+    return NetworkSettings(vpn_subnet=str(net), pool_first=str(ipaddress.IPv4Address(first)),
+                           pool_last=str(ipaddress.IPv4Address(last)), guest_subnet=settings.guest_sub,
+                           dns_servers=list(dict.fromkeys(dns)), routes=routes, proxy_cidrs=cidrs(proxies)).model_dump()
 
 
-def validate(body):
-    data = body.model_dump()
+def get_settings(db=None) -> dict:
+    saved = settings.read_network()
+    data = NetworkSettings(**saved).model_dump() if saved else from_server_conf()
+    return with_defaults(data, db)
+
+
+def guest_portal() -> dict | None:
+    """{"host", "target"} of the personal portal for guests, or None when not set up."""
+    saved = settings.read_network()
+    if not saved:
+        return None
+    gateway = NetworkSettings(**saved).gateway
+    if not gateway.openvpn_host or not gateway.portal_listener:
+        return None
+    return {"host": gateway.openvpn_host, "target": gateway.portal_listener}
+
+
+# -- validation and saving ------------------------------------------------------------
+def validate_addressing(data: dict) -> None:
     try:
-        net = ipaddress.IPv4Network(body.vpn_subnet, strict=True)
-        guest = ipaddress.IPv4Network(body.guest_subnet, strict=True)
-        first, last = ipaddress.IPv4Address(body.pool_first), ipaddress.IPv4Address(body.pool_last)
-        if net.prefixlen > 28 or not guest.subnet_of(net) or guest.prefixlen <= net.prefixlen or guest.prefixlen > 30:
-            raise ValueError()
+        net = ipaddress.IPv4Network(data["vpn_subnet"], strict=True)
+        guest = ipaddress.IPv4Network(data["guest_subnet"], strict=True)
+        first, last = ipaddress.IPv4Address(data["pool_first"]), ipaddress.IPv4Address(data["pool_last"])
+        if net.prefixlen > 28 or not guest.subnet_of(net) or not net.prefixlen < guest.prefixlen <= 30:
+            raise ValueError
         if not net.network_address + 1 < first <= last < net.broadcast_address:
-            raise ValueError()
-        if int(first) <= int(guest.broadcast_address) and int(last) >= int(guest.network_address):
-            raise ValueError()
-        if net.network_address + 1 in guest:
-            raise ValueError()
+            raise ValueError
+        if first <= guest.broadcast_address and last >= guest.network_address:   # pool overlaps the guest range
+            raise ValueError
+        if net.network_address + 1 in guest:                                    # the server's own address
+            raise ValueError
         data.update(vpn_subnet=str(net), guest_subnet=str(guest), pool_first=str(first), pool_last=str(last))
-        data["dns_servers"] = list(dict.fromkeys(str(ipaddress.IPv4Address(v)) for v in body.dns_servers))
-        for ip in pki.static_ips().values():
-            addr = ipaddress.IPv4Address(ip)
-            if addr not in net or addr in guest or first <= addr <= last or addr in (net.network_address, net.network_address + 1, net.broadcast_address):
-                raise PkiError("Move existing static client addresses before changing these networks")
+        data["dns_servers"] = list(dict.fromkeys(str(ipaddress.IPv4Address(v)) for v in data["dns_servers"]))
     except ValueError:
-        raise PkiError("Use a valid VPN subnet, a non-overlapping client pool and a guest subnet inside it")
-    for key in ("routes", "lan_cidrs", "blocked_cidrs", "proxy_cidrs"):
-        data[key] = cidrs(data[key], ipv4=key in ("routes", "lan_cidrs", "blocked_cidrs"))
+        raise PkiError("Use a valid VPN subnet, a client pool inside it and a separate guest subnet inside it") from None
+    reserved = (net.network_address, net.network_address + 1, net.broadcast_address)
+    for ip in pki.static_ips().values():
+        addr = ipaddress.IPv4Address(ip)
+        if addr not in net or addr in guest or first <= addr <= last or addr in reserved:
+            raise PkiError("Move existing static client addresses before changing these networks")
+    data["routes"] = cidrs(data["routes"], ipv4=True)
+    data["proxy_cidrs"] = cidrs(data["proxy_cidrs"])
     if not data["proxy_cidrs"]:
         raise PkiError("Keep at least one trusted proxy address")
-    portal = data["portal"]
-    gateway = data["gateway"]
+
+
+def validate_gateway(gateway: dict) -> None:
     for key in ("domain", "openvpn_host", "relay_host"):
-        if gateway[key]: gateway[key] = hostname(gateway[key])
-    portal["host"] = hostname(portal["host"]) if portal["host"] else gateway["openvpn_host"]
-    if portal["enabled"]:
-        portal["host"] = hostname(portal["host"])
-    if portal["target"]:
-        try:
-            portal["target"] = endpoint(portal["target"], portal=True)
-        except PkiError:
-            raise PkiError("Dedicated portal listener: enter the gateway's LAN IPv4 and port, such as 192.0.2.10:9443") from None
-        try:
-            portal["destinations"] = list(dict.fromkeys(str(ipaddress.IPv4Address(v)) for v in portal["destinations"]))
-            if portal["enabled"] and not portal["destinations"]:
-                raise ValueError()
-            for value in portal["destinations"]:
-                endpoint(value + ":9443", portal=True)
-        except (ValueError, PkiError):
-            raise PkiError("Portal DNS IPv4 addresses: enter the portal's individual IPv4 DNS answers") from None
-    if portal["enabled"] and portal["host"] != gateway["openvpn_host"]:
-        raise PkiError("The private portal and OpenVPN website must use the same hostname")
+        if gateway[key]:
+            gateway[key] = hostname(gateway[key])
     if gateway["openvpn_backend"]:
         try:
             gateway["openvpn_backend"] = backend_url(gateway["openvpn_backend"])
         except PkiError:
-            raise PkiError("VPN server web address: enter an HTTP(S) URL including the web UI port") from None
+            raise PkiError("VPN server web address: enter an HTTP(S) URL with the web UI port, "
+                           "such as http://192.0.2.20:8080") from None
     if gateway["relay_backend"]:
         try:
-            gateway["relay_backend"] = endpoint(gateway["relay_backend"])
+            gateway["relay_backend"] = host_port(gateway["relay_backend"])
         except PkiError:
-            raise PkiError("Relay backend: enter the VPN server address and internal relay port, such as 192.0.2.20:8444") from None
+            raise PkiError("Relay backend: enter this server's address and relay port, such as 192.0.2.20:8444") from None
     if gateway["relay_public_url"]:
         from . import relay
-        gateway["relay_public_url"] = relay.validate_settings(relay.RelaySettings(url=gateway["relay_public_url"]))["url"]
-    for key in ("trusted_cidrs", "portal_cidrs"):
-        gateway[key] = cidrs(gateway[key])
+        gateway["relay_public_url"] = relay.validate_url(gateway["relay_public_url"])
+    if gateway["portal_listener"]:
+        gateway["portal_listener"] = portal_listener(gateway["portal_listener"])
+        if not gateway["openvpn_host"]:
+            raise PkiError("Set the website hostname before the guest portal listener")
+    gateway["trusted_cidrs"] = cidrs(gateway["trusted_cidrs"])
+    reserved = {gateway["openvpn_host"], "dashboard." + gateway["domain"]}
     names = set()
     for service in gateway["services"]:
         if not re.fullmatch(r"[a-z][a-z0-9-]{0,39}", service["name"]) or service["name"] in names:
@@ -250,20 +273,25 @@ def validate(body):
         names.add(service["name"])
         service["host"] = hostname(service["host"])
         service["url"] = backend_url(service["url"])
-        if service["host"] in (gateway["openvpn_host"], portal["host"], "dashboard." + gateway["domain"]):
-            raise PkiError("Additional services cannot replace the portal or dashboard host")
-        if any(not p.startswith("/") or re.search(r"[\s`{}\\]", p) for p in service["paths"]):
+        if service["host"] in reserved:
+            raise PkiError("Additional services cannot use the OpenVPN website or dashboard hostname")
+        if any(not path.startswith("/") or UNSAFE.search(path) for path in service["paths"]):
             raise PkiError("Service paths must start with / and contain no whitespace or template characters")
     if gateway["services"]:
         gateway["replace_services"] = True
+
+
+def validate(body: NetworkSettings) -> dict:
+    data = body.model_dump()
+    validate_addressing(data)
+    validate_gateway(data["gateway"])
     return data
 
 
-def save_settings(body):
-    data = validate(body)
-    text = settings.server_conf.read_text()
+def server_conf_lines(data: dict) -> list[str]:
+    """server.conf with the subnet, pool, DNS and route lines replaced."""
     lines = []
-    for line in text.splitlines():
+    for line in settings.server_conf.read_text().splitlines():
         words = shlex.split(line, comments=True)
         if words and words[0] in ("server", "ifconfig-pool"):
             continue
@@ -279,53 +307,51 @@ def save_settings(body):
     for value in data["routes"]:
         route = ipaddress.IPv4Network(value)
         lines.append(f'push "route {route.network_address} {route.netmask}"')
-    portal = data["portal"]
-    isolated_portal = portal["enabled"] and bool(portal["target"])
+    return lines
+
+
+def write_private(path, text: str, owner: int | None = None) -> None:
+    temp = path.with_suffix(".tmp")
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)
+    if owner is not None and os.geteuid() == 0:
+        os.fchown(fd, owner, owner)
+    with os.fdopen(fd, "w") as stream:
+        stream.write(text)
+    temp.replace(path)
+
+
+def save_settings(body: NetworkSettings) -> dict:
+    data = validate(body)
+    # Read by bin/network-settings.sh as KEY=value data, never executed.
     fields = {"TRUST_SUB": data["vpn_subnet"], "GUEST_SUB": data["guest_subnet"],
-        "LAN_CIDRS": " ".join(data["lan_cidrs"]), "GUEST_BLOCK": " ".join(data["blocked_cidrs"]),
-        "PROXY_CIDRS": " ".join(data["proxy_cidrs"]),
-        "GUEST_PORTAL_HOST": portal["host"] if isolated_portal else "",
-        "GUEST_PORTAL_TARGET": portal["target"] if isolated_portal else "",
-        "GUEST_PORTAL_DESTINATIONS": " ".join(portal["destinations"]) if isolated_portal else "",
-        "NETWORK_JSON": json.dumps(data, separators=(",", ":"))}
+              "PROXY_CIDRS": " ".join(data["proxy_cidrs"]),
+              "GUEST_PORTAL_TARGET": data["gateway"]["portal_listener"],
+              "NETWORK_JSON": json.dumps(data, separators=(",", ":"))}
     path = settings.network_file
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_suffix(".tmp")
     with pki.lock:
-        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w") as stream:
-            stream.write("".join(f"{key}={value}\n" for key, value in fields.items()))
-        pki.write_config("server", "\n".join(lines) + "\n")
+        pki.write_config("server", "\n".join(server_conf_lines(data)) + "\n")
         settings.server_conf.chmod(0o600)
-        temp.replace(path)
-        # The relay runs as UID 65532. Give it only its own private proxy-trust
-        # file, not access to the UI's complete service inventory.
-        proxy_path = path.with_name("proxies.conf")
-        proxy_temp = proxy_path.with_suffix(".tmp")
-        fd = os.open(proxy_temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        os.fchmod(fd, 0o600)
-        if os.geteuid() == 0:
-            os.fchown(fd, 65532, 65532)
-        with os.fdopen(fd, "w") as stream:
-            stream.write("PROXY_CIDRS=" + " ".join(data["proxy_cidrs"]) + "\n")
-        proxy_temp.replace(proxy_path)
+        write_private(path, "".join(f"{key}={value}\n" for key, value in fields.items()))
+        # The relay runs as UID 65532 and gets only the proxy trust, not the service inventory.
+        write_private(path.with_name("proxies.conf"), "PROXY_CIDRS=" + " ".join(data["proxy_cidrs"]) + "\n", owner=65532)
     return {"settings": data, "restart_required": True}
 
 
-def export_gateway(db=None):
-    data = get_settings(db)
-    gateway = data["gateway"]
-    required = {"domain": "Gateway domain", "openvpn_host": "Website hostname", "openvpn_backend": "OpenVPN UI backend URL",
-                "relay_host": "Public relay URL", "relay_backend": "Relay backend"}
+# -- gateway export -----------------------------------------------------------------
+def export_gateway(db=None) -> dict:
+    """network.private.json for `./manage setup --network-file` on the Traefik gateway."""
+    gateway = get_settings(db)["gateway"]
+    required = {"domain": "Domain", "openvpn_host": "Website hostname", "openvpn_backend": "VPN server web address"}
     missing = [label for key, label in required.items() if not gateway[key]]
     if missing:
-        raise PkiError("Complete these settings before exporting: " + ", ".join(missing))
-    if data["portal"]["enabled"] and data["portal"]["host"] != gateway["openvpn_host"]:
-        raise PkiError("The private portal and gateway OpenVPN host must match")
-    if data["portal"]["enabled"]:
-        gateway["portal_cidrs"] = list(dict.fromkeys([*(gateway["portal_cidrs"] or gateway["trusted_cidrs"]), data["guest_subnet"]]))
-    return {"version": 1, "gateway": gateway, "portal": data["portal"]}
+        raise PkiError("Complete these settings before downloading the gateway file: " + ", ".join(missing))
+    return {"version": EXPORT_VERSION,
+            **{key: gateway[key] for key in ("domain", "openvpn_host", "openvpn_backend", "relay_host",
+                                             "relay_backend", "relay_public_url", "portal_listener", "trusted_cidrs")},
+            # None keeps the gateway's existing additional services.
+            "services": gateway["services"] if gateway["replace_services"] else None}
 
 
 class NetworkProxyHeaders:

@@ -122,11 +122,6 @@ services:
     volumes:
       - ./pki:/etc/openvpn/pki:ro
       - ./guests:/etc/openvpn/guests:ro
-      - type: bind
-        source: ./server.conf
-        target: /etc/openvpn/server.conf
-        read_only: true
-        bind: {create_host_path: false}
       - ./config/network:/etc/openvpn/config/network:ro
     # Private CA/client key areas are hidden; only public identity state is used.
     tmpfs:

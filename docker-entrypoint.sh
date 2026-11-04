@@ -18,8 +18,6 @@ MGMT_PW_FILE=$OPENVPN_DIR/config/management.pw
 
 TRUST_SUB=${TRUST_SUB:-}
 GUEST_SUB=${GUEST_SUB:-}
-LAN_CIDRS=${HOME_SUB:-}
-GUEST_BLOCK=${GUEST_BLOCK:-10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16}
 OVPN_STRICT_FORWARD=${OVPN_STRICT_FORWARD:-1}
 OVPN_LOG_STDOUT=${OVPN_LOG_STDOUT:-1}
 OVPN_LOG_MAX_BYTES=${OVPN_LOG_MAX_BYTES:-10485760}
@@ -207,24 +205,14 @@ firewall() {
     guest_portal_rules -A
     iptables -t nat -A OVPN-NAT -s "$TRUST_SUB" -o "$egress" -j MASQUERADE   # guests are inside TRUST_SUB
 
-    # Guests: the pushed DNS servers and the internet, nothing else - no LAN, no
-    # private ranges, no network the server pushes a route to, no other VPN
-    # clients, no ping, and nothing on this host.
+    # Guests: the pushed DNS servers and the personal portal (guest_portal_rules
+    # above), nothing else - no internet, no LAN, no other VPN client, no ping
+    # and nothing on this host.
     for dns in $(sed -n -e 's/^[[:space:]]*push[[:space:]]\+"dhcp-option DNS \([0-9.]\+\)".*/\1/p' \
                         -e 's/^[[:space:]]*push[[:space:]]\+"dns server [0-9]\+ address \([0-9.]\+\)".*/\1/p' "$SERVER_CONF" | sort -u); do
         for p in udp tcp; do iptables -A OVPN-FORWARD -s "$GUEST_SUB" -d "$dns" -p $p --dport 53 -j ACCEPT; done
     done
-    iptables -A OVPN-FORWARD -s "$GUEST_SUB" -p icmp --icmp-type echo-request -j DROP
-    for net in $LAN_CIDRS $GUEST_BLOCK; do
-        iptables -A OVPN-FORWARD -s "$GUEST_SUB" -d "$net" -j DROP
-    done
-    # push "route NET [MASK]": a host route without a mask; not the default routes, which would
-    # cut guests off the internet. A mistyped route must not keep the server from starting.
-    for net in $(sed -n 's/^[[:space:]]*push[[:space:]]\+"route[[:space:]]\+\([0-9.]\+\)[[:space:]"]\+\([0-9.]*\).*/\1\/\2/p' "$SERVER_CONF" \
-                 | sed 's|/$|/255.255.255.255|' | grep -vE '/(0|128)\.0\.0\.0$' || true); do
-        iptables -A OVPN-FORWARD -s "$GUEST_SUB" -d "$net" -j DROP 2>/dev/null \
-            || warn "Cannot block guests from the pushed route '$net' - check that line in server.conf"
-    done
+    iptables -A OVPN-FORWARD -s "$GUEST_SUB" -j DROP
     iptables -A OVPN-INPUT -i 'tun+' -s "$GUEST_SUB" -j DROP
 
     # Custom rules supplied by the user (see fw-rules.sh).
@@ -299,6 +287,7 @@ firewall_intact() {
         && iptables -t nat -S OVPN-NAT 2>/dev/null | grep -q MASQUERADE \
         && iptables -C INPUT -j OVPN-INPUT 2>/dev/null \
         && iptables -C OVPN-INPUT -i 'tun+' -s "$GUEST_SUB" -j DROP 2>/dev/null \
+        && iptables -C OVPN-FORWARD -s "$GUEST_SUB" -j DROP 2>/dev/null \
         && iptables -C "$(forward_first)" -j OVPN-FORWARD 2>/dev/null \
         && iptables -C FORWARD -j OVPN-ACCEPT 2>/dev/null \
         && iptables -C OVPN-ACCEPT -i 'tun+' -j ACCEPT 2>/dev/null

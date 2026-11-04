@@ -8,6 +8,7 @@ import hmac
 import html
 import json
 import logging
+import re
 import secrets
 import time
 from contextlib import asynccontextmanager
@@ -1170,26 +1171,28 @@ def get_network_settings(user: dict[str, Any] = Authed):
 
 @app.post("/api/network/discovery", dependencies=[Csrf])
 def discover_network(body: network.NetworkSettings, request: Request, user: dict[str, Any] = Authed):
-    data = network.shared_settings(body.model_dump(), db)
-    return JSONResponse(network_discovery.discover(data, peer=getattr(request.state, "network_peer", None),
-                        proxied=bool(request.headers.get("x-forwarded-proto"))), headers={"Cache-Control": "no-store"})
+    data = network.with_defaults(body.model_dump(), db)
+    peer = getattr(request.state, "network_peer", None)
+    return JSONResponse(network_discovery.discover(data, peer=peer, proxied=bool(request.headers.get("x-forwarded-proto"))),
+                        headers={"Cache-Control": "no-store"})
 
 
 class NetworkUpdate(network.NetworkSettings):
+    """The whole Settings → Network form: network settings, relay switch and URL, profile address."""
     relay_settings: relay.RelaySettings | None = Field(default=None, alias="relay")
     remote: RemoteBody | None = None
 
 
 @app.put("/api/network/settings", dependencies=[Csrf])
 def put_network_settings(body: NetworkUpdate, user: dict[str, Any] = Authed):
-    # Validate the whole form before changing persistent state.
-    if body.relay_settings is not None:
-        relay_config = relay.validate_settings(body.relay_settings, lan_cidrs=body.lan_cidrs)
+    # Validate every part before changing anything.
+    relay_config = relay.validate_settings(body.relay_settings) if body.relay_settings is not None else None
+    if relay_config is not None:
         body.gateway.relay_public_url = relay_config["url"]
     if body.remote is not None:
         pki.validate_remote(body.remote.host, body.remote.ports)
     result = network.save_settings(network.NetworkSettings(**body.model_dump(exclude={"relay_settings", "remote"})))
-    if body.relay_settings is not None:
+    if relay_config is not None:
         result["relay"] = relay.save_settings(db, body.relay_settings)
     if body.remote is not None:
         current = pki.get_remote()
@@ -1228,10 +1231,11 @@ def healthz():
 def index():
     # Deployments can change assets without changing the release version.
     # Hash their contents so the browser cannot reuse a previous build's UI.
-    html = (STATIC_DIR / "index.html").read_text()
-    for asset in ("app.css", "app.js"):
-        digest = hashlib.sha256((STATIC_DIR / asset).read_bytes()).hexdigest()[:16]
-        html = html.replace(f'"/static/{asset}"', f'"/static/{asset}?v={digest}"')
+    def versioned(match: re.Match) -> str:
+        digest = hashlib.sha256((STATIC_DIR / match[1]).read_bytes()).hexdigest()[:16]
+        return f'"/static/{match[1]}?v={digest}"'
+
+    html = re.sub(r'"/static/([\w.-]+)"', versioned, (STATIC_DIR / "index.html").read_text())
     return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
 
 

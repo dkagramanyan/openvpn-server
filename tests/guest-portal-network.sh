@@ -48,12 +48,10 @@ iptables -A FORWARD -j OVPN-FORWARD
 source "$root/bin/guest-portal.sh"
 GUEST_SUB=10.8.0.128/25
 GUEST_PORTAL_TARGET=192.0.2.13:9443
-GUEST_PORTAL_DESTINATIONS='192.0.2.13 198.51.100.4'
 guest_portal_validate
 guest_portal_rules -A
 guest_portal_rules -C
-iptables -A OVPN-FORWARD -s "$GUEST_SUB" -d 192.0.2.0/24 -j DROP
-iptables -A OVPN-FORWARD -s "$GUEST_SUB" -d 198.51.100.4 -j DROP
+iptables -A OVPN-FORWARD -s "$GUEST_SUB" -j DROP     # as the entrypoint: nothing else for guests
 iptables -A FORWARD -i 'tun+' -j ACCEPT
 iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 iptables -t nat -A OVPN-NAT -s 10.8.0.0/24 -o lan0 -j MASQUERADE
@@ -81,6 +79,7 @@ for attempt in $(seq 100); do
 done
 curl --noproxy '*' -fsS --max-time 1 http://192.0.2.13:9443/ >/dev/null
 request() { nsenter -t "$guest_pid" -n curl --noproxy '*' --interface "$1" -fsS --max-time 1 "http://$2/"; }
+# Any HTTPS destination of a guest lands on the portal listener.
 [[ $(request 10.8.0.129 192.0.2.13:443) == 9443 ]]
 [[ $(request 10.8.0.129 198.51.100.4:443) == 9443 ]]
 for port in 8080 9443; do
@@ -90,4 +89,4 @@ for port in 8080 9443; do
 done
 [[ $(request 10.8.0.10 192.0.2.13:443) == 443 ]]
 [[ $(request 10.8.0.10 192.0.2.13:8080) == 8080 ]]
-echo 'PASS: guest LAN/public HTTPS DNAT, return NAT, direct-port isolation, full-access routing'
+echo 'PASS: guest HTTPS goes to the portal listener, nothing else is reachable; full access unchanged'

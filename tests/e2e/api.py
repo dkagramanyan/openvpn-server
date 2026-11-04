@@ -114,6 +114,13 @@ def main():
         call("/api/server/restart", {})
         time.sleep(3)
         until("OpenVPN did not come back after the restart", lambda: call("/healthz")["openvpn"])
+    elif cmd == "portal":       # portal IP:PORT: guests reach the personal portal there; restart OpenVPN
+        body = call("/api/network/settings")
+        body["gateway"].update(domain="example.test", openvpn_host="openvpn.example.test", portal_listener=args[0])
+        call("/api/network/settings", body, "PUT")
+        call("/api/server/restart", {})
+        time.sleep(3)
+        until("OpenVPN did not come back after the restart", lambda: call("/healthz")["openvpn"])
     elif cmd == "profile":
         sys.stdout.write(call(f"/api/clients/{args[0]}/ovpn"))
     elif cmd == "backup":

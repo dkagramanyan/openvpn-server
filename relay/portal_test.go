@@ -15,32 +15,37 @@ import (
 	"time"
 )
 
-func TestGuestPortalBoundary(t *testing.T) {
-	portal, err := parseGuestPortal("OpenVPN.Example.test", "192.0.2.13:9443", "192.0.2.13 198.51.100.4")
+func TestGuestReachesOnlyThePortal(t *testing.T) {
+	portal, err := parseGuestPortal(portalConfig{Host: "OpenVPN.Example.test", Target: "192.0.2.13:9443"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	s := &relayServer{}
-	p := policy{Portal: &portalConfig{Enabled: true, Host: "openvpn.example.test", Target: portal.target.String(), Destinations: []string{"192.0.2.13", "198.51.100.4"}}, Guest: true, CIDRs: []string{"0.0.0.0/0"}, Blocked: []string{"192.0.2.0/24", "198.51.100.4/32"}}
-	for _, target := range []string{"openvpn.example.test:443", "OPENVPN.EXAMPLE.TEST.:443", "192.0.2.13:443", "198.51.100.4:443"} {
+	p := policy{Portal: &portalConfig{Host: "openvpn.example.test", Target: portal.target.String()}, Guest: true}
+	for _, target := range []string{"openvpn.example.test:443", "OPENVPN.EXAMPLE.TEST.:443"} {
 		ctx, addresses, err := s.resolveDestination(context.Background(), target, p, true)
 		if err != nil || len(addresses) != 1 || addresses[0] != portal.target || !s.portalFlow(ctx, portal.target.Addr(), p) {
 			t.Fatalf("portal %s: %v %v", target, addresses, err)
 		}
 		if s.portalFlow(ctx, netip.MustParseAddr("192.0.2.30"), p) {
-			t.Fatal("exception escaped its pinned destination")
+			t.Fatal("portal flow escaped its pinned destination")
 		}
 	}
-	for _, target := range []string{"192.0.2.13:9443", "192.0.2.30:443", "192.0.2.13:80", "198.51.100.4:8080", "openvpn.example.test:8443", "127.0.0.1:443"} {
+	// No internet, no LAN, no other port or protocol, not even the portal's own addresses.
+	for _, target := range []string{"example.com:443", "8.8.8.8:443", "192.0.2.13:443", "192.0.2.13:9443", "openvpn.example.test:80", "openvpn.example.test:8443", "127.0.0.1:443"} {
 		if _, _, err := s.resolveDestination(context.Background(), target, p, true); err == nil {
-			t.Fatalf("allowed %s", target)
+			t.Fatalf("guest allowed %s", target)
 		}
 	}
 	if _, _, err := s.resolveDestination(context.Background(), "openvpn.example.test:443", p, false); err == nil {
-		t.Fatal("UDP portal exception")
+		t.Fatal("guest allowed UDP to the portal")
 	}
 	if s.portalFlow(context.Background(), portal.target.Addr(), p) {
-		t.Fatal("ordinary flow bypassed policy")
+		t.Fatal("a flow without the pinned portal target passed")
+	}
+	noPortal := policy{Guest: true}
+	if _, _, err := s.resolveDestination(context.Background(), "openvpn.example.test:443", noPortal, true); err == nil {
+		t.Fatal("guest without a configured portal reached it")
 	}
 	full := policy{CIDRs: []string{"0.0.0.0/0"}}
 	_, addresses, err := s.resolveDestination(context.Background(), "192.0.2.13:443", full, true)
@@ -50,16 +55,19 @@ func TestGuestPortalBoundary(t *testing.T) {
 }
 
 func TestGuestPortalConfiguration(t *testing.T) {
-	if p, err := parseGuestPortal("", "", ""); err != nil || p != nil {
-		t.Fatal("disabled default")
-	}
 	for _, target := range []string{"", "192.0.2.13:443", "127.0.0.1:9443", "169.254.169.254:9443", "0.0.0.0:9443", "[::1]:9443", "host:9443"} {
-		if _, err := parseGuestPortal("openvpn.example.test", target, ""); err == nil {
+		if _, err := parseGuestPortal(portalConfig{Host: "openvpn.example.test", Target: target}); err == nil {
 			t.Fatalf("accepted %s", target)
 		}
 	}
-	if _, err := parseGuestPortal("openvpn.example.test", "192.0.2.13:9443", "0.0.0.0/0"); err == nil {
-		t.Fatal("accepted destination subnet")
+	for _, host := range []string{"", "https://openvpn.example.test", "openvpn.example.test:443"} {
+		if _, err := parseGuestPortal(portalConfig{Host: host, Target: "192.0.2.13:9443"}); err == nil {
+			t.Fatalf("accepted host %q", host)
+		}
+	}
+	p := policy{Guest: true, Portal: &portalConfig{Host: "openvpn.example.test", Target: "bad"}}
+	if p.compile() == nil {
+		t.Fatal("malformed portal policy compiled")
 	}
 }
 
@@ -70,10 +78,10 @@ func TestGuestPortalStillRevalidatesAuthorization(t *testing.T) {
 			w.WriteHeader(http.StatusForbidden)
 			return
 		}
-		json.NewEncoder(w).Encode(policy{Portal: &portalConfig{Enabled: true, Host: "openvpn.example.test", Target: "192.0.2.13:9443"}, Client: "guest", Guest: true, CIDRs: []string{"0.0.0.0/0"}, Blocked: []string{"192.0.2.0/24"}, URL: "https://relay.example.test"})
+		json.NewEncoder(w).Encode(policy{Portal: &portalConfig{Host: "openvpn.example.test", Target: "192.0.2.13:9443"}, Client: "guest", Guest: true, URL: "https://relay.example.test"})
 	}))
 	defer api.Close()
-	portal, _ := parseGuestPortal("openvpn.example.test", "192.0.2.13:9443", "")
+	portal, _ := parseGuestPortal(portalConfig{Host: "openvpn.example.test", Target: "192.0.2.13:9443"})
 	s := &relayServer{api: api.URL, client: api.Client(), recheck: 10 * time.Millisecond, policyTTL: time.Millisecond}
 	ctx, cancel := context.WithCancel(context.WithValue(context.Background(), portalFlowKey{}, portal.target))
 	defer cancel()
@@ -121,7 +129,7 @@ func TestHTTP2GuestPortalTunnel(t *testing.T) {
 			w.WriteHeader(403)
 			return
 		}
-		json.NewEncoder(w).Encode(policy{Portal: &portalConfig{Enabled: true, Host: "openvpn.example.test", Target: destination.Addr().String(), Destinations: []string{ip}}, Guest: true, Client: "guest", URL: origin, CIDRs: []string{"0.0.0.0/0"}, Blocked: []string{ip + "/32"}})
+		json.NewEncoder(w).Encode(policy{Portal: &portalConfig{Host: "openvpn.example.test", Target: destination.Addr().String()}, Guest: true, Client: "guest", URL: origin})
 	}))
 	defer auth.Close()
 	s := &relayServer{api: auth.URL, client: auth.Client(), slots: make(chan struct{}, 4), recheck: 10 * time.Millisecond, policyTTL: time.Millisecond}

@@ -570,7 +570,7 @@ def test_page_asks_for_assets_by_content_hash(client):
     from app.main import STATIC_DIR
     page = client.get("/")
     assert page.headers["cache-control"] == "no-cache"
-    for asset in ("app.css", "app.js"):
+    for asset in ("app.css", "core.js", "admin.js", "relay.js", "settings.js", "portal.js", "app.js"):
         digest = hashlib.sha256((STATIC_DIR / asset).read_bytes()).hexdigest()[:16]
         url = f'/static/{asset}?v={digest}'
         assert f'"{url}"' in page.text
@@ -581,8 +581,8 @@ def test_page_asks_for_assets_by_content_hash(client):
 
 def test_asset_change_invalidates_url_without_a_version_bump(client, monkeypatch, tmp_path):
     from app import main
-    for asset in ("index.html", "app.css", "app.js"):
-        shutil.copy(main.STATIC_DIR / asset, tmp_path / asset)
+    for asset in main.STATIC_DIR.iterdir():
+        shutil.copy(asset, tmp_path / asset.name)
     monkeypatch.setattr(main, "STATIC_DIR", tmp_path)
     before = client.get("/").text
     script = tmp_path / "app.js"
@@ -599,8 +599,7 @@ def test_asset_change_invalidates_url_without_a_version_bump(client, monkeypatch
 @pytest.fixture
 def configured(client):
     old = relay.get_settings(db)
-    body = {"enabled": True, "url": "https://relay.example.com:8443", "route_all": False,
-            "match_domains": ["home.arpa"], "allowed_cidrs": ["192.168.1.0/24", "fd00::/64"]}
+    body = {"enabled": True, "url": "https://relay.example.com:8443"}
     response = client.put("/api/relay/settings", json=body, headers=H)
     assert response.status_code == 200
     yield response.json()
@@ -638,29 +637,19 @@ def test_profile_and_revoke(client, configured):
 
 
 def test_full_access_relay_routes_internet_and_lan(client, configured):
-    lan_profile, token = download(client)
-    updated = {**configured, "route_all": True, "match_domains": []}
-    assert client.put("/api/relay/settings", json=updated, headers=H).status_code == 200
-    full_profile, full_token = download(client)
-    assert full_token == token
-    assert full_profile["PayloadIdentifier"] == lan_profile["PayloadIdentifier"]
-    assert full_profile["PayloadContent"][0]["MatchDomains"] == []
-    assert "Internet and LAN" in full_profile["PayloadDescription"]
+    profile, token = download(client)
+    assert profile["PayloadContent"][0]["MatchDomains"] == []
+    assert "Internet and LAN" in profile["PayloadDescription"]
     policy = client.post("/api/relay/authorize", headers={"Authorization": token}).json()
     assert policy == {"client": "alice", "guest": False, "allowed_cidrs": ["0.0.0.0/0", "::/0"],
-                      "blocked_cidrs": [], "url": configured["url"], "portal": None,
+                      "url": configured["url"], "portal": None,
                       "credential_id": hashlib.sha256(token.removeprefix("Bearer ").partition(":")[2].encode()).hexdigest()}
-    # Legacy split-routing settings cannot diverge from the OpenVPN access role.
-    assert client.put("/api/relay/settings", json={**configured, "route_all": False}, headers=H).json()["route_all"] is True
-    assert client.post("/api/relay/authorize", headers={"Authorization": token}).json()["allowed_cidrs"] == ["0.0.0.0/0", "::/0"]
-    assert download(client)[0] == lan_profile
 
 
-def test_relay_defaults_to_full_access_when_upgrading(client, configured):
-    legacy = {key: value for key, value in configured.items() if key != "route_all"}
+def test_relay_settings_from_earlier_builds_keep_working(client, configured):
+    legacy = {**configured, "route_all": False, "match_domains": ["home.arpa"], "allowed_cidrs": ["192.168.1.0/24"]}
     db.set_setting("apple_relay", json.dumps(legacy))
-    result = client.get("/api/relay/settings").json()
-    assert result == {**legacy, "route_all": True}
+    assert client.get("/api/relay/settings").json() == configured
     assert download(client)[0]["PayloadContent"][0]["MatchDomains"] == []
 
 
@@ -723,8 +712,6 @@ def test_lifecycle_denies_existing_credentials(client, configured, monkeypatch, 
     {"url": "http://relay.example.com"}, {"url": "https://u:p@relay.example.com"},
     {"url": "https://relay.example.com/path"}, {"url": "https://relay.example.com:70000"},
     {"url": "https://relay.example.com?token=secret"}, {"url": ""},
-    {"match_domains": ["*.home.arpa"]},
-    {"allowed_cidrs": []}, {"allowed_cidrs": ["192.168.1.12/24"]},
 ])
 def test_settings_validation(client, configured, updates):
     response = client.put("/api/relay/settings", json={**configured, **updates}, headers=H)
@@ -747,32 +734,43 @@ def test_relay_fails_closed_without_pki_index(client, configured, monkeypatch):
     assert client.post("/api/clients/alice/relay.mobileconfig", headers=H).status_code == 400
 
 
-@pytest.mark.parametrize("route_all", [False, True])
-def test_guest_and_non_guest_relay_profiles(client, configured, route_all):
-    client.put("/api/relay/settings", json={**configured, "route_all": route_all}, headers=H)
+@pytest.fixture
+def guest_portal(monkeypatch):
+    portal = {"host": "openvpn.example.com", "target": "192.0.2.10:9443"}
+    monkeypatch.setattr(relay.network, "guest_portal", lambda: portal)
+    return portal
+
+
+def test_guest_and_non_guest_relay_profiles(client, configured, guest_portal):
     _, full_token = download(client)
     try:
         assert client.put("/api/clients/alice/access", json={"guest": True}, headers=H).status_code == 200
         assert client.post("/api/relay/authorize", headers={"Authorization": full_token}).json()["guest"] is True
         profile, guest_token = download(client)
         assert guest_token == full_token
-        assert profile["PayloadContent"][0]["MatchDomains"] == []
+        # Only the portal goes through the relay; the device keeps its own internet.
+        assert profile["PayloadContent"][0]["MatchDomains"] == ["openvpn.example.com"]
         assert "Guest" in profile["PayloadDisplayName"]
         policy = client.post("/api/relay/authorize", headers={"Authorization": guest_token}).json()
-        assert policy["guest"] is True and policy["allowed_cidrs"] == ["0.0.0.0/0"]
-        for network in ["192.0.2.0/24", "203.0.113.0/24", "10.9.0.0/24", "10.8.0.0/24", "192.168.1.0/24"]:
-            assert network in policy["blocked_cidrs"]
-        assert "0.0.0.0/0" not in policy["blocked_cidrs"]
+        assert policy["guest"] is True and policy["allowed_cidrs"] == [] and policy["portal"] == guest_portal
         assert client.get("/api/clients/alice").json()["relay_available"]
         # Saving the unchanged role must not invalidate a working profile.
         client.put("/api/clients/alice/access", json={"guest": True}, headers=H)
         assert client.post("/api/relay/authorize", headers={"Authorization": guest_token}).status_code == 200
         client.put("/api/clients/alice/access", json={"guest": False}, headers=H)
-        assert client.post("/api/relay/authorize", headers={"Authorization": guest_token}).json()["guest"] is False
+        policy = client.post("/api/relay/authorize", headers={"Authorization": guest_token}).json()
+        assert policy["guest"] is False and policy["portal"] is None
         assert download(client)[1] == full_token
         assert download(client)[0]["PayloadContent"][0]["MatchDomains"] == []
     finally:
         pki.set_guest("alice", False)
+
+
+def test_guest_relay_profile_needs_the_portal_listener(client, configured, monkeypatch):
+    monkeypatch.setattr(relay.network, "guest_portal", lambda: None)
+    monkeypatch.setattr(relay, "is_guest", lambda name: True)
+    response = client.post("/api/clients/alice/relay.mobileconfig", headers=H)
+    assert response.status_code == 400 and "portal listener" in response.json()["detail"]
 
 
 def test_ui_certificate_renewal_preserves_relay_profile(client, configured, monkeypatch):
@@ -895,21 +893,13 @@ def test_relay_diagnostics_require_admin_session(client, monkeypatch):
         client.cookies.update(cookies)
 
 
-def test_guest_relay_denies_when_network_configuration_unreadable(client, configured, monkeypatch):
-    from app.settings import settings
+def test_guest_relay_denies_when_network_configuration_unreadable(client, configured, guest_portal, monkeypatch):
     monkeypatch.setattr(relay, "is_guest", lambda name: True)
     _, token = download(client)
-    monkeypatch.setattr(settings, "server_conf", settings.openvpn_dir / "missing.conf")
+    def unreadable():
+        raise ValueError("Network settings are incomplete")
+    monkeypatch.setattr(relay.network, "guest_portal", unreadable)
     assert client.post("/api/relay/authorize", headers={"Authorization": token}).status_code == 403
-
-
-def test_guest_relay_blocks_configured_public_ingress(client, configured, monkeypatch):
-    from app.settings import settings
-    monkeypatch.setattr(settings, "guest_block", settings.guest_block + " 198.51.100.4/32")
-    monkeypatch.setattr(relay, "is_guest", lambda name: True)
-    _, token = download(client)
-    policy = client.post("/api/relay/authorize", headers={"Authorization": token}).json()
-    assert "198.51.100.4/32" in policy["blocked_cidrs"]
 
 
 def test_relay_authorization_does_not_scan_client_certificates(client, configured, monkeypatch):
@@ -1017,14 +1007,13 @@ def test_combined_network_and_relay_save_validates_before_writing(client, monkey
     server_conf.write_text(settings.server_conf.read_text())
     monkeypatch.setattr(settings, "server_conf", server_conf)
     body = client.get("/api/network/settings").json()
-    body["lan_cidrs"] = ["192.0.2.0/24"]
     previous_relay = db.get_setting("apple_relay")
     client_conf = pki.config_path("client")
     previous_client = client_conf.read_bytes()
     regenerated = []
     monkeypatch.setattr(pki, "regenerate_profiles", lambda: regenerated.append(True))
     try:
-        body["relay"] = {"enabled": True, "url": "http://invalid.example.test", "allowed_cidrs": []}
+        body["relay"] = {"enabled": True, "url": "http://invalid.example.test"}
         before = server_conf.read_bytes()
         response = client.put("/api/network/settings", json=body, headers=H)
         assert response.status_code == 400

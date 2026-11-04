@@ -241,24 +241,16 @@ func TestRelayTCPUDPAndRevocation(t *testing.T) {
 	}
 }
 
-func TestGuestPolicy(t *testing.T) {
-	p := policy{Guest: true, CIDRs: []string{"0.0.0.0/0"}, Blocked: []string{"192.0.2.0/24", "203.0.113.0/24", "198.51.100.4/32"}}
-	if p.allows(netip.MustParseAddr("198.51.100.4")) {
-		t.Fatal("guest can loop back through the public reverse proxy")
-	}
-	for _, ip := range []string{"8.8.8.8", "1.1.1.1", "::ffff:8.8.8.8"} {
-		if !p.allows(netip.MustParseAddr(ip)) {
-			t.Errorf("guest public destination denied: %s", ip)
-		}
-	}
-	for _, ip := range []string{"10.0.0.1", "172.16.0.1", "192.168.1.1", "100.64.0.1", "192.0.2.1", "203.0.113.1", "::ffff:192.168.1.1", "64:ff9b::c0a8:101", "2002:c0a8:101::1", "2001:4860:4860::8888", "198.18.0.1", "240.0.0.1", localIP(t)} {
+func TestGuestPolicyDeniesEveryResolvedAddress(t *testing.T) {
+	p := policy{Guest: true, CIDRs: []string{"0.0.0.0/0", "::/0"}}
+	for _, ip := range []string{"8.8.8.8", "1.1.1.1", "::ffff:8.8.8.8", "2001:4860:4860::8888", "192.168.1.1", localIP(t)} {
 		if p.allows(netip.MustParseAddr(ip)) {
-			t.Errorf("guest protected destination allowed: %s", ip)
+			t.Errorf("guest destination allowed: %s", ip)
 		}
 	}
-	p.Blocked = []string{"invalid"}
-	if p.allows(netip.MustParseAddr("8.8.8.8")) {
-		t.Fatal("malformed block policy failed open")
+	full := policy{CIDRs: []string{"invalid"}}
+	if full.allows(netip.MustParseAddr("8.8.8.8")) {
+		t.Fatal("malformed policy failed open")
 	}
 }
 

@@ -7,70 +7,44 @@ import (
 	"net"
 	"net/netip"
 	"strconv"
-	"strings"
 	"time"
 )
 
+// policy is the relay-policy service's answer for one credential. Full-access
+// clients may reach CIDRs (internet and LAN); guests reach only the portal.
 type policy struct {
 	CredentialID    string        `json:"credential_id"`
 	Client          string        `json:"client"`
 	CIDRs           []string      `json:"allowed_cidrs"`
 	URL             string        `json:"url"`
 	Guest           bool          `json:"guest"`
-	Blocked         []string      `json:"blocked_cidrs"`
 	Portal          *portalConfig `json:"portal"`
 	portal          *guestPortal
 	compiled        bool
 	allowedPrefixes []netip.Prefix
-	blockedPrefixes []netip.Prefix
-	interfaces      []netip.Prefix
 }
 
-var guestSpecial = func() []netip.Prefix {
-	var values []netip.Prefix
-	for _, cidr := range []string{"0.0.0.0/8", "100.64.0.0/10", "192.0.0.0/24", "192.0.2.0/24", "192.88.99.0/24", "198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24", "240.0.0.0/4"} {
-		values = append(values, netip.MustParsePrefix(cidr))
-	}
-	return values
-}()
-
-// Compile CIDRs once per fresh policy, including a fresh interface snapshot.
+// compile parses the policy once per authorization; a malformed policy is an error.
 func (p *policy) compile() error {
-	if p.Portal != nil && p.Guest && p.Portal.Enabled {
+	if p.Guest && p.Portal != nil {
 		var err error
-		p.portal, err = parseGuestPortal(p.Portal.Host, p.Portal.Target, strings.Join(p.Portal.Destinations, " "))
-		if err != nil {
+		if p.portal, err = parseGuestPortal(*p.Portal); err != nil {
 			return err
 		}
 	}
-	for _, group := range []struct {
-		source []string
-		target *[]netip.Prefix
-	}{{p.CIDRs, &p.allowedPrefixes}, {p.Blocked, &p.blockedPrefixes}} {
-		for _, value := range group.source {
-			prefix, err := netip.ParsePrefix(value)
-			if err != nil {
-				return err
-			}
-			*group.target = append(*group.target, prefix.Masked())
-		}
-	}
-	if p.Guest {
-		addresses, err := net.InterfaceAddrs()
+	for _, value := range p.CIDRs {
+		prefix, err := netip.ParsePrefix(value)
 		if err != nil {
 			return err
 		}
-		for _, address := range addresses {
-			prefix, err := netip.ParsePrefix(address.String())
-			if err == nil {
-				p.interfaces = append(p.interfaces, prefix.Masked())
-			}
-		}
+		p.allowedPrefixes = append(p.allowedPrefixes, prefix.Masked())
 	}
 	p.compiled = true
 	return nil
 }
 
+// allows checks a resolved destination address. Guests are never allowed a
+// resolved address: their portal flow is pinned in resolveDestination.
 func (p policy) allows(addr netip.Addr) bool {
 	if !p.compiled {
 		if p.compile() != nil {
@@ -78,28 +52,8 @@ func (p policy) allows(addr netip.Addr) bool {
 		}
 	}
 	addr = addr.Unmap()
-	if addr.IsLoopback() || addr.IsUnspecified() || addr.IsMulticast() || addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() {
+	if p.Guest || addr.IsLoopback() || addr.IsUnspecified() || addr.IsMulticast() || addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() {
 		return false
-	}
-	if p.Guest {
-		if !addr.Is4() || !addr.IsGlobalUnicast() || addr.IsPrivate() {
-			return false
-		}
-		for _, prefix := range guestSpecial {
-			if prefix.Contains(addr) {
-				return false
-			}
-		}
-		for _, prefix := range p.interfaces {
-			if prefix.Contains(addr) {
-				return false
-			}
-		}
-	}
-	for _, prefix := range p.blockedPrefixes {
-		if prefix.Contains(addr) {
-			return false
-		}
 	}
 	for _, prefix := range p.allowedPrefixes {
 		if prefix.Contains(addr) {

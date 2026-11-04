@@ -9,7 +9,6 @@ import os
 import psycopg
 from psycopg import sql as pgsql
 import threading
-import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import relay
@@ -38,31 +37,13 @@ class ReadOnlySettings:
 
 
 def check_metadata():
+    """Fail closed (503) when the public PKI state or the access roles are unreadable."""
     index = settings.pki_dir / "index.txt"
-    if not index.is_file() or index.stat().st_nlink == 0:
+    if not index.is_file():
         raise OSError("PKI index unavailable")
     index.read_bytes()
     if not settings.guests_dir.is_dir():
         raise OSError("Access role directory unavailable")
-    if settings.server_conf.stat().st_nlink == 0:
-        raise OSError("Recreate policy service after replacing server.conf")
-
-
-def monitor_config_mount():
-    """An external atomic replacement unlinks the inode. Restart to rebind it.
-
-    Requests fail closed while the old inode is visible. Compose's restart
-    policy then mounts the new host file without needing a Docker socket here.
-    """
-    while True:
-        time.sleep(0.5)
-        try:
-            replaced = settings.server_conf.stat().st_nlink == 0
-        except OSError:
-            continue  # Request readiness reports unavailable metadata.
-        if replaced:
-            log.warning("Server configuration replaced; restarting policy service to refresh its read-only mount")
-            os._exit(75)
 
 
 class PolicyHandler(BaseHTTPRequestHandler):
@@ -148,7 +129,6 @@ def main():
         raise ValueError("Relay policy service must bind a loopback address")
     logging.basicConfig(level=logging.INFO)
     log.info("Independent relay policy service listening on %s", address)
-    threading.Thread(target=monitor_config_mount, daemon=True).start()
     PolicyServer((host, int(port)), PolicyHandler).serve_forever()
 
 
