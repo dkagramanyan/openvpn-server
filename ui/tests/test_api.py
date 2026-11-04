@@ -736,7 +736,7 @@ def test_relay_fails_closed_without_pki_index(client, configured, monkeypatch):
 
 @pytest.fixture
 def guest_portal(monkeypatch):
-    portal = {"host": "openvpn.example.com", "target": "192.0.2.10:9443"}
+    portal = {"host": "openvpn.example.com", "target": "192.0.2.10:9443", "hosts": ["files.example.com"]}
     monkeypatch.setattr(relay.network, "guest_portal", lambda: portal)
     return portal
 
@@ -749,7 +749,7 @@ def test_guest_and_non_guest_relay_profiles(client, configured, guest_portal):
         profile, guest_token = download(client)
         assert guest_token == full_token
         # Only the portal goes through the relay; the device keeps its own internet.
-        assert profile["PayloadContent"][0]["MatchDomains"] == ["openvpn.example.com"]
+        assert profile["PayloadContent"][0]["MatchDomains"] == ["openvpn.example.com", "files.example.com"]
         assert "Guest" in profile["PayloadDisplayName"]
         policy = client.post("/api/relay/authorize", headers={"Authorization": guest_token}).json()
         assert policy["guest"] is True and policy["allowed_cidrs"] == [] and policy["portal"] == guest_portal
@@ -868,14 +868,30 @@ def test_portal_signer_failure_never_returns_unsigned_profile(client, configured
     assert response.status_code == 400 and "Signing service is offline" in response.json()["detail"]
 
 
-def test_public_portal_login_rejects_admin_credentials(client):
+def test_one_sign_in_for_admins_and_clients(client, portal):
     from fastapi.testclient import TestClient
-    browser = TestClient(app)
+    restricted = {**H, "X-OpenVPN-Portal-Only": "1"}
+    for path in ("/api/login", "/api/portal/login"):
+        browser = TestClient(app)
+        try:
+            admin = browser.post(path, json={"username": "admin", "password": "test-password"}, headers=H)
+            assert admin.status_code == 200 and admin.json()["role"] == "admin"
+            user = TestClient(app)
+            answer = user.post(path, json={"username": "alice-login", "password": "portal-test-password"}, headers=H)
+            assert answer.status_code == 200 and answer.json()["role"] == "client"
+            assert user.get("/api/clients").status_code == 403
+            user.close()
+            # The guest portal listener neither accepts nor honours an administrator.
+            assert browser.get("/api/portal/me", headers=restricted).status_code == 401
+        finally:
+            browser.close()
+    guest_side = TestClient(app)
     try:
-        assert browser.post("/api/portal/login", json={"username": "admin", "password": "test-password"}, headers=H).status_code == 401
-        assert not browser.cookies
+        assert guest_side.post("/api/portal/login", json={"username": "admin", "password": "test-password"}, headers=restricted).status_code == 401
+        assert not guest_side.cookies
+        assert guest_side.post("/api/portal/login", json={"username": "alice-login", "password": "portal-test-password"}, headers=restricted).status_code == 200
     finally:
-        browser.close()
+        guest_side.close()
 
 
 def test_relay_diagnostics_require_admin_session(client, monkeypatch):

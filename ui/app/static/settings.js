@@ -35,6 +35,7 @@ function networkSettingsCard(saved, relay, general) {
     dns_servers: text(listText(saved.dns_servers)), routes: text(listText(saved.routes)),
   };
   const services = serviceEditor(gw);
+  const links = guestLinkEditor(gw.guest_links || []);
 
   // An empty field means "the usual value", shown as its placeholder.
   const defaults = () => {
@@ -68,7 +69,8 @@ function networkSettingsCard(saved, relay, general) {
       gateway: {
         domain: domain.value.trim(), openvpn_host: websiteHost, openvpn_backend: backend.value.trim(),
         relay_host: hostOf(relayOrigin), relay_backend: value(relayBackend, d.relayBackend), relay_public_url: relayOrigin,
-        portal_listener: portal.value.trim(), trusted_cidrs: parseList(trusted.value), ...services.collect(),
+        portal_listener: portal.value.trim(), trusted_cidrs: parseList(trusted.value), guest_links: links.collect(),
+        ...services.collect(),
       },
       relay: { enabled: relayEnabled.checked, url: relayOrigin },
       remote: profileHost ? { host: profileHost, ports: Object.fromEntries(vpnPorts.map(p => [p.proto, Number(p.input.value)])) } : null,
@@ -134,9 +136,10 @@ function networkSettingsCard(saved, relay, general) {
         h('label', { class: 'check' }, relayEnabled, 'Offer Apple relay profiles'))),
     section('Guests', null,
       h('p', null, 'Guests of OpenVPN and the Apple relay have no internet and no LAN access. They can open only their personal portal, ',
-        portalPage, ', to change their password and download their profiles.'),
+        portalPage, ', to change their password and download their profiles, and the guest links below.'),
       field('Guest portal listener on the gateway', portal,
-        'The gateway’s LAN address and its portal port (9443). Every HTTPS connection of a guest goes there. Empty: guests can open nothing.')),
+        'The gateway’s LAN address and its portal port (9443). Every HTTPS connection of a guest goes there. Empty: guests can open nothing.'),
+      links.element),
     section('Gateway', 'How the Traefik gateway reaches this server, and which of its addresses this server trusts.',
       h('div', { class: 'form cols' },
         field('This server’s web address', backend, 'As the gateway reaches the web UI, including the port.'),
@@ -174,6 +177,35 @@ function networkSettingsCard(saved, relay, general) {
   refresh();
   detect();
   return card('Network', root);
+}
+
+// Extra pages guests may open: websites under your domain, served by the gateway.
+// Each link allows its own path and below, or its whole website.
+function guestLinkEditor(saved) {
+  const list = h('div', { class: 'stack' });
+  const rows = [];
+  const add = (link = { url: '', whole_site: false }) => {
+    const row = {
+      url: h('input', { class: 'input', type: 'url', value: link.url, placeholder: 'https://files.example.com/share/abc', autocomplete: 'off', spellcheck: 'false', 'aria-label': 'Guest link' }),
+      scope: h('select', { class: 'input', 'aria-label': 'What the link allows' },
+        h('option', { value: 'path' }, 'This page and below'), h('option', { value: 'site' }, 'The whole website')),
+    };
+    row.scope.value = link.whole_site ? 'site' : 'path';
+    row.element = h('div', { class: 'guest-link' }, row.url, row.scope,
+      h('button', { class: 'btn', type: 'button', onClick: () => { rows.splice(rows.indexOf(row), 1); row.element.remove(); } }, 'Remove'));
+    rows.push(row);
+    list.append(row.element);
+  };
+  saved.forEach(add);
+  return {
+    element: h('div', { class: 'form' },
+      h('strong', null, 'Guest links'),
+      h('p', { class: 'small muted' }, 'Pages under your domain that guests may open as well. They appear on the guests’ portal page. ' +
+        'After a change, apply the gateway file on the gateway. A page that loads files from elsewhere on its website may need the whole website.'),
+      list, h('div', null, h('button', { class: 'btn', type: 'button', onClick: () => add() }, 'Add link'))),
+    collect: () => rows.filter(row => row.url.value.trim())
+      .map(row => ({ url: row.url.value.trim(), whole_site: row.scope.value === 'site' })),
+  };
 }
 
 // Additional websites on the gateway. Off: the gateway keeps its own list.

@@ -120,7 +120,7 @@ def test_guest_relay_policy_is_the_portal_only(config, monkeypatch):
     db = SavedSettings(apple_relay={"enabled": True, "url": "https://relay.example.test"}, **{"relay_client:alice": {"secret": "token", "serial": "01"}})
     policy = relay.authorize(db, "Bearer alice:token")
     assert policy["guest"] and policy["allowed_cidrs"] == []
-    assert policy["portal"] == {"host": "vpn.example.test", "target": "192.0.2.10:9443"}
+    assert policy["portal"] == {"host": "vpn.example.test", "target": "192.0.2.10:9443", "hosts": []}
     guest["value"] = False
     policy = relay.authorize(db, "Bearer alice:token")
     assert policy["allowed_cidrs"] == ["0.0.0.0/0", "::/0"] and policy["portal"] is None
@@ -218,3 +218,28 @@ def test_existing_vpn_endpoint_can_prefill_domain_without_using_ip_as_domain(con
     config["gateway"] = network.Gateway().model_dump()
     network.save_settings(network.NetworkSettings(**config))
     assert network.get_settings(SavedSettings())["gateway"]["domain"] == domain
+
+
+def test_guest_links_reach_the_gateway_file_relay_and_portal_page(config):
+    config["gateway"]["guest_links"] = [
+        {"url": "https://Files.Example.test/share/abc?x=1", "whole_site": False},
+        {"url": "https://wiki.example.test/start", "whole_site": True},
+        {"url": "https://files.example.test/", "whole_site": False},
+    ]
+    network.save_settings(network.NetworkSettings(**config))
+    assert network.export_gateway()["guest_links"] == [
+        {"host": "files.example.test", "path": "/share/abc"}, {"host": "wiki.example.test", "path": "/"},
+        {"host": "files.example.test", "path": "/"}]
+    assert network.guest_portal()["hosts"] == ["files.example.test", "wiki.example.test"]
+    assert network.guest_links()[0] == "https://files.example.test/share/abc?x=1"
+
+
+@pytest.mark.parametrize("url", [
+    "http://files.example.test/", "https://files.example.test:8443/", "https://user:pw@files.example.test/",
+    "https://other.test/", "https://example.test/", "https://vpn.example.test/portal", "https://dashboard.example.test/",
+    "https://relay.example.test/", "https://files.example.test/{{x}}", "not a url",
+])
+def test_invalid_guest_links_are_refused(config, url):
+    config["gateway"]["guest_links"] = [{"url": url}]
+    with pytest.raises(pki.PkiError, match="Guest link"):
+        network.save_settings(network.NetworkSettings(**config))

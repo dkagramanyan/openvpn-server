@@ -17,7 +17,7 @@ SHOTS = os.environ.get('SCREENSHOT_DIR', '/tmp')
 BASE_NETWORK = dict(vpn_subnet='10.8.0.0/24', pool_first='10.8.0.2', pool_last='10.8.0.99', guest_subnet='10.8.0.128/25',
     dns_servers=['1.1.1.1'], routes=[], proxy_cidrs=['127.0.0.1/32'],
     gateway=dict(domain='example.test', openvpn_host='openvpn.example.test', openvpn_backend='', relay_host='example.test',
-        relay_backend='', relay_public_url='https://example.test:9444', portal_listener='', trusted_cidrs=['192.0.2.0/24'],
+        relay_backend='', relay_public_url='https://example.test:9444', portal_listener='', trusted_cidrs=['192.0.2.0/24'], guest_links=[],
         services=[], replace_services=False))
 
 
@@ -65,7 +65,7 @@ def scenario(browser, portal=False):
                     '/api/portal/me':dict(username='alice-login',role='client',client_name='alice'),
                     '/api/settings':dict(remote=dict(host='example.test',remotes=[dict(proto='udp',port=21197),dict(proto='tcp',port=21196)]),listen=[dict(proto='udp',port=1197),dict(proto='tcp',port=1196)],tfa_issuer='OpenVPN',poll_interval=5,version='test'),
                     '/api/relay/settings':relay, '/api/network/settings':network,
-                    '/api/portal':dict(name='alice',guest=True,expires_at=1900000000,relay_available=True,signed_profiles=True,relay_download=dict(url='/api/portal/relay.mobileconfig',csrf='session-bound-test-token')),
+                    '/api/portal':dict(name='alice',guest=True,links=['https://files.example.test/share/abc'],expires_at=1900000000,relay_available=True,signed_profiles=True,relay_download=dict(url='/api/portal/relay.mobileconfig',csrf='session-bound-test-token')),
                 }
                 result = data.get(path,{})
             route.fulfill(content_type='application/json',body=json.dumps(result))
@@ -85,6 +85,7 @@ def scenario(browser, portal=False):
         assert download.value.suggested_filename=='alice-relay.mobileconfig'
         assert native==[('POST', {'csrf':['session-bound-test-token']})]
         page.get_by_text('Guest access',exact=True).wait_for()
+        assert page.get_by_role('link',name='https://files.example.test/share/abc',exact=True).count()==1
         page.get_by_text('My relay activity',exact=True).click()
         page.get_by_text('Your connection activity cannot be loaded right now.',exact=False).wait_for()
         assert page.get_by_text('Forbidden',exact=True).count()==0
@@ -110,6 +111,9 @@ def scenario(browser, portal=False):
         page.get_by_role('button',name='Detect addresses',exact=True).click()
         page.get_by_text('Nothing was changed',exact=False).wait_for()
         assert web.input_value()=='http://192.0.2.99:8088'
+        page.get_by_role('button',name='Add link',exact=True).click()
+        page.get_by_label('Guest link',exact=True).fill('https://wiki.example.test/start')
+        page.get_by_label('What the link allows',exact=True).select_option('site')
         # An empty field uses the value shown as its placeholder.
         page.get_by_label('This server’s relay address',exact=True).fill('')
         assert page.get_by_label('This server’s relay address',exact=True).get_attribute('placeholder')=='192.0.2.99:8444'
@@ -126,6 +130,7 @@ def scenario(browser, portal=False):
         assert body['gateway']['portal_listener']=='192.0.2.10:9443'
         assert body['gateway']['openvpn_backend']=='http://192.0.2.99:8088'
         assert body['gateway']['replace_services'] is False and body['gateway']['services']==[]
+        assert body['gateway']['guest_links']==[{'url':'https://wiki.example.test/start','whole_site':True}]
         assert data['version']==2 and data['portal_listener']=='192.0.2.10:9443'
         page.screenshot(path=os.path.join(SHOTS,'settings-desktop.png'),full_page=True)
         page.set_viewport_size({'width':390,'height':844})

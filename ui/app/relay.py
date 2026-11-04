@@ -138,9 +138,9 @@ def profile(db, name: str) -> bytes:
     url_key = "HTTP2RelayURL" if config["transport"] == "http2" else "HTTP3RelayURL"
     relay.update({"Relays": [{url_key: config["url"] + "/.well-known/masque/udp/{target_host}/{target_port}/",
                               "AdditionalHTTPHeaderFields": {"Authorization": "Bearer " + token}}],
-                  # Guests send only the portal through the relay; their other traffic stays
+                  # Guests send only the portal and their links through the relay; the rest stays
                   # on the device's own connection. Full access routes everything.
-                  "MatchDomains": [portal["host"]] if guest else []})
+                  "MatchDomains": [portal["host"], *portal["hosts"]] if guest else []})
     result = payload("Configuration", "", title)
     result.update({"PayloadContent": [relay], "PayloadDescription":
                    ("Guest access to your personal portal page only. " if guest else "Internet and LAN access through your server. ")

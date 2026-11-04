@@ -203,9 +203,15 @@ def cookie_secure(request: Request) -> bool:
     return request.url.scheme == "https"
 
 
+def portal_only(request: Request) -> bool:
+    """A request through the gateway's guest portal listener (the gateway sets this header)."""
+    return request.headers.get("x-openvpn-portal-only") == "1"
+
+
 def signed_in_user(request: Request) -> dict[str, Any]:
     user = auth.get_session_user(db, request.cookies.get(COOKIE), settings.session_ttl)
-    if user is None:
+    # The guest portal listener is for client accounts only.
+    if user is None or (user["role"] == "admin" and portal_only(request)):
         raise HTTPException(401, "Not authenticated")
     if user["role"] == "client":
         cert = relay.eligible(user["client_name"])
@@ -434,6 +440,9 @@ def event(kind: str, user: dict[str, Any] | None, client: str | None = None, det
 
 
 # -- auth endpoints -------------------------------------------------------------
+# One sign-in for administrators and client accounts; the answer's "role" tells
+# the page which view to show. /api/portal/login is the same endpoint under the
+# path the guest portal listener lets through, where administrators are refused.
 @app.post("/api/login", dependencies=[Csrf])
 @app.post("/api/portal/login", dependencies=[Csrf])
 def login(body: LoginBody, request: Request, response: Response):
@@ -449,8 +458,8 @@ def login(body: LoginBody, request: Request, response: Response):
     if row is not None and row["client_name"] is not None:
         cert = relay.eligible(row["client_name"])
         valid_client = bool(cert and cert["serial"] == row["client_serial"])
-    portal_admin = request.url.path == "/api/portal/login" and row is not None and row["client_name"] is None
-    if row is None or not auth.verify_password(body.password, row["password_hash"]) or not valid_client or portal_admin:
+    admin_on_guest_listener = row is not None and row["client_name"] is None and portal_only(request)
+    if row is None or not auth.verify_password(body.password, row["password_hash"]) or not valid_client or admin_on_guest_listener:
         db.add_event("login_failed", None, body.username[:64], ip)
         raise HTTPException(401, "Invalid username or password")
     limiter.success(ip)
@@ -546,7 +555,9 @@ def own_profile_info(request: Request, user: dict[str, Any] = SignedIn):
     cert = relay.eligible(user["client_name"])
     if not cert:
         raise HTTPException(401, "Client access is no longer valid")
-    return {"name": user["client_name"], "guest": relay.is_guest(user["client_name"]), "expires_at": cert["not_after"],
+    guest = relay.is_guest(user["client_name"])
+    return {"name": user["client_name"], "guest": guest, "expires_at": cert["not_after"],
+            "links": network.guest_links() if guest else [],
             "relay_available": relay.get_settings(db)["enabled"], "signed_profiles": bool(relay_services.signing_config(db)["url"]),
             "relay_download": {"url": "/api/portal/relay.mobileconfig", "csrf": profile_download_token(request, "/api/portal/relay.mobileconfig")}}
 

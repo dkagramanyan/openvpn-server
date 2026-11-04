@@ -244,6 +244,9 @@ function render() {
   const app = $('#app');
   app.replaceChildren();
   if (!state.user) { app.append(loginView()); return; }
+  // Each account gets its own page: administrators the admin UI, clients /portal.
+  if (portalMode && state.user.role === 'admin') { location.replace('/'); return; }
+  if (!portalMode && state.user.role === 'client') history.replaceState(null, '', '/portal');
   if (portalMode || state.user.role === 'client') {
     closeStream();
     app.append(h('main', { class: 'main', id: 'view', style: 'margin-left:0;max-width:1000px;margin-right:auto' }));
@@ -414,6 +417,8 @@ function tile(label, value, sub, spark) {
 }
 
 /* ---------------------------------------------------------------- login */
+// One sign-in for administrators and client accounts. On /portal it uses the
+// portal path, the only one the guest portal listener lets through.
 function loginView() {
   const err = h('div', { class: 'err' });
   const user = h('input', { class: 'input', name: 'username', autocomplete: 'username', required: true, autofocus: true });
@@ -421,11 +426,15 @@ function loginView() {
   const btn = h('button', { class: 'btn primary', type: 'submit', style: 'width:100%;justify-content:center;padding:9px' }, 'Sign in');
   const form = h('form', { class: 'form', onSubmit: async e => {
     e.preventDefault(); err.textContent = ''; btn.disabled = true;
-    try { state.user = await api(portalMode ? '/api/portal/login' : '/api/login', { method: 'POST', body: { username: user.value.trim(), password: pass.value }, allow401: true }); render(); }
-    catch (ex) { err.textContent = ex.message; } finally { btn.disabled = false; }
+    try {
+      const body = { username: user.value.trim(), password: pass.value };
+      state.user = await api(portalMode ? '/api/portal/login' : '/api/login', { method: 'POST', body, allow401: true });
+      render();
+    } catch (ex) { err.textContent = ex.message; } finally { btn.disabled = false; }
   } }, field('Username', user), field('Password', pass), err, btn);
   return h('div', { class: 'login' }, h('div', { class: 'card' },
     h('div', { class: 'brand' }, h('div', { class: 'logo' }, svg('svg', { viewBox: '0 0 24 24' }, svg('path', { d: 'M12 2a7 7 0 0 0-3.5 13.06V20h7v-4.94A7 7 0 0 0 12 2z' }))), 'OpenVPN'),
+    h('p', { class: 'small muted' }, 'Administrators and VPN users sign in here.'),
     form));
 }
 

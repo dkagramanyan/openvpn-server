@@ -28,7 +28,7 @@ function connectCard(profile) {
   const downloadError = h('div', { class: 'notice', role: 'alert', hidden: true });
   const showError = error => { downloadError.hidden = false; downloadError.textContent = error.message; };
   const access = profile.guest
-    ? ['Guest access', 'Your profiles open only this page. They do not give internet or local network access.']
+    ? ['Guest access', (profile.links || []).length ? 'Your profiles open only this page and the pages listed below. They do not give internet or local network access.' : 'Your profiles open only this page. They do not give internet or local network access.']
     : ['Full access', 'Internet and local network access through this server.'];
 
   const appleMethod = h('details', { class: 'connection-method', open: apple },
@@ -56,8 +56,12 @@ function connectCard(profile) {
       ]),
       h('a', { class: 'btn primary', href: '/api/portal/ovpn', download: profile.name + '.ovpn' }, icon('download'), 'Download OpenVPN profile')));
 
+  const links = profile.links && profile.links.length ? h('div', { class: 'stack' },
+    h('strong', null, 'Pages you can open'),
+    h('ul', { class: 'guest-links' }, profile.links.map(url => h('li', null, h('a', { href: url, target: '_blank', rel: 'noopener' }, url))))) : null;
   return card('Connect your device', h('div', { class: 'stack' },
     h('div', { class: 'access-summary' }, h('strong', null, access[0]), h('span', { class: 'small muted' }, access[1])),
+    links,
     h('p', null, 'Choose one method. An installed profile keeps working; you only need to download it again if your administrator asks you to.'),
     appleMethod, openvpnMethod,
     h('span', { class: 'small muted' }, `Personal profile ${profile.name} · valid until ${fmtDate(profile.expires_at)}`)));

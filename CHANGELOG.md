@@ -1,6 +1,17 @@
 <!-- Network addresses in examples are synthetic; deployment-specific notes are omitted. -->
 # Changelog
 
+## 2.1.0 - 2026-11-04
+
+* **One sign-in for administrators and clients**, at `/` and `/portal`; each
+  account lands on its own page. Administrator accounts still cannot sign in
+  (or use a session) through the guest portal listener.
+* **Guest links**: Settings → Network → Guests takes pages under your domain
+  that guests may open besides their portal, each as "this page and below" or
+  "the whole website". They reach the relay policy, the guest relay profiles
+  (`MatchDomains`), the guests' portal page and the gateway file (`guest_links`).
+* The sign-in page showed no title on phones.
+
 ## 2.0.0 - 2026-11-04
 
 A large release: PostgreSQL, the Apple Network Relay, a personal portal for

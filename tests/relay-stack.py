@@ -176,6 +176,11 @@ http:
       service: ui
       middlewares: [portal-boundary]
       tls: {}
+    guest-link:
+      entryPoints: [portal]
+      rule: "Host(`files.example.test`) && PathPrefix(`/share/`)"
+      service: ui
+      tls: {}
     signer:
       entryPoints: [websecure]
       rule: "Host(`traefik`) && Path(`/internal/relay-sign`)"
@@ -264,7 +269,8 @@ tls:
         # Guests reach the UI's portal pages through the gateway's portal listener.
         gateway_ip = json.loads(command("docker", "inspect", proxy))[0]["NetworkSettings"]["Networks"][network]["IPAddress"]
         network_settings = json.loads(api("/api/network/settings"))
-        network_settings["gateway"].update(domain="example.test", openvpn_host="openvpn.example.test", portal_listener=gateway_ip + ":9443")
+        network_settings["gateway"].update(domain="example.test", openvpn_host="openvpn.example.test", portal_listener=gateway_ip + ":9443",
+                                           guest_links=[{"url": "https://files.example.test/share/", "whole_site": False}])
         api("/api/network/settings", network_settings, "PUT")
         try:
             api("/api/clients/alice/relay.mobileconfig", {}, "POST")
@@ -341,12 +347,17 @@ tls:
         hidden = subprocess.run([*[x for x in curl if x != "--fail"], *inner_tls, "--output", "/dev/null", "--write-out", "%{http_code}",
                                  "https://openvpn.example.test/api/clients"], capture_output=True, text=True)
         assert hidden.stdout.endswith("404"), hidden.stdout
-        print("PASS: a relay guest reaches only the portal pages: no LAN, no internet, no admin API")
+        # A guest link reaches its route on the portal listener; another hostname is refused by the relay.
+        status = lambda url: subprocess.run([*[x for x in curl if x not in ("--fail", "%{http_connect}", "--write-out")], *inner_tls,
+                                             "--output", "/dev/null", "--write-out", "%{http_code}", url], capture_output=True, text=True).stdout
+        assert status("https://files.example.test/share/x") == "404"   # answered by the backend behind the link route
+        assert status("https://grafana.example.test/") == "000"        # CONNECT refused
+        print("PASS: a relay guest reaches only the portal pages and guest links: no LAN, no internet, no admin API")
         guest_signed = api("/api/clients/alice/relay.mobileconfig", {}, "POST")
         guest_xml = command("openssl", "cms", "-verify", "-binary", "-inform", "DER", "-purpose", "any", data=guest_signed, env=env)
         guest_payload = plistlib.loads(guest_xml.encode())["PayloadContent"][0]
         assert token == guest_payload["Relays"][0]["AdditionalHTTPHeaderFields"]["Authorization"]
-        assert guest_payload["MatchDomains"] == ["openvpn.example.test"]
+        assert guest_payload["MatchDomains"] == ["openvpn.example.test", "files.example.test"]
         api("/api/clients/alice/access", {"guest": False}, "PUT")
         time.sleep(2)
         assert "OpenVPN" in command(*curl, "http://" + address + ":8080/")

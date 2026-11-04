@@ -21,8 +21,8 @@ func TestGuestReachesOnlyThePortal(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := &relayServer{}
-	p := policy{Portal: &portalConfig{Host: "openvpn.example.test", Target: portal.target.String()}, Guest: true}
-	for _, target := range []string{"openvpn.example.test:443", "OPENVPN.EXAMPLE.TEST.:443"} {
+	p := policy{Portal: &portalConfig{Host: "openvpn.example.test", Target: portal.target.String(), Hosts: []string{"files.example.test"}}, Guest: true}
+	for _, target := range []string{"openvpn.example.test:443", "OPENVPN.EXAMPLE.TEST.:443", "files.example.test:443"} {
 		ctx, addresses, err := s.resolveDestination(context.Background(), target, p, true)
 		if err != nil || len(addresses) != 1 || addresses[0] != portal.target || !s.portalFlow(ctx, portal.target.Addr(), p) {
 			t.Fatalf("portal %s: %v %v", target, addresses, err)
@@ -32,7 +32,7 @@ func TestGuestReachesOnlyThePortal(t *testing.T) {
 		}
 	}
 	// No internet, no LAN, no other port or protocol, not even the portal's own addresses.
-	for _, target := range []string{"example.com:443", "8.8.8.8:443", "192.0.2.13:443", "192.0.2.13:9443", "openvpn.example.test:80", "openvpn.example.test:8443", "127.0.0.1:443"} {
+	for _, target := range []string{"example.com:443", "8.8.8.8:443", "grafana.example.test:443", "files.example.test:80", "192.0.2.13:443", "192.0.2.13:9443", "openvpn.example.test:80", "openvpn.example.test:8443", "127.0.0.1:443"} {
 		if _, _, err := s.resolveDestination(context.Background(), target, p, true); err == nil {
 			t.Fatalf("guest allowed %s", target)
 		}
@@ -63,6 +63,9 @@ func TestGuestPortalConfiguration(t *testing.T) {
 	for _, host := range []string{"", "https://openvpn.example.test", "openvpn.example.test:443"} {
 		if _, err := parseGuestPortal(portalConfig{Host: host, Target: "192.0.2.13:9443"}); err == nil {
 			t.Fatalf("accepted host %q", host)
+		}
+		if _, err := parseGuestPortal(portalConfig{Host: "openvpn.example.test", Target: "192.0.2.13:9443", Hosts: []string{host}}); err == nil {
+			t.Fatalf("accepted link host %q", host)
 		}
 	}
 	p := policy{Guest: true, Portal: &portalConfig{Host: "openvpn.example.test", Target: "bad"}}

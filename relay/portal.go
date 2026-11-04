@@ -8,12 +8,12 @@ import (
 	"strings"
 )
 
-// Guests may reach exactly one destination: the personal portal, through the
-// gateway's dedicated portal listener. That listener serves only the portal
-// pages of the OpenVPN website, so a guest never reaches the regular HTTPS
-// listener, where the relay's LAN source address would count as trusted.
+// Guests may reach only the gateway's guest portal listener: the personal
+// portal plus the guest links the administrator added. That listener serves
+// nothing else, so a guest never reaches the regular HTTPS listener, where the
+// relay's LAN source address would count as trusted.
 type guestPortal struct {
-	host   string
+	hosts  map[string]bool // the portal hostname and the guest links' hostnames
 	target netip.AddrPort
 }
 
@@ -21,25 +21,33 @@ type portalFlowKey struct{}
 
 // portalConfig is the "portal" object of a guest's policy.
 type portalConfig struct {
-	Host   string `json:"host"`
-	Target string `json:"target"`
+	Host   string   `json:"host"`
+	Target string   `json:"target"`
+	Hosts  []string `json:"hosts"` // guest links
 }
 
+func normalHost(host string) string { return strings.ToLower(strings.TrimSuffix(host, ".")) }
+
 func parseGuestPortal(c portalConfig) (*guestPortal, error) {
-	host := strings.ToLower(strings.TrimSuffix(c.Host, "."))
-	if host == "" || strings.ContainsAny(host, ":/ \\?#@\t\r\n") {
-		return nil, fmt.Errorf("portal host must be a hostname without scheme or port")
-	}
 	target, err := netip.ParseAddrPort(c.Target)
 	if err != nil || !target.Addr().Is4() || !target.Addr().IsGlobalUnicast() || target.Port() < 1024 {
 		return nil, fmt.Errorf("portal target must be the gateway's portal listener IPv4:port (port >= 1024)")
 	}
-	return &guestPortal{host: host, target: target}, nil
+	portal := &guestPortal{hosts: map[string]bool{}, target: target}
+	for _, value := range append([]string{c.Host}, c.Hosts...) {
+		host := normalHost(value)
+		if host == "" || strings.ContainsAny(host, ":/ \\?#@\t\r\n") {
+			return nil, fmt.Errorf("portal hosts must be hostnames without scheme or port")
+		}
+		portal.hosts[host] = true
+	}
+	return portal, nil
 }
 
-// resolveDestination returns the addresses a flow may dial. A guest's only
-// destination is the portal host on TCP 443, pinned to the portal listener
-// without DNS; the HTTPS bytes (SNI, Host) pass unchanged to the gateway.
+// resolveDestination returns the addresses a flow may dial. A guest may open
+// only the portal and guest-link hostnames on TCP 443, pinned to the portal
+// listener without DNS; the HTTPS bytes (SNI, Host) pass unchanged to the
+// gateway, which routes only those hostnames (and the links' paths).
 func (s *relayServer) resolveDestination(ctx context.Context, target string, p policy, tcp bool) (context.Context, []netip.AddrPort, error) {
 	if !p.compiled {
 		if err := p.compile(); err != nil {
@@ -54,7 +62,7 @@ func (s *relayServer) resolveDestination(ctx context.Context, target string, p p
 	if err != nil {
 		return ctx, nil, errInvalidTarget
 	}
-	if p.portal == nil || !tcp || port != "443" || !strings.EqualFold(strings.TrimSuffix(host, "."), p.portal.host) {
+	if p.portal == nil || !tcp || port != "443" || !p.portal.hosts[normalHost(host)] {
 		return ctx, nil, errDestinationDenied
 	}
 	ctx = context.WithValue(ctx, portalFlowKey{}, p.portal.target)

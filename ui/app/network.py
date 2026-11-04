@@ -11,7 +11,7 @@ import json
 import os
 import re
 import shlex
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -35,6 +35,12 @@ class Service(BaseModel):
     insecure_tls: bool = False
 
 
+class GuestLink(BaseModel):
+    """A page on one of the gateway's websites that guests may open besides their portal."""
+    url: str = Field(max_length=2048)
+    whole_site: bool = False      # False: only the link's path and below
+
+
 class Gateway(BaseModel):
     """What the Traefik gateway needs to know; exported as network.private.json."""
     domain: str = ""
@@ -45,6 +51,7 @@ class Gateway(BaseModel):
     relay_public_url: str = ""
     portal_listener: str = ""     # the gateway's guest portal listener, LAN IPv4:port; empty = guests reach nothing
     trusted_cidrs: list[str] = Field(default_factory=list, max_length=100)   # empty keeps the gateway's own list
+    guest_links: list[GuestLink] = Field(default_factory=list, max_length=50)
     replace_services: bool = False
     services: list[Service] = Field(default_factory=list, max_length=100)
 
@@ -202,15 +209,32 @@ def get_settings(db=None) -> dict:
     return with_defaults(data, db)
 
 
+def link_rule(link: dict) -> dict:
+    """{"host", "path"} a guest link opens on the gateway; path "/" is the whole site."""
+    url = urlsplit(link["url"])
+    return {"host": url.hostname, "path": "/" if link["whole_site"] else url.path or "/"}
+
+
 def guest_portal() -> dict | None:
-    """{"host", "target"} of the personal portal for guests, or None when not set up."""
+    """What guests may reach, or None when no portal listener is set.
+
+    {"host": the portal hostname, "target": the gateway's portal listener,
+     "hosts": hostnames of the guest links}; all of them go to the listener.
+    """
     saved = settings.read_network()
     if not saved:
         return None
     gateway = NetworkSettings(**saved).gateway
     if not gateway.openvpn_host or not gateway.portal_listener:
         return None
-    return {"host": gateway.openvpn_host, "target": gateway.portal_listener}
+    hosts = sorted({link_rule(link.model_dump())["host"] for link in gateway.guest_links})
+    return {"host": gateway.openvpn_host, "target": gateway.portal_listener, "hosts": hosts}
+
+
+def guest_links() -> list[str]:
+    """The guest links' URLs, for the guests' portal page."""
+    saved = settings.read_network()
+    return [link.url for link in NetworkSettings(**saved).gateway.guest_links] if saved else []
 
 
 # -- validation and saving ------------------------------------------------------------
@@ -266,6 +290,8 @@ def validate_gateway(gateway: dict) -> None:
             raise PkiError("Set the website hostname before the guest portal listener")
     gateway["trusted_cidrs"] = cidrs(gateway["trusted_cidrs"])
     reserved = {gateway["openvpn_host"], "dashboard." + gateway["domain"]}
+    for link in gateway["guest_links"]:
+        validate_guest_link(link, gateway["domain"], reserved | {gateway["relay_host"]})
     names = set()
     for service in gateway["services"]:
         if not re.fullmatch(r"[a-z][a-z0-9-]{0,39}", service["name"]) or service["name"] in names:
@@ -279,6 +305,22 @@ def validate_gateway(gateway: dict) -> None:
             raise PkiError("Service paths must start with / and contain no whitespace or template characters")
     if gateway["services"]:
         gateway["replace_services"] = True
+
+
+def validate_guest_link(link: dict, domain: str, reserved: set[str]) -> None:
+    raw = link["url"].strip()
+    try:
+        url = urlsplit(raw)
+        host = hostname(url.hostname or "")
+        if url.scheme != "https" or url.port not in (None, 443) or url.username or url.password or UNSAFE.search(raw):
+            raise ValueError
+    except (ValueError, PkiError):
+        raise PkiError(f"Guest link {raw!r}: enter an https:// address without a port or credentials") from None
+    if not domain or not host.endswith("." + domain):
+        raise PkiError(f"Guest link {raw!r}: only websites under your domain ({domain or 'not set'}) can be opened by guests")
+    if host in reserved:
+        raise PkiError(f"Guest link {raw!r}: this hostname cannot be a guest link")
+    link["url"] = urlunsplit(("https", host, url.path or "/", url.query, url.fragment))
 
 
 def validate(body: NetworkSettings) -> dict:
@@ -350,6 +392,7 @@ def export_gateway(db=None) -> dict:
     return {"version": EXPORT_VERSION,
             **{key: gateway[key] for key in ("domain", "openvpn_host", "openvpn_backend", "relay_host",
                                              "relay_backend", "relay_public_url", "portal_listener", "trusted_cidrs")},
+            "guest_links": [link_rule(link) for link in gateway["guest_links"]],
             # None keeps the gateway's existing additional services.
             "services": gateway["services"] if gateway["replace_services"] else None}
 

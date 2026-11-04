@@ -80,15 +80,15 @@ hands it a settings file (see [Network settings](#network-settings-and-the-gatew
 ## Guests: the personal portal only
 
 A client is either **full access** (internet, LAN, this server) or **guest**.
-A guest, over OpenVPN or the Apple relay, reaches exactly one page: its
-personal portal at `https://openvpn.<domain>/portal`, to change its password
-and download its profiles. No internet, no LAN, no other website, no
+A guest, over OpenVPN or the Apple relay, reaches its personal portal at
+`https://openvpn.<domain>/portal` (password, profile downloads) and the
+**guest links** you allow. No internet, no LAN, no other website, no
 administrator page.
 
 | | OpenVPN | Apple relay |
 |---|---|---|
 | Full access | everything: internet, LAN, this server | everything: internet and LAN |
-| Guest | the pushed DNS servers + the portal | the portal |
+| Guest | the pushed DNS servers + the portal and guest links | the portal and guest links |
 
 How it is enforced:
 
@@ -97,15 +97,26 @@ How it is enforced:
   the gateway's portal listener (`bin/guest-portal.sh`). Everything else from
   the guest subnet is dropped. So the portal opens whatever address a guest's
   DNS returns for `openvpn.<domain>`, and every other HTTPS site fails.
-* **Relay guests**: the relay accepts only `openvpn.<domain>:443` and connects
-  it straight to the portal listener; every other destination is refused. A
-  guest's relay profile routes only that hostname through the relay, so the
-  device keeps its own internet connection while the profile is installed.
+* **Relay guests**: the relay accepts only `openvpn.<domain>:443` and the guest
+  links' hostnames on 443, and connects them straight to the portal listener;
+  every other destination is refused. A guest's relay profile routes only those
+  hostnames through the relay, so the device keeps its own internet connection
+  while the profile is installed.
 * **The portal listener** (Traefik entrypoint `portal`, normally the gateway's
   LAN address, port 9443) serves only the OpenVPN website and adds
   `X-OpenVPN-Portal-Only: 1`; with it, the UI answers only `/portal`,
   `/api/portal/*` and `/static/*` (`/` redirects to `/portal`, the rest is 404),
   even for a browser holding an administrator cookie.
+
+**Guest links** (Settings → Network → Guests) are pages on websites under your
+domain that the gateway already serves, e.g. `https://files.<domain>/share/abc`.
+Each link allows either *this page and below* (`/share/abc`, `/share/abc/...`)
+or *the whole website*. The gateway adds a route for each link on the portal
+listener, using the backend of its existing route for that hostname; guests see
+the links on their portal page. Add a link, download the gateway file and apply
+it on the gateway; the relay picks it up within seconds, guest relay profiles
+need a new download. A page that loads scripts or images from elsewhere on its
+website may need the whole website.
 
 Without a portal listener in Settings, guests reach nothing at all (DNS only).
 Changing a client between guest and full access applies to OpenVPN on the next
@@ -119,7 +130,7 @@ because the two roles route different traffic.
 * **Public addresses** - domain, website hostname (`openvpn.<domain>`), the
   address and ports in VPN profiles, the Apple relay URL and whether relay
   profiles are offered. Empty fields use the value shown in grey.
-* **Guests** - the gateway's portal listener (`<gateway LAN IP>:9443`).
+* **Guests** - the gateway's portal listener (`<gateway LAN IP>:9443`) and the guest links.
 * **Gateway** - this server's web and relay addresses as the gateway reaches
   them, and the gateway's own source addresses (trusted for `X-Forwarded-For`).
   **Detect addresses** suggests them from this server's interfaces, the proxy
@@ -209,14 +220,15 @@ docker compose exec -T apple-relay wget -qO- http://127.0.0.1:8446/readyz
 `bin/export-relay-cert.py`), UDP 8443 forwarded to this server, then
 `docker compose up -d --build` and new profiles.
 
-## Personal portal
+## Sign-in and the personal portal
 
-Give a client a portal login under **Clients → client → Portal access**. The
-client signs in at `https://openvpn.<domain>/portal` and sees step-by-step
+Administrators and clients use the same sign-in form, at `/` or `/portal`;
+each lands on its own page. Give a client a login under **Clients → client →
+Portal access**. The client signs in and sees step-by-step
 instructions for Apple relay and OpenVPN, its own relay activity, and a
 password form. It cannot see other clients, settings or logs; every
-administrator API refuses a portal session, and the admin login refuses portal
-accounts. A login stays bound to the client's current certificate:
+administrator API refuses a portal session. On the guest portal listener
+administrator accounts cannot sign in at all. A login stays bound to the client's current certificate:
 revocation, expiry or deletion ends it, a renewal through the UI keeps it.
 Portal passwords are separate from profile passphrases and TOTP codes.
 
