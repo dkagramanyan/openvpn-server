@@ -482,11 +482,13 @@ function portalView(el) {
         h('div', { class: 'stack' },
           h('p', null, 'Connect using the relay built into your Apple device. Open this page in Safari to install the profile.'),
           steps([
-            'Download your personal Apple relay profile below. Tap Allow when Safari asks.',
+            h('div', { class: 'stack' },
+              h('span', null, 'Download your personal Apple relay profile. Tap Allow when Safari asks.'),
+              relayButton(profile, false, true, error => { downloadMessage.hidden = false; downloadMessage.textContent = error.message; }),
+              downloadMessage),
             'Open Settings → General → VPN & Device Management, select the downloaded profile, then tap Install.',
             'Follow the on-screen prompts, then open a website to check your connection.',
           ]),
-          downloadMessage, relayButton(profile, false, true, error => { downloadMessage.hidden = false; downloadMessage.textContent = error.message; }),
           !profile.relay_available ? h('p', { class: 'small muted' }, 'Apple relay is not enabled for this server yet. Ask your administrator, or use OpenVPN below.') : null,
           h('a', { href: 'https://support.apple.com/102400', target: '_blank', rel: 'noopener' }, 'Apple’s profile installation guide')));
       const vpnSteps = h('details', { class: 'connection-method', open: !apple },
