@@ -100,25 +100,26 @@ def scenario(browser, portal=False):
         assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
         page.screenshot(path='/tmp/ovpn-portal-guided-mobile.png',full_page=True)
     else:
-        page.get_by_role('heading',name='Public connection addresses',exact=True).wait_for()
+        page.get_by_role('heading',name='Connection settings',exact=True).wait_for()
         page.get_by_text('VPN server: 192.0.2.20',exact=False).wait_for()
         assert page.get_by_label('VPN server web address',exact=True).input_value()=='http://192.0.2.20:8080'
         assert page.get_by_label('Dedicated portal listener',exact=True).input_value()=='192.0.2.10:9443'
         assert page.get_by_label('Portal DNS IPv4 addresses',exact=True).input_value()=='192.0.2.10, 198.51.100.10'
         assert '192.0.2.10/32' in page.get_by_label('Trusted reverse proxy CIDRs',exact=True).input_value()
+        page.get_by_text('Advanced settings',exact=True).click()
+        page.get_by_text('Server and gateway addresses',exact=True).click()
         page.get_by_label('VPN server web address',exact=True).fill('http://192.0.2.99:8088')
         page.get_by_role('button',name='Detect addresses',exact=True).click()
         page.get_by_text('VPN server: 192.0.2.20',exact=False).wait_for()
         assert page.get_by_label('VPN server web address',exact=True).input_value()=='http://192.0.2.99:8088'
-        page.get_by_label('Allow guests to use the private portal',exact=True).check()
+        page.get_by_label('Allow guests to use the OpenVPN website',exact=True).check()
         with page.expect_download() as simple_download:
             page.get_by_role('button',name='Save and download Traefik settings',exact=True).click()
         simple=json.loads(Path(simple_download.value.path()).read_text())
-        assert simple['portal']['target']=='' and simple['portal']['destinations']==[]
+        assert simple['portal']['target']=='192.0.2.10:9443' and simple['portal']['destinations']==['192.0.2.10','198.51.100.10']
         assert '10.8.0.128/25' in simple['gateway']['portal_cidrs']
         assert '10.8.0.128/25' not in simple['gateway']['trusted_cidrs']
-        page.get_by_text('Advanced: routing through guest LAN blocks',exact=True).click()
-        page.get_by_label('Use dedicated portal routing',exact=True).check()
+        page.get_by_text('Private services and website routing',exact=True).click()
         saves_before = len(saved)
         page.get_by_label('Dedicated portal listener',exact=True).fill('missing-port')
         page.get_by_role('button',name='Save settings',exact=True).click()

@@ -111,6 +111,7 @@ func (s *relayServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if flow != nil {
 		flow.event.Client, flow.event.Guest = p.Client, p.Guest
+		flow.identity = p.CredentialID
 	}
 	identity := p.Client
 	if identity == "" {

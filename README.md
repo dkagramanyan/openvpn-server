@@ -243,12 +243,16 @@ guests** in Settings → Network. This block applies
 to both OpenVPN guests and relay guests, including public services sharing
 that address.
 
-An optional [private portal exception](https://github.com/dkagramanyan/traefik#private-portal-for-lan-openvpn-guests-and-apple-relay-guests)
-uses a separate Traefik listener serving only portal paths. Enter the portal hostname, target and DNS addresses in Settings → Network after
-deploying that listener. This does not remove the guest LAN blocks: OpenVPN
-redirects only guest TCP 443 connections to the listed IPv4 destinations, and
-the relay pins only the portal hostname/addresses to that listener. Authentication
-and live relay revocation checks still apply. Clear the portal enable checkbox to disable it.
+The **Allow guests to use the OpenVPN website** setting adds one website
+exception to these LAN blocks. The service suggests the gateway address and
+website DNS answers; editable overrides are under **Advanced settings → Private
+services and website routing**. Export and deploy the gateway file before
+restarting VPN. OpenVPN redirects only guest TCP 443 connections to the listed
+IPv4 destinations, and relay guests use the same isolated website listener.
+The OpenVPN service permits only personal portal pages, downloads and assets on
+this route, including when a browser has an administrator cookie. Other private
+hostnames remain unavailable. Clear the guest website checkbox to disable the
+exception; internet access and full-access clients keep their existing roles.
 
 | Access type | OpenVPN | Apple relay |
 |---|---|---|
@@ -394,16 +398,26 @@ and [profile replacement rules](https://developer.apple.com/documentation/device
 
 ### Relay activity and reliability checks
 
-The **Relay** page groups active connections and recent activity by client
-across all devices. Expand a client to inspect destinations and individual
-results. Summaries show active TCP/UDP counts, accepted flows, denied requests,
-failed connections, traffic and the last issue. TCP and HTTP/2 UDP byte counters
-update during active transfers. HTTP/3 UDP payload bytes remain uncounted and
-are marked as such. Portal users can see their own aggregate activity; another
-client's destinations and signing credentials are never returned to that login.
+The **Relay** page shows sessions first. Short TCP/UDP connections from one
+profile form one visit; five minutes with no open flows starts a new visit.
+Each session shows its start, last activity, status, connection count, blocked
+and failed requests, upload and download totals. Expand it for individual
+connections still present in the relay's recent-event ring. **Individual
+connections and diagnostics** retains the live per-client view.
 
-Counters reset on relay restart. History retains up to 2048 inactive clients
-plus active clients, and details use a 500-event ring. Container logs emit one
+Session summaries are sampled every five seconds into PostgreSQL and retained
+for one year; the latest 200 visits are displayed. They survive service/server
+restarts and are included in backups. A brief relay restart joins the same visit
+when the profile reconnects within five minutes. An abrupt shutdown can lose
+traffic since the last sample. Existing history before this feature cannot be
+reconstructed. Several devices using one profile share its session; a newly
+issued credential with a reused client name cannot inherit another credential's
+personal history. Portal users see only their own saved sessions.
+
+TCP and HTTP/2 UDP counters include active transfers. HTTP/3 UDP payload bytes
+remain uncounted and are marked as such. Raw flow details use a 500-event ring
+and reset on relay restart; cumulative diagnostic counters also reset.
+Container logs emit one
 terminal record per flow, with repeated failure records capped at 20 per second;
 all failures still update counters/the ring. Suppressed-log and transport-error
 counters are available in `/metrics`. Malformed HTTP/2 input is never echoed
@@ -487,37 +501,37 @@ and out of Git. Installed profiles remain valid when the hostname stays the same
 
 ## Private network configuration
 
-Use **Settings → Network and private portal** for public VPN endpoints, relay,
-VPN addressing, DNS, guest blocks, trusted reverse proxies, the portal, and gateway
-services. Set the gateway domain once: VPN profiles and relay use that domain,
-while the website and portal share `openvpn.<domain>`. Existing profile, signing
-and relay URLs prefill the form. The page groups setup into public addresses,
-internal addresses, access/guest portal, and save/apply steps. Custom hostnames
-are available under **Different hostnames**. The relay backend defaults to the
-UI backend host on port 8444. One LAN list supplies VPN and relay guest blocks;
-private-service access networks remain a separate allowlist.
+Use **Settings → Network and private portal** for VPN and relay configuration.
+The normal view has two steps: **Connection settings** and **Apply your changes**.
+Enter your domain once, review the shared website/VPN/relay addresses, enable the
+connection methods you need and choose whether guests can open the OpenVPN
+website. One LAN list blocks private destinations for both guest transports.
+Guests keep internet access; full-access clients keep their existing permissions.
 
-**Detect addresses** reads the VPN server's interfaces, route-selected source
-address, original reverse-proxy peer and portal DNS answers. It prefills empty
-address fields and suggests individual proxy IPs, while preserving entered
-values. Every suggestion stays editable and requires saving. It does not probe
-or change your port forwarding, infer public NAT mappings, or automatically
-grant a detected network access to private services. A separate button allows
-the administrator to add the detected LAN to that allowlist explicitly.
+Custom public hostnames/forwarded ports, backend URLs, trusted proxy sources,
+private-service allowlists, VPN addressing and gateway service inventory are
+under **Advanced settings**. Existing public profile, relay and signing URLs are
+reused. The relay backend defaults to the web backend host on port 8444. The
+layout follows [progressive disclosure](https://www.nngroup.com/articles/progressive-disclosure/)
+and [GOV.UK details guidance](https://design-system.service.gov.uk/components/details/):
+normal choices stay visible and specialist settings expand when needed. Inline
+validation opens any hidden field that requires attention.
 
-For ordinary portal access, enable **Allow guests to use the private portal**
-and export the Traefik settings. The guest subnet is added only to the portal's
-source allowlist; private/admin service networks are kept separate. The default
-portal sources also include the VPN/relay egress IP because Traefik may see that
-address after NAT. No dedicated listener or DNS redirect fields are required.
+**Detect addresses** reads the server's interfaces, route-selected source address,
+original reverse-proxy peer and website DNS answers. Empty address fields are
+prefilled with editable suggestions; entered values are preserved. The suggested
+private website listener uses the gateway IPv4 with port 9443. Detection does not
+probe/change port forwarding or infer public NAT mappings. Private-service
+permissions require an explicit administrator choice.
 
-**Advanced: routing through guest LAN blocks** retains optional dedicated portal
-routing when guests cannot otherwise reach the gateway. Existing dedicated
-settings are preserved. This option can be staged on the gateway before enabling
-its VPN/relay exception. The normal allowlist option does not relax guest LAN
-blocks or add a relay destination exception. Existing additional gateway services
-are preserved unless **Manage and replace the gateway's additional services here**
-is checked.
+Enabling **Allow guests to use the OpenVPN website** exports a website-only
+source allowlist and the isolated listener. The default sources include the
+VPN/relay server's egress IP and guest subnet, separately from private/admin
+service networks. The service owns the restricted route's URL boundary, while
+Traefik supplies TLS, source filtering and forwarding. Certificate renewal and
+profile signing stay on the gateway so its private keys stay there. Existing
+additional gateway services are preserved unless inventory replacement is
+explicitly enabled in Advanced settings.
 
 **Save settings** applies the combined form. VPN profiles regenerate only when
 their endpoint changes. **Save and download Traefik settings** saves current edits
@@ -1041,3 +1055,46 @@ GitHub Actions runs both on every push (`.github/workflows/ci.yml`). A weekly
 job (`upstream.yml`) compares the OpenVPN, easy-rsa and Alpine versions
 pinned in the Dockerfiles with the newest releases and opens an issue when
 one is behind.
+
+## Production update: OpenVPN/relay and Traefik
+
+On the VPN/relay host, update the application first:
+
+```sh
+cd ~/openvpn-server &&
+git pull --ff-only &&
+bin/upgrade-relay.sh --sudo-docker
+```
+
+This builds the UI and relay, upgrades the database schema and recreates the
+application/policy/relay services while preserving profiles and PostgreSQL data.
+It keeps the running OpenVPN container. For the current firewall/website routing
+changes, rebuild OpenVPN as well:
+
+```sh
+sudo docker compose up -d --build openvpn
+sudo docker compose ps
+```
+
+Open Settings, review suggested addresses and guest website access, then use
+**Save and download Traefik settings**. Copy the downloaded `network.private.json`
+into `~/traefik/` on the gateway; it is private deployment data, not a Git file.
+`/path/to/network.private.json` in earlier examples was a placeholder and must be
+replaced by the real downloaded file.
+
+On the Traefik host:
+
+```sh
+cd ~/traefik &&
+git pull --ff-only &&
+test -f ./network.private.json &&
+./manage setup --network-file ./network.private.json &&
+sudo docker compose config --quiet &&
+sudo docker compose up -d --build --remove-orphans
+```
+
+After the gateway listener is deployed, use **Save and restart VPN** to apply
+website exception/firewall changes. VPN clients briefly reconnect. Relay profiles
+already installed on devices remain valid. Session history starts collecting
+when the updated relay and UI run; keep `.env`, PKI, runtime configuration and
+the PostgreSQL volume. Do not remove volumes during an update.

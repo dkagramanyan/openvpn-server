@@ -330,3 +330,8 @@ dialog.modal .m-f { padding: 0 18px 16px; display: flex; gap: 8px; justify-conte
   .portal-content input, .network-settings input { font-size: 16px; }
   .portal-content .btn { min-height: 44px; }
 }
+
+.relay-session { border: 1px solid var(--border); border-radius: 10px; padding: 12px; }
+details.relay-session > summary { cursor: pointer; }
+details.relay-session > summary > div { display: inline-flex; vertical-align: top; }
+details.relay-session[open] > summary { margin-bottom: 12px; }

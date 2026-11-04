@@ -22,11 +22,12 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Str
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import __version__, auth, backup, pki, relay, relay_services, watchdog, network, network_discovery
+from . import __version__, auth, backup, pki, relay, relay_services, relay_history, watchdog, network, network_discovery
 from .collector import Collector, Maintenance
 from .db import Database
 from .mgmt import Management, ManagementError
 from .pki import PkiError
+from .portal_boundary import PortalBoundary
 from .settings import settings
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -47,6 +48,7 @@ mgmt = Management(_mgmt_host, _mgmt_port, settings.management_password)
 collector = Collector(db, mgmt, settings.poll_interval, settings.status_file,
                       (settings.log_dir / "openvpn.log", settings.log_dir / "oath.log"))
 maintenance = Maintenance(db, [lambda: pki.ensure_crl_fresh(), backup.ensure_recent])
+relay_collector = relay_history.RelayCollector(db)
 limiter = auth.LoginLimiter()
 
 
@@ -111,18 +113,21 @@ async def lifespan(_: FastAPI):
                     settings.management_endpoint()[2])
     collector.start()
     maintenance.start()
+    relay_collector.start()
     dog = watchdog.start()
     yield
     if dog:
         dog.stop()
     collector.stop()
     maintenance.stop()
+    relay_collector.stop()
     mgmt.close()
 
 
 app = FastAPI(title="OpenVPN UI", version=__version__, lifespan=lifespan,
               docs_url=None, redoc_url=None, openapi_url=None)
 app.add_middleware(network.NetworkProxyHeaders)
+app.add_middleware(PortalBoundary)
 
 
 @app.middleware("http")
@@ -565,6 +570,7 @@ def own_relay_status(user: dict[str, Any] = SignedIn):
     # Filter again at the trust boundary, even when an older backend ignores
     # the client query. Never send another client's destinations to this login.
     return {"ready": bool(status.get("ready")), "policy_ready": status.get("policy_ready", False),
+            "sessions": relay_history.sessions(db, client=name, credential=relay.credential_id(db, name)),
             **{key: [row for row in status.get(key, []) if row.get("client") == name]
                for key in ("clients", "active", "events")}}
 
@@ -771,7 +777,8 @@ def get_relay_settings(user: dict[str, Any] = Authed):
 
 @app.get("/api/relay/status")
 def relay_status(user: dict[str, Any] = Authed):
-    return relay_services.runtime_status()
+    return {**relay_services.runtime_status(), "sessions": relay_history.sessions(db),
+            "session_idle_seconds": relay_history.IDLE_SECONDS}
 
 
 @app.get("/api/relay/signing")

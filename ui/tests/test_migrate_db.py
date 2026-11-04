@@ -42,10 +42,12 @@ def test_import_preserves_every_table_accounts_credentials_history_and_source(tm
     before = hashlib.sha256(path.read_bytes()).digest()
     db = Database()
     result = import_sqlite(path, db)
-    assert result['verified'] and set(result['imported']) == set(TABLES)
+    legacy_tables = set(TABLES) - {'relay_sessions'}
+    assert result['verified'] and set(result['imported']) == legacy_tables
+    assert db.query('SELECT * FROM relay_sessions') == []
     with sqlite3.connect(path) as source:
         source.row_factory = sqlite3.Row
-        for table in TABLES:
+        for table in legacy_tables:
             rows = [dict(row) for row in source.execute(f'SELECT * FROM {table}')]
             assert result['imported'][table] == len(rows)
             actual = db.query(f'SELECT * FROM {table}' + (" WHERE key NOT LIKE 'migration:%'" if table == 'settings' else ''))
@@ -109,6 +111,10 @@ def test_readonly_sqlite_wal_is_imported_consistently(tmp_path):
 def test_postgres_dump_can_restore_to_empty_database_and_preserves_data(tmp_path):
     db = Database()
     import_sqlite(legacy(tmp_path / 'legacy.db'), db)
+    from app import relay_history
+    relay_history.record(db, {'ready': True, 'sessions': [dict(id='boot:1', client='alice', credential_id='hash',
+        transport='http2', started_at=100, last_seen=200, active=0, accepted=30, denied=1, failed=2,
+        bytes_up=4294967297, bytes_down=8589934593, uncounted_flows=0)]}, now=200)
     dump = tmp_path / 'snapshot.pgdump'
     dump_postgres(dump, db.dsn, db.schema)
     assert dump.stat().st_mode & 0o777 == 0o600

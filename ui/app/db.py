@@ -63,6 +63,25 @@ CREATE TABLE IF NOT EXISTS vpn_sessions (
 );
 CREATE INDEX IF NOT EXISTS vpn_sessions_client ON vpn_sessions (client_name, connected_at);
 CREATE INDEX IF NOT EXISTS vpn_sessions_open   ON vpn_sessions (disconnected_at);
+CREATE TABLE IF NOT EXISTS relay_sessions (
+    id TEXT PRIMARY KEY,
+    grp TEXT NOT NULL,
+    client_name TEXT NOT NULL,
+    credential_id TEXT NOT NULL,
+    transport TEXT NOT NULL,
+    started_at BIGINT NOT NULL,
+    last_seen BIGINT NOT NULL,
+    sampled_at BIGINT NOT NULL,
+    active BIGINT NOT NULL,
+    accepted BIGINT NOT NULL,
+    denied BIGINT NOT NULL,
+    failed BIGINT NOT NULL,
+    bytes_up BIGINT NOT NULL,
+    bytes_down BIGINT NOT NULL,
+    uncounted BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS relay_sessions_client ON relay_sessions (client_name, credential_id, last_seen);
+CREATE INDEX IF NOT EXISTS relay_sessions_grp ON relay_sessions (grp);
 CREATE TABLE IF NOT EXISTS traffic_minute (
     ts          BIGINT NOT NULL,
     client_name TEXT NOT NULL,
@@ -125,7 +144,8 @@ CREATE TABLE IF NOT EXISTS share_tokens (
 _SESSION_COLUMNS = (("proto", "TEXT"), ("platform", "TEXT"), ("client_ver", "TEXT"), ("end_reason", "TEXT"),
                     ("grp", "BIGINT"))
 
-_HISTORY = (("vpn_sessions", "connected_at"), ("traffic_minute", "ts"), ("traffic_hour", "ts"), ("traffic_day", "ts"))
+_HISTORY = (("vpn_sessions", "connected_at"), ("relay_sessions", "started_at"),
+            ("traffic_minute", "ts"), ("traffic_hour", "ts"), ("traffic_day", "ts"))
 
 MINUTE_RETENTION = 2 * 86400      # minute buckets are kept for two days
 HOUR_RETENTION = 90 * 86400       # hourly buckets for 90 days, daily forever

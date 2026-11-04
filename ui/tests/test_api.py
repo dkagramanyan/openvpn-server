@@ -1,5 +1,6 @@
 """End-to-end API tests against a throwaway PKI built with openssl (no easy-rsa needed)."""
 import copy
+import hashlib
 import json
 import plistlib
 import os
@@ -647,7 +648,8 @@ def test_full_access_relay_routes_internet_and_lan(client, configured):
     assert "Internet and LAN" in full_profile["PayloadDescription"]
     policy = client.post("/api/relay/authorize", headers={"Authorization": token}).json()
     assert policy == {"client": "alice", "guest": False, "allowed_cidrs": ["0.0.0.0/0", "::/0"],
-                      "blocked_cidrs": [], "url": configured["url"], "portal": None}
+                      "blocked_cidrs": [], "url": configured["url"], "portal": None,
+                      "credential_id": hashlib.sha256(token.removeprefix("Bearer ").partition(":")[2].encode()).hexdigest()}
     # Legacy split-routing settings cannot diverge from the OpenVPN access role.
     assert client.put("/api/relay/settings", json={**configured, "route_all": False}, headers=H).json()["route_all"] is True
     assert client.post("/api/relay/authorize", headers={"Authorization": token}).json()["allowed_cidrs"] == ["0.0.0.0/0", "::/0"]
@@ -1115,3 +1117,35 @@ def test_network_discovery_is_read_only_admin_only_and_uses_original_peer(client
     assert seen['proxied'] is True
     assert settings.server_conf.read_bytes() == before
     assert response.headers['cache-control'] == 'no-store'
+
+
+def test_restricted_gateway_route_enforces_portal_boundary_even_for_admin(client, portal):
+    restricted = {'X-OpenVPN-Portal-Only': '1'}
+    assert client.get('/', headers=restricted, follow_redirects=False).headers['location'] == '/portal'
+    for path in ('/api/clients', '/api/settings', '/api/relay/status', '/internal/relay-sign', '/portal-admin', '/api/portal-admin'):
+        assert client.get(path, headers=restricted).status_code == 404
+    assert client.get('/api/clients').status_code == 200
+    assert portal.get('/api/portal', headers=restricted).status_code == 200
+    assert portal.get('/api/portal/relay/status', headers=restricted).status_code == 200
+    assert portal.get('/portal', headers=restricted).status_code == 200
+    assert portal.get('/static/app.js', headers=restricted).status_code == 200
+
+
+def test_portal_relay_sessions_are_bound_to_current_credential(client, configured, portal, monkeypatch):
+    from app import relay, relay_history, relay_services
+    from app.main import db
+    download(client)
+    identity = relay.credential_id(db, 'alice')
+    def row(identifier, name, credential):
+        return dict(id=identifier, client=name, credential_id=credential, transport='http2', started_at=100,
+                    last_seen=110, active=0, accepted=4, denied=0, failed=0, bytes_up=10, bytes_down=20, uncounted_flows=0)
+    relay_history.record(db, dict(ready=True, sessions=[row('test:1','alice', identity),
+        row('test:2','alice','previous-profile'), row('test:3','bob','bob-profile')]), now=110)
+    monkeypatch.setattr(relay_services, 'runtime_status', lambda **kwargs: dict(ready=False))
+    try:
+        result = portal.get('/api/portal/relay/status').json()
+        assert [entry['id'] for entry in result['sessions']] == ['test:1']
+        assert 'credential_id' not in json.dumps(result)
+        assert 'bob' not in json.dumps(result)
+    finally:
+        db.execute("DELETE FROM relay_sessions WHERE id LIKE 'test:%'")

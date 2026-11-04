@@ -14,31 +14,36 @@ import (
 )
 
 type activityLog struct {
-	mu             sync.Mutex
-	started        int64
-	transport      string
-	reasons        map[string]uint64
-	bytesUp        int64
-	bytesDown      int64
-	tcpUp          int64
-	tcpDown        int64
-	runtime        *relayMetrics
-	limits         map[string]int
-	readiness      func(context.Context) error
-	clients        map[string]*clientActivity
-	sequence       uint64
-	events         []flowEvent
-	next           int
-	active         map[uint64]*flowLog
-	total          uint64
-	denied         uint64
-	failed         uint64
-	logSecond      int64
-	logCount       int
-	logsSuppressed uint64
+	mu              sync.Mutex
+	started         int64
+	instance        string
+	sessionSequence uint64
+	sessions        map[string]*relaySession
+	currentSessions map[string]string
+	transport       string
+	reasons         map[string]uint64
+	bytesUp         int64
+	bytesDown       int64
+	tcpUp           int64
+	tcpDown         int64
+	runtime         *relayMetrics
+	limits          map[string]int
+	readiness       func(context.Context) error
+	clients         map[string]*clientActivity
+	sequence        uint64
+	events          []flowEvent
+	next            int
+	active          map[uint64]*flowLog
+	total           uint64
+	denied          uint64
+	failed          uint64
+	logSecond       int64
+	logCount        int
+	logsSuppressed  uint64
 }
 
 type flowEvent struct {
+	SessionID     string `json:"session_id,omitempty"`
 	ID            uint64 `json:"id"`
 	Method        string `json:"method"`
 	Status        int    `json:"status"`
@@ -57,14 +62,15 @@ type flowEvent struct {
 }
 
 type flowLog struct {
-	log    *activityLog
-	mu     sync.Mutex
-	event  flowEvent
-	start  time.Time
-	opened bool
-	ended  bool
-	up     atomic.Int64
-	down   atomic.Int64
+	identity string
+	log      *activityLog
+	mu       sync.Mutex
+	event    flowEvent
+	start    time.Time
+	opened   bool
+	ended    bool
+	up       atomic.Int64
+	down     atomic.Int64
 }
 
 type flowKey struct{}
@@ -94,7 +100,7 @@ func (f *flowLog) add(up, down int64) {
 }
 
 func newActivity(mode string) *activityLog {
-	return &activityLog{started: time.Now().Unix(), transport: mode, active: make(map[uint64]*flowLog), reasons: make(map[string]uint64)}
+	return &activityLog{started: time.Now().Unix(), instance: sessionInstance(), transport: mode, active: make(map[uint64]*flowLog), reasons: make(map[string]uint64)}
 }
 
 func (a *activityLog) begin() *flowLog {
@@ -115,6 +121,10 @@ func (f *flowLog) connected() {
 	f.event.Reason = "connection_closed"
 	f.event.Status = 200
 	f.log.mu.Lock()
+	if session := f.log.sessionLocked(f, f.start.Unix()); session != nil {
+		session.Active++
+		session.Accepted++
+	}
 	f.log.active[f.event.ID] = f
 	f.log.total++
 	client := f.log.clientLocked(f.event)
@@ -217,6 +227,24 @@ func (f *flowLog) finish() {
 	if f.opened {
 		client.open--
 	}
+	if session := f.log.sessionLocked(f, time.Now().Unix()); session != nil {
+		session.LastSeen = time.Now().Unix()
+		if f.opened {
+			session.Active--
+		}
+		if kind == "denied" {
+			session.Denied++
+		}
+		if kind == "failed" {
+			session.Failed++
+		}
+		if f.event.Counted {
+			session.BytesUp += f.up.Load()
+			session.BytesDown += f.down.Load()
+		} else if f.opened {
+			session.Uncounted++
+		}
+	}
 	if len(f.log.clients) > maxClientHistory && client.open == 0 {
 		delete(f.log.clients, f.event.Client)
 	}
@@ -264,10 +292,10 @@ func (a *activityLog) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		events = filtered
 	}
-	flows := make([]*flowLog, 0, len(a.active))
+	active := make([]flowEvent, 0, len(a.active))
 	for _, f := range a.active {
 		if selected == "" || f.event.Client == selected {
-			flows = append(flows, f)
+			active = append(active, f.snapshot("connected"))
 		}
 	}
 	total, denied, failed, suppressed := a.total, a.denied, a.failed, a.logsSuppressed
@@ -277,14 +305,16 @@ func (a *activityLog) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			history = append(history, *c)
 		}
 	}
-	a.mu.Unlock()
-	active := make([]flowEvent, 0, len(flows))
-	for _, f := range flows {
-		active = append(active, f.snapshot("connected"))
+	sessions := make([]relaySession, 0, len(a.sessions))
+	for _, row := range a.sessions {
+		if selected == "" || row.Client == selected {
+			sessions = append(sessions, *row)
+		}
 	}
+	a.mu.Unlock()
 	clients := summarizeClients(history, active)
 	json.NewEncoder(w).Encode(map[string]any{"ready": true, "transport": a.transport, "started_at": a.started,
-		"total": total, "denied": denied, "failed": failed, "logs_suppressed": suppressed, "clients": clients, "active": active, "events": events, "policy_ready": policyReady, "limits": a.limits, "metrics": a.runtime.snapshot()})
+		"total": total, "denied": denied, "failed": failed, "logs_suppressed": suppressed, "clients": clients, "active": active, "events": events, "sessions": sessionSnapshot(sessions, active, time.Now().Unix()), "session_idle_seconds": relaySessionIdleSeconds, "instance": a.instance, "policy_ready": policyReady, "limits": a.limits, "metrics": a.runtime.snapshot()})
 }
 
 func (a *activityLog) listen(address string) (*http.Server, error) {

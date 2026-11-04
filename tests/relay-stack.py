@@ -46,7 +46,7 @@ def check_browser(api_url, portal_url, admin_password, folder):
         admin.get_by_role("button", name="Sign in", exact=True).click()
         admin.get_by_role("link", name="Relay", exact=True).click()
         admin.get_by_text("Signed downloads enabled", exact=True).wait_for()
-        admin.get_by_role("heading", name="Relay activity", exact=True).wait_for()
+        admin.get_by_role("heading", name="Relay sessions", exact=True).wait_for()
         assert admin.get_by_label("Shared signing token", exact=True).input_value() == ""
         admin.get_by_role("button", name="Save signing settings", exact=True).click()
         admin.get_by_text("Signing settings saved", exact=True).wait_for()
@@ -69,16 +69,17 @@ def check_browser(api_url, portal_url, admin_password, folder):
         user.locator('input[name=username]').fill("alice-portal")
         user.locator('input[type=password]').fill(portal_password)
         user.get_by_role("button", name="Sign in", exact=True).click()
-        user.get_by_role("heading", name="My profiles", exact=True).wait_for()
+        user.get_by_role("heading", name="Connect your device", exact=True).wait_for()
         user.get_by_text("My relay activity", exact=True).wait_for()
         personal = user.evaluate("fetch('/api/portal/relay/status').then(r => r.json())")
         assert all(row["client"] == "alice" for key in ("clients","active","events") for row in personal[key])
         assert personal["clients"][0]["active"] > 0 and personal["clients"][0]["bytes_down"] > 0
-        user.get_by_role("link", name="OpenVPN config", exact=True).wait_for()
+        user.locator('details').filter(has=user.get_by_text('OpenVPN · all devices', exact=True)).evaluate('(node) => { node.open = true; }')
         assert user.locator('a[href="#/server"]').count() == 0
         with user.expect_download() as download:
-            user.get_by_role("link", name="OpenVPN config", exact=True).click()
+            user.get_by_role("link", name="Download OpenVPN config", exact=True).click()
         assert download.value.suggested_filename == "alice.ovpn"
+        user.get_by_text('Apple relay · iPhone, iPad and Mac', exact=True).click()
         with user.expect_download() as download:
             user.get_by_role("button", name="Download Apple relay", exact=True).click()
         assert download.value.suggested_filename == "alice-relay.mobileconfig"
@@ -161,14 +162,20 @@ http:
   routers:
     portal:
       entryPoints: [websecure]
-      rule: "Host(`localhost`) && (Path(`/portal`) || Path(`/api/portal`) || PathPrefix(`/api/portal/`) || PathPrefix(`/static/`))"
+      rule: "Host(`localhost`)"
       service: ui
+      middlewares: [portal-boundary]
       tls: {}
     signer:
       entryPoints: [websecure]
       rule: "Host(`traefik`) && Path(`/internal/relay-sign`)"
       service: signer
       tls: {}
+  middlewares:
+    portal-boundary:
+      headers:
+        customRequestHeaders:
+          X-OpenVPN-Portal-Only: "1"
   services:
     ui:
       loadBalancer:
@@ -267,6 +274,15 @@ tls:
         page = command(*curl, "http://" + address + ":8080/")
         assert "OpenVPN" in page
         print("PASS: signed profile verified; real HTTP/2 CONNECT through Docker Traefik reaches LAN")
+        def saved_session(minimum):
+            for _ in range(30):
+                rows = json.loads(api('/api/relay/status'))['sessions']
+                if rows and rows[0]['accepted'] >= minimum:
+                    assert rows[0]['bytes_down'] > 0
+                    return rows[0]
+                time.sleep(0.5)
+            raise AssertionError('Relay session collector did not persist connection totals')
+        first_session = saved_session(1)
         # Reboot-style startup: policy/UI/relay come up before PostgreSQL. Use
         # only the already downloaded profile, never issue a replacement grant.
         original_grant = fixture.db.get_setting("relay_client:alice")
@@ -291,6 +307,11 @@ tls:
         restarted_db = type(fixture.db)(restarted_dsn, schema=fixture.db.schema)
         assert restarted_db.get_setting("relay_client:alice") == original_grant
         assert restarted_db.get_setting("relay_instance") == original_instance
+        restored_session = saved_session(first_session['accepted'] + 1)
+        assert restored_session['id'] == first_session['id']
+        assert restored_session['bytes_down'] > first_session['bytes_down']
+        assert 'credential_id' not in json.dumps(restored_session)
+        print('PASS: relay session totals persist and reconnects join the same visit across a full stack restart')
         print("PASS: original signed profile works after relay/UI/policy/database restart; credentials and identifiers persist; startup waits for database")
         api("/api/clients/alice/access", {"guest": True}, "PUT")
         time.sleep(2)  # The authorization cache expires after one second.

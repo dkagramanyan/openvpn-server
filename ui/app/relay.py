@@ -136,6 +136,11 @@ def revoke(db, name: str) -> None:
     db.execute("DELETE FROM settings WHERE key = ?", ("relay_client:" + name,))
 
 
+def credential_id(db, name):
+    raw = db.get_setting("relay_client:" + name)
+    return hashlib.sha256(json.loads(raw)["secret"].encode()).hexdigest() if raw else ""
+
+
 def profile(db, name: str) -> bytes:
     config = get_settings(db)
     cert = eligible(name)
@@ -224,6 +229,6 @@ def authorize(db, authorization: str, *, strict_state: bool = False) -> dict | N
     allowed = ["0.0.0.0/0"] if guest else ["0.0.0.0/0", "::/0"]
     network = settings.read_network()
     portal = network.get("portal", {})
-    return {"client": name, "allowed_cidrs": allowed,
+    return {"client": name, "credential_id": hashlib.sha256(grant["secret"].encode()).hexdigest(), "allowed_cidrs": allowed,
             "blocked_cidrs": blocked, "guest": guest, "url": config["url"],
             "portal": portal if guest and portal.get("enabled") and portal.get("target") else None}

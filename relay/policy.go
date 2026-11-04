@@ -12,6 +12,7 @@ import (
 )
 
 type policy struct {
+	CredentialID    string        `json:"credential_id"`
 	Client          string        `json:"client"`
 	CIDRs           []string      `json:"allowed_cidrs"`
 	URL             string        `json:"url"`
