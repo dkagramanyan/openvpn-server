@@ -208,7 +208,8 @@ api dns 192.0.2.1 198.51.100.53
 for _ in $(seq 30); do fw -S OVPN-FORWARD | grep -q 198.51.100.53 && break; sleep 1; done    # 2 s pause, then the restart
 fw -S OVPN-FORWARD | grep -q -- '-d 198.51.100.53/32 .*--dport 53 -j ACCEPT' || fail "the guest DNS rule did not follow server.conf"
 fw -S OVPN-FORWARD | grep -q -- '-d 192.0.2.1/32 .*--dport 53' && fail "the old guest DNS rule is still there"
-fw -S OVPN-FORWARD | grep -q -- '-s 10.8.0.128/25 -j DROP' || fail "guests are not blocked from everything else"
+fw -S OVPN-FORWARD | grep -q -- '-s 10.8.0.128/25 -d 10.0.0.0/8 -j DROP' || fail "guests are not blocked from private ranges"
+fw -S OVPN-FORWARD | grep -q -- '-s 10.8.0.128/25 -d 203.0.113.0/24 -j DROP' || fail "guests are not blocked from the pushed routes"
 
 say "Rules removed behind its back and a lease nobody holds are repaired within a minute"
 for _ in $(seq 40); do [ -n "$(docker exec openvpn ls /tmp/openvpn-leases)" ] && break; sleep 1; done    # the clients are back
