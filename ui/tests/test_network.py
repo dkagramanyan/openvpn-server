@@ -219,3 +219,12 @@ def test_existing_vpn_endpoint_can_prefill_domain_without_using_ip_as_domain(con
     config["portal"].update(host="", enabled=False)
     network.save_settings(network.NetworkSettings(**config))
     assert network.get_settings(SavedSettings())["gateway"]["domain"] == domain
+
+
+def test_website_export_needs_no_duplicate_gateway_admin_networks(config):
+    config['gateway'].update(trusted_cidrs=[], portal_cidrs=['192.0.2.20/32'])
+    network.save_settings(network.NetworkSettings(**config))
+    exported = network.export_gateway()
+    assert exported['gateway']['trusted_cidrs'] == []
+    assert exported['gateway']['portal_cidrs'] == ['192.0.2.20/32', config['guest_subnet']]
+    assert exported['portal']['target'] == config['portal']['target']

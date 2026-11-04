@@ -119,7 +119,7 @@ def scenario(browser, portal=False):
         assert simple['portal']['target']=='192.0.2.10:9443' and simple['portal']['destinations']==['192.0.2.10','198.51.100.10']
         assert '10.8.0.128/25' in simple['gateway']['portal_cidrs']
         assert '10.8.0.128/25' not in simple['gateway']['trusted_cidrs']
-        page.get_by_text('Private services and website routing',exact=True).click()
+        page.get_by_text('Website routing',exact=True).click()
         saves_before = len(saved)
         page.get_by_label('Dedicated portal listener',exact=True).fill('missing-port')
         page.get_by_role('button',name='Save settings',exact=True).click()
@@ -143,6 +143,14 @@ def scenario(browser, portal=False):
         page.set_viewport_size({'width':390,'height':844})
         assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
         page.screenshot(path='/tmp/ovpn-settings-guided-mobile.png',full_page=True)
+        page.get_by_text('Gateway access override (optional)',exact=True).click()
+        page.get_by_label('Override gateway private-service networks (optional)',exact=True).fill('')
+        with page.expect_download() as preserved_download:
+            page.get_by_role('button',name='Save and download Traefik settings',exact=True).click()
+        preserved = json.loads(Path(preserved_download.value.path()).read_text())
+        assert preserved['gateway']['trusted_cidrs'] == []
+        assert '10.8.0.128/25' in preserved['gateway']['portal_cidrs']
+        assert page.locator('[aria-invalid=true]').count() == 0
         block_save[0]=True
         exports=sum(path=='/api/network/traefik.json' for _,path in calls)
         page.get_by_role('button',name='Save and download Traefik settings',exact=True).click()

@@ -1224,7 +1224,6 @@ function networkSettingsCard(s, relay, publicSettings) {
     if (exporting) {
       if (!inputs['gateway.domain'].value.trim()) flag(inputs['gateway.domain'], 'Enter the domain already used by your VPN or relay.');
       if (!inputs['gateway.openvpn_backend'].value.trim()) flag(inputs['gateway.openvpn_backend'], 'Detect or enter the VPN server’s internal web address.');
-      if (!split(inputs['gateway.trusted_cidrs'].value).length) flag(inputs['gateway.trusted_cidrs'], 'Choose which source networks may open private services. These permissions are not detected automatically.');
     }
     for (const { control, message } of errors) {
       control.setAttribute('aria-invalid', 'true');
@@ -1273,15 +1272,8 @@ function networkSettingsCard(s, relay, publicSettings) {
   const internalStep = details('Server and gateway addresses',
     h('div', { class: 'form cols' }, backendField, field('Relay backend override', relayBackend, 'Optional. Defaults to the VPN server’s web address host on port 8444.')),
     forwarding, input('proxy_cidrs', 'Trusted reverse proxy CIDRs', 'Only the gateway’s actual source IPs. Suggested addresses are added as individual /32 entries.'));
-  const trustedField = input('gateway.trusted_cidrs', 'Private-service access networks', 'Source networks allowed to open administrator/private websites. Review these permissions explicitly.');
-  const accessStep = details('Private services and website routing',
-    trustedField, h('div', null, h('button', { class: 'btn', onClick: () => {
-      const address = detected?.server_ipv4;
-      const found = detected?.interfaces.find(row => row.address === address);
-      if (!found) { success('Detect addresses first, or enter your administrator network manually.'); return; }
-      inputs['gateway.trusted_cidrs'].value = [...new Set([...split(inputs['gateway.trusted_cidrs'].value), found.network])].join(', ');
-      touched.add('gateway.trusted_cidrs'); refreshAddresses();
-    } }, 'Allow the detected LAN into private services')),
+  const trustedField = input('gateway.trusted_cidrs', 'Override gateway private-service networks (optional)', 'Leave blank to keep Traefik’s existing administrator access. This does not change a VPN or relay profile’s guest/full-access role.');
+  const accessStep = details('Website routing',
     input('blocked_cidrs', 'Other networks blocked for guests', 'Include public addresses that route back into your local network.'),
       input('gateway.portal_cidrs', 'Networks allowed into the portal', 'Optional override. Defaults include private-service networks and the VPN/relay server source IP. Enabling guests adds the guest subnet to the export.'),
         h('p', { class: 'small muted' }, 'The isolated website route lets guests reach their profiles through the LAN blocks. The OpenVPN service limits this route to the user website. Other private websites stay blocked.'),
@@ -1300,6 +1292,7 @@ function networkSettingsCard(s, relay, publicSettings) {
     input('lan_cidrs', 'LAN networks blocked for guests', 'Applies to both VPN and relay. The OpenVPN website is the only private website exception.'),
     detectionStatus, h('div', null, h('button', { class: 'btn', onClick: event => busy(event.currentTarget, detect) }, 'Detect addresses')));
   const advanced = details('Advanced settings', publicStep, internalStep, accessStep, vpnStep,
+    details('Gateway access override (optional)', trustedField),
     details('Additional gateway services', h('label', { class: 'row' }, manageServices, 'Manage and replace the gateway’s additional services here'), h('p', { class: 'small muted' }, 'Leave this off to keep the gateway’s existing service inventory.'), serviceFields));
   const applyStep = step('2', 'Apply your changes', 'For a website routing change, deploy the downloaded gateway file first, then restart VPN.',
     details('Gateway installation steps', h('ol', { class: 'setup-steps' }, h('li', null, 'Save and download the Traefik settings file.'), h('li', null, 'Copy network.private.json to your gateway. Run ', h('code', null, './manage setup --network-file ./network.private.json'), ', then ', h('code', null, 'sudo docker compose up -d --build --remove-orphans'), '.'), h('li', null, 'Return here and use Save and restart VPN. Existing relay profiles reconnect automatically.'))),

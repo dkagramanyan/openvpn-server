@@ -245,8 +245,7 @@ that address.
 
 The **Allow guests to use the OpenVPN website** setting adds one website
 exception to these LAN blocks. The service suggests the gateway address and
-website DNS answers; editable overrides are under **Advanced settings → Private
-services and website routing**. Export and deploy the gateway file before
+website DNS answers; editable overrides are under **Advanced settings → Website routing**. Export and deploy the gateway file before
 restarting VPN. OpenVPN redirects only guest TCP 443 connections to the listed
 IPv4 destinations, and relay guests use the same isolated website listener.
 The OpenVPN service permits only personal portal pages, downloads and assets on
@@ -509,7 +508,7 @@ website. One LAN list blocks private destinations for both guest transports.
 Guests keep internet access; full-access clients keep their existing permissions.
 
 Custom public hostnames/forwarded ports, backend URLs, trusted proxy sources,
-private-service allowlists, VPN addressing and gateway service inventory are
+VPN addressing and gateway service inventory are
 under **Advanced settings**. Existing public profile, relay and signing URLs are
 reused. The relay backend defaults to the web backend host on port 8444. The
 layout follows [progressive disclosure](https://www.nngroup.com/articles/progressive-disclosure/)
@@ -522,7 +521,9 @@ original reverse-proxy peer and website DNS answers. Empty address fields are
 prefilled with editable suggestions; entered values are preserved. The suggested
 private website listener uses the gateway IPv4 with port 9443. Detection does not
 probe/change port forwarding or infer public NAT mappings. Private-service
-permissions require an explicit administrator choice.
+permissions are kept on Traefik. Leaving the optional gateway override blank
+preserves its existing administrator/private-service networks; guest website
+setup does not require entering these networks again.
 
 Enabling **Allow guests to use the OpenVPN website** exports a website-only
 source allowlist and the isolated listener. The default sources include the

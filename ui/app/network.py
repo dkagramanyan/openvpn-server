@@ -317,7 +317,7 @@ def export_gateway(db=None):
     data = get_settings(db)
     gateway = data["gateway"]
     required = {"domain": "Gateway domain", "openvpn_host": "Website hostname", "openvpn_backend": "OpenVPN UI backend URL",
-                "relay_host": "Public relay URL", "relay_backend": "Relay backend", "trusted_cidrs": "Networks allowed into private services"}
+                "relay_host": "Public relay URL", "relay_backend": "Relay backend"}
     missing = [label for key, label in required.items() if not gateway[key]]
     if missing:
         raise PkiError("Complete these settings before exporting: " + ", ".join(missing))
