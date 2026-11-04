@@ -53,6 +53,7 @@
 
 /* ---- base ------------------------------------------------------------ */
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 html, body { margin: 0; height: 100%; }
 body {
   background: var(--page); color: var(--ink);
@@ -134,6 +135,7 @@ h3 { font-size: 13px; font-weight: 600; margin: 0; color: var(--ink-2); text-tra
 .settings-details > summary { cursor: pointer; font-weight: 500; }
 .settings-details[open] > summary { margin-bottom: 12px; }
 .network-settings label.row { flex-wrap: nowrap; align-items: flex-start; }
+.network-settings .btn { white-space: normal; max-width: 100%; }
 @media (max-width: 600px) {
   .network-settings .form.cols { grid-template-columns: 1fr; }
   .network-settings .kv { grid-template-columns: 1fr; gap: 4px; }
@@ -294,3 +296,37 @@ dialog.modal .m-f { padding: 0 18px 16px; display: flex; gap: 8px; justify-conte
 
 .relay-toggle { display:inline-block; font-size:1.3em; transition:transform .12s; }
 .relay-user[open] > summary .relay-toggle { transform:rotate(90deg); }
+
+/* Guided connection settings and the personal download portal. */
+.setup-step { border: 1px solid var(--border); border-radius: 12px; padding: 18px; display: flex; flex-direction: column; gap: 16px; }
+.step-heading { display: flex; gap: 12px; align-items: flex-start; }
+.step-heading > div { min-width: 0; }
+.step-heading h3 { font-size: 16px; text-transform: none; letter-spacing: 0; color: var(--ink); }
+.step-heading p { margin: 5px 0 0; }
+.step-number { flex: 0 0 30px; height: 30px; border-radius: 50%; display: grid; place-items: center; color: var(--accent); background: var(--series-1-wash); font-weight: 650; }
+.notice, .detection-status { border-radius: 8px; padding: 12px 14px; background: var(--surface-2); border: 1px solid var(--border); overflow-wrap: anywhere; }
+.notice p:last-child, .detection-status p:last-child { margin-bottom: 0; }
+.forwarding-map { display: flex; flex-direction: column; gap: 10px; padding: 12px; border-radius: 8px; background: var(--surface-2); }
+.forwarding-map > div { display: flex; flex-wrap: wrap; gap: 6px 16px; }
+.forwarding-map strong { min-width: 120px; }
+.forwarding-map span { overflow-wrap: anywhere; }
+.input-error { color: var(--critical); font-size: 13px; margin: 6px 0 0; }
+.input[aria-invalid="true"] { border-color: var(--critical); }
+.setup-steps { display: flex; flex-direction: column; gap: 12px; margin: 0; padding-left: 24px; }
+.setup-steps li { padding-left: 4px; }
+.portal-setup, .service-editor { display: flex; flex-direction: column; gap: 14px; padding: 14px; border: 1px solid var(--border); border-radius: 8px; }
+.portal-content { max-width: 760px; width: 100%; }
+.access-summary { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; padding: 12px; background: var(--surface-2); border-radius: 8px; }
+.connection-method, .portal-panel { padding: 16px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
+.connection-method summary, .portal-panel summary { font-weight: 600; cursor: pointer; font-size: 15px; }
+.connection-method[open] summary, .portal-panel[open] summary { margin-bottom: 16px; }
+.connection-method .btn { align-self: flex-start; }
+.form-message { padding: 10px; border-radius: 8px; background: var(--surface-2); }
+.download-help { max-width: 640px; margin: 40px auto; padding: 20px; }
+@media (max-width: 600px) {
+  .setup-step { padding: 14px; }
+  .settings-actions { flex-direction: column; align-items: stretch; }
+  .settings-actions .btn { justify-content: center; min-height: 44px; white-space: normal; }
+  .portal-content input, .network-settings input { font-size: 16px; }
+  .portal-content .btn { min-height: 44px; }
+}

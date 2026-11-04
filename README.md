@@ -187,8 +187,8 @@ To enable it:
    ```
 
 4. In **Settings → Network and private portal**, enable Apple relay profiles.
-   The relay uses the gateway domain and port 8443 by default; **Custom addresses
-   and ports** supports another hostname or port. Enter LAN CIDRs (e.g.
+   Existing public relay addresses and ports are kept; **Public connection
+   addresses** supports another hostname or port. Enter LAN CIDRs (e.g.
    `192.0.2.0/24`) in **LAN networks blocked for guests**, shared by VPN and relay.
    Access follows each client’s
    OpenVPN role: guests have internet only; full-access clients have internet
@@ -491,10 +491,24 @@ Use **Settings → Network and private portal** for public VPN endpoints, relay,
 VPN addressing, DNS, guest blocks, trusted reverse proxies, the portal, and gateway
 services. Set the gateway domain once: VPN profiles and relay use that domain,
 while the website and portal share `openvpn.<domain>`. Existing profile, signing
-and relay URLs prefill the form. Existing custom addresses are preserved and can
-be edited under **Custom addresses and ports**. The relay backend defaults to the
+and relay URLs prefill the form. The page groups setup into public addresses,
+internal addresses, access/guest portal, and save/apply steps. Custom hostnames
+are available under **Different hostnames**. The relay backend defaults to the
 UI backend host on port 8444. One LAN list supplies VPN and relay guest blocks;
 private-service access networks remain a separate allowlist.
+
+**Detect addresses** reads the VPN server's interfaces, route-selected source
+address, original reverse-proxy peer and portal DNS answers. It prefills empty
+address fields and suggests individual proxy IPs, while preserving entered
+values. Every suggestion stays editable and requires saving. It does not probe
+or change your port forwarding, infer public NAT mappings, or automatically
+grant a detected network access to private services. A separate button allows
+the administrator to add the detected LAN to that allowlist explicitly.
+
+You can save and export the dedicated portal listener with guest access still
+disabled. Deploy it on the gateway first, then enable guest access and restart
+VPN. Existing additional gateway services are preserved unless **Manage and
+replace the gateway's additional services here** is checked.
 
 **Save settings** applies the combined form. VPN profiles regenerate only when
 their endpoint changes. **Save and download Traefik settings** saves current edits
@@ -527,6 +541,15 @@ The export contains network information and should remain private. Credentials
 remain in local secret storage; they are not included in the export.
 
 ## User download portal
+
+The personal portal offers step-by-step Apple relay and OpenVPN installation
+instructions, with connection activity and password changes in expandable
+sections. Apple relay uses a native, session-protected HTTP form download so
+Safari can hand the profile to Settings. JSON and plain-text gateway errors are
+handled without exposing browser parsing errors. A blocked route is reported
+with useful retry/contact instructions; gateway access restrictions remain in
+effect. Use [Apple's profile installation guide](https://support.apple.com/102400)
+for the installation steps on Apple devices.
 
 Administrators can create or reset a personal website login from
 **Clients → client → Portal access** and disable it from the same dialog.

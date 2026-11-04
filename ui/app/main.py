@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import hmac
 import html
 import json
 import logging
@@ -12,16 +13,16 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, parse_qs
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
-from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exception_handlers import request_validation_exception_handler, http_exception_handler
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import __version__, auth, backup, pki, relay, relay_services, watchdog, network
+from . import __version__, auth, backup, pki, relay, relay_services, watchdog, network, network_discovery
 from .collector import Collector, Maintenance
 from .db import Database
 from .mgmt import Management, ManagementError
@@ -149,13 +150,33 @@ async def validation_error(request: Request, exc: RequestValidationError):
 
 
 @app.exception_handler(PkiError)
-async def pki_error(_: Request, exc: PkiError):
+async def pki_error(request: Request, exc: PkiError):
+    if getattr(request.state, "native_profile_download", False):
+        return profile_download_error(str(exc), 400, request.url.path.startswith("/api/portal/"))
     return JSONResponse({"detail": str(exc)}, status_code=400)
 
 
 @app.exception_handler(relay_services.SigningUnavailable)
-async def signing_error(_: Request, exc: relay_services.SigningUnavailable):
+async def signing_error(request: Request, exc: relay_services.SigningUnavailable):
+    if getattr(request.state, "native_profile_download", False):
+        return profile_download_error(str(exc), 503, request.url.path.startswith("/api/portal/"))
     return JSONResponse({"detail": str(exc)}, status_code=503, headers={"Cache-Control": "no-store", "Retry-After": "5"})
+
+
+@app.exception_handler(HTTPException)
+async def friendly_download_error(request: Request, exc: HTTPException):
+    if getattr(request.state, "native_profile_download", False):
+        return profile_download_error(str(exc.detail), exc.status_code, request.url.path.startswith("/api/portal/"))
+    return await http_exception_handler(request, exc)
+
+
+def profile_download_error(message, status, portal=True):
+    back = "/portal" if portal else "/#/clients"
+    return HTMLResponse('<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+        '<title>Profile download unavailable</title><link rel="stylesheet" href="/static/app.css"><main class="download-help">'
+        '<h1>Your profile could not be downloaded</h1><p>' + html.escape(message) + '</p>'
+        '<p>Stay connected to your approved Wi-Fi, VPN or relay, then try again. If this continues, contact your administrator.</p>'
+        '<a class="btn primary" href="' + back + '">Back to my profiles</a></main></html>', status_code=status, headers={"Cache-Control": "no-store"})
 
 
 @app.exception_handler(ManagementError)
@@ -207,6 +228,33 @@ def csrf_check(request: Request) -> None:
 Authed = Depends(current_user)
 SignedIn = Depends(signed_in_user)
 Csrf = Depends(csrf_check)
+
+
+def profile_download_token(request, path):
+    # A session-bound form token; never expose the HttpOnly session cookie.
+    return hmac.new(request.cookies.get(COOKIE, "").encode(), ("profile-download:" + path).encode(), hashlib.sha256).hexdigest()
+
+
+async def profile_download_csrf(request: Request):
+    if request.headers.get("x-requested-with") == "fetch":
+        csrf_check(request)
+        return
+    request.state.native_profile_download = request.headers.get("content-type", "").startswith("application/x-www-form-urlencoded")
+    origin = request.headers.get("origin")
+    if origin and origin != "null" and urlsplit(origin).netloc.lower() != request.headers.get("host", "").lower():
+        raise HTTPException(403, "Cross-origin request rejected")
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        if len(body) > 256:
+            raise HTTPException(413, "Refresh the page before downloading your profile")
+    try:
+        token = parse_qs(body.decode("utf-8"), max_num_fields=1).get("csrf", [""])[0]
+    except (ValueError, UnicodeError):
+        token = ""
+    if not request.cookies.get(COOKIE) or not hmac.compare_digest(token.encode(), profile_download_token(request, request.url.path).encode()):
+        raise HTTPException(403, "Refresh the page before downloading your profile")
+    request.state.native_profile_download = True
 
 
 # -- models ---------------------------------------------------------------------
@@ -486,14 +534,15 @@ def remove_portal_account(name: str, user: dict[str, Any] = Authed):
 
 
 @app.get("/api/portal")
-def own_profile_info(user: dict[str, Any] = SignedIn):
+def own_profile_info(request: Request, user: dict[str, Any] = SignedIn):
     if user["role"] != "client":
         raise HTTPException(400, "This page is for client accounts")
     cert = relay.eligible(user["client_name"])
     if not cert:
         raise HTTPException(401, "Client access is no longer valid")
     return {"name": user["client_name"], "guest": relay.is_guest(user["client_name"]), "expires_at": cert["not_after"],
-            "relay_available": relay.get_settings(db)["enabled"], "signed_profiles": bool(relay_services.signing_config(db)["url"])}
+            "relay_available": relay.get_settings(db)["enabled"], "signed_profiles": bool(relay_services.signing_config(db)["url"]),
+            "relay_download": {"url": "/api/portal/relay.mobileconfig", "csrf": profile_download_token(request, "/api/portal/relay.mobileconfig")}}
 
 
 @app.get("/api/portal/ovpn")
@@ -520,7 +569,7 @@ def own_relay_status(user: dict[str, Any] = SignedIn):
                for key in ("clients", "active", "events")}}
 
 
-@app.post("/api/portal/relay.mobileconfig", dependencies=[Csrf])
+@app.post("/api/portal/relay.mobileconfig", dependencies=[Depends(profile_download_csrf)])
 def own_relay_profile(user: dict[str, Any] = SignedIn):
     if user["role"] != "client":
         raise HTTPException(400, "This page is for client accounts")
@@ -744,7 +793,14 @@ def put_relay_settings(body: relay.RelaySettings, user: dict[str, Any] = Authed)
     return config
 
 
-@app.post("/api/clients/{name}/relay.mobileconfig", dependencies=[Csrf])
+@app.get("/api/clients/{name}/relay-download")
+def relay_download_form(name: str, request: Request, user: dict[str, Any] = Authed):
+    find_client(name)
+    path = "/api/clients/" + name + "/relay.mobileconfig"
+    return {"url": path, "csrf": profile_download_token(request, path)}
+
+
+@app.post("/api/clients/{name}/relay.mobileconfig", dependencies=[Depends(profile_download_csrf)])
 def download_relay_profile(name: str, user: dict[str, Any] = Authed):
     find_client(name)
     content = relay.profile(db, name)
@@ -1105,6 +1161,13 @@ def get_network_settings(user: dict[str, Any] = Authed):
     return JSONResponse(network.get_settings(db), headers={"Cache-Control": "no-store"})
 
 
+@app.post("/api/network/discovery", dependencies=[Csrf])
+def discover_network(body: network.NetworkSettings, request: Request, user: dict[str, Any] = Authed):
+    data = network.shared_settings(body.model_dump(), db)
+    return JSONResponse(network_discovery.discover(data, peer=getattr(request.state, "network_peer", None),
+                        proxied=bool(request.headers.get("x-forwarded-proto"))), headers={"Cache-Control": "no-store"})
+
+
 class NetworkUpdate(network.NetworkSettings):
     relay_settings: relay.RelaySettings | None = Field(default=None, alias="relay")
     remote: RemoteBody | None = None
@@ -1114,7 +1177,8 @@ class NetworkUpdate(network.NetworkSettings):
 def put_network_settings(body: NetworkUpdate, user: dict[str, Any] = Authed):
     # Validate the whole form before changing persistent state.
     if body.relay_settings is not None:
-        relay.validate_settings(body.relay_settings, lan_cidrs=body.lan_cidrs)
+        relay_config = relay.validate_settings(body.relay_settings, lan_cidrs=body.lan_cidrs)
+        body.gateway.relay_public_url = relay_config["url"]
     if body.remote is not None:
         pki.validate_remote(body.remote.host, body.remote.ports)
     result = network.save_settings(network.NetworkSettings(**body.model_dump(exclude={"relay_settings", "remote"})))

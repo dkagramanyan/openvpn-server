@@ -70,7 +70,7 @@ def check_browser(api_url, portal_url, admin_password, folder):
         user.locator('input[type=password]').fill(portal_password)
         user.get_by_role("button", name="Sign in", exact=True).click()
         user.get_by_role("heading", name="My profiles", exact=True).wait_for()
-        user.get_by_role("heading", name="My relay activity", exact=True).wait_for()
+        user.get_by_text("My relay activity", exact=True).wait_for()
         personal = user.evaluate("fetch('/api/portal/relay/status').then(r => r.json())")
         assert all(row["client"] == "alice" for key in ("clients","active","events") for row in personal[key])
         assert personal["clients"][0]["active"] > 0 and personal["clients"][0]["bytes_down"] > 0
@@ -80,7 +80,7 @@ def check_browser(api_url, portal_url, admin_password, folder):
             user.get_by_role("link", name="OpenVPN config", exact=True).click()
         assert download.value.suggested_filename == "alice.ovpn"
         with user.expect_download() as download:
-            user.get_by_role("button", name="Apple relay", exact=True).click()
+            user.get_by_role("button", name="Download Apple relay", exact=True).click()
         assert download.value.suggested_filename == "alice-relay.mobileconfig"
         verify_env = {**os.environ, "SSL_CERT_FILE": str(folder / "identity/ca.pem")}
         content = Path(download.value.path()).read_bytes()

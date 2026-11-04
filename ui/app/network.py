@@ -37,9 +37,11 @@ class Gateway(BaseModel):
     openvpn_backend: str = ""
     relay_host: str = ""
     relay_backend: str = ""
+    relay_public_url: str = ""
     trusted_cidrs: list[str] = Field(default_factory=list, max_length=100)
     portal_cidrs: list[str] = Field(default_factory=list, max_length=100)
     services: list[Service] = Field(default_factory=list, max_length=100)
+    replace_services: bool = False
 
 
 class NetworkSettings(BaseModel):
@@ -107,6 +109,8 @@ def shared_settings(data, db=None):
 
     gateway, portal = data["gateway"], data["portal"]
     relay_config = relay.get_settings(db) if db is not None else {}
+    if relay_config.get("url"):
+        gateway["relay_public_url"] = relay_config["url"]
     signer = relay_services.signing_config(db)
 
     def dns_host(url):
@@ -207,21 +211,36 @@ def validate(body):
     for key in ("domain", "openvpn_host", "relay_host"):
         if gateway[key]: gateway[key] = hostname(gateway[key])
     portal["host"] = hostname(portal["host"]) if portal["host"] else gateway["openvpn_host"]
-    if portal["enabled"]:
-        portal["host"] = hostname(portal["host"])
-        portal["target"] = endpoint(portal["target"], portal=True)
+    if portal["enabled"] or portal["target"]:
+        if portal["enabled"]:
+            portal["host"] = hostname(portal["host"])
+        try:
+            portal["target"] = endpoint(portal["target"], portal=True)
+        except PkiError:
+            raise PkiError("Dedicated portal listener: enter the gateway's LAN IPv4 and port, such as 192.0.2.10:9443") from None
         try:
             portal["destinations"] = list(dict.fromkeys(str(ipaddress.IPv4Address(v)) for v in portal["destinations"]))
-            if not portal["destinations"]:
+            if portal["enabled"] and not portal["destinations"]:
                 raise ValueError()
             for value in portal["destinations"]:
                 endpoint(value + ":9443", portal=True)
-        except ValueError:
-            raise PkiError("Enter the portal's individual IPv4 DNS addresses")
+        except (ValueError, PkiError):
+            raise PkiError("Portal DNS IPv4 addresses: enter the portal's individual IPv4 DNS answers") from None
     if portal["enabled"] and portal["host"] != gateway["openvpn_host"]:
         raise PkiError("The private portal and OpenVPN website must use the same hostname")
-    if gateway["openvpn_backend"]: gateway["openvpn_backend"] = backend_url(gateway["openvpn_backend"])
-    if gateway["relay_backend"]: gateway["relay_backend"] = endpoint(gateway["relay_backend"])
+    if gateway["openvpn_backend"]:
+        try:
+            gateway["openvpn_backend"] = backend_url(gateway["openvpn_backend"])
+        except PkiError:
+            raise PkiError("VPN server web address: enter an HTTP(S) URL including the web UI port") from None
+    if gateway["relay_backend"]:
+        try:
+            gateway["relay_backend"] = endpoint(gateway["relay_backend"])
+        except PkiError:
+            raise PkiError("Relay backend: enter the VPN server address and internal relay port, such as 192.0.2.20:8444") from None
+    if gateway["relay_public_url"]:
+        from . import relay
+        gateway["relay_public_url"] = relay.validate_settings(relay.RelaySettings(url=gateway["relay_public_url"]))["url"]
     for key in ("trusted_cidrs", "portal_cidrs"):
         gateway[key] = cidrs(gateway[key])
     names = set()
@@ -235,6 +254,8 @@ def validate(body):
             raise PkiError("Additional services cannot replace the portal or dashboard host")
         if any(not p.startswith("/") or re.search(r"[\s`{}\\]", p) for p in service["paths"]):
             raise PkiError("Service paths must start with / and contain no whitespace or template characters")
+    if gateway["services"]:
+        gateway["replace_services"] = True
     return data
 
 
@@ -311,6 +332,8 @@ class NetworkProxyHeaders:
 
     async def __call__(self, scope, receive, send):
         from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
+        if scope["type"] == "http":
+            scope.setdefault("state", {})["network_peer"] = (scope.get("client") or (None,))[0]
         config = settings.read_network()
         trusted = config.get("proxy_cidrs", os.environ.get("FORWARDED_ALLOW_IPS", "127.0.0.1").split(","))
         await ProxyHeadersMiddleware(self.app, trusted_hosts=trusted)(scope, receive, send)

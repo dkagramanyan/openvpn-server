@@ -1053,3 +1053,65 @@ def test_combined_network_and_relay_save_validates_before_writing(client, monkey
             db.execute("DELETE FROM settings WHERE key = ?", ("apple_relay",))
         else:
             db.set_setting("apple_relay", previous_relay)
+
+
+def test_native_portal_relay_download_is_session_bound_and_csrf_protected(client, configured, portal):
+    download = portal.get('/api/portal').json()['relay_download']
+    response = portal.post(download['url'], data={'csrf': download['csrf']})
+    assert response.status_code == 200
+    assert response.headers['content-type'].startswith('application/x-apple-aspen-config')
+    assert 'alice-relay.mobileconfig' in response.headers['content-disposition']
+    assert plistlib.loads(response.content)['PayloadContent'][0]['Relays']
+    for token in ['', 'bad-token', 'неверный-токен']:
+        assert portal.post(download['url'], data={'csrf': token}).status_code == 403
+    assert portal.post(download['url'], data={'csrf': download['csrf']}, headers={'Origin': 'https://untrusted.example'}).status_code == 403
+    # The administrator's distinct session cannot use this client's form token.
+    assert client.post(download['url'], data={'csrf': download['csrf']}).status_code == 403
+    assert portal.get('/api/clients/alice/relay-download').status_code == 403
+    assert client.post('/api/clients/alice/relay.mobileconfig', data={'csrf': download['csrf']}).status_code == 403
+    administrator = client.get('/api/clients/alice/relay-download').json()
+    assert client.post(administrator['url'], data={'csrf': administrator['csrf']}).status_code == 200
+    cookies = dict(portal.cookies)
+    portal.cookies.clear()
+    try:
+        expired = portal.post(download['url'], data={'csrf': download['csrf']})
+        assert expired.status_code == 403 and expired.headers['content-type'].startswith('text/html')
+        assert 'Refresh the page' in expired.text
+    finally:
+        portal.cookies.update(cookies)
+
+
+def test_native_download_failure_is_readable_and_does_not_return_unsigned_profile(client, configured, portal, monkeypatch):
+    from app.settings import settings
+    monkeypatch.setattr(settings, 'relay_signing_required', True)
+    def offline(*args, **kwargs):
+        raise pki.PkiError('signer unavailable')
+    monkeypatch.setattr(relay, 'sign_profile', offline)
+    download = portal.get('/api/portal').json()['relay_download']
+    response = portal.post(download['url'], data={'csrf': download['csrf']})
+    assert response.status_code == 503
+    assert response.headers['content-type'].startswith('text/html')
+    assert 'Your profile could not be downloaded' in response.text
+    assert 'Back to my profiles' in response.text
+    assert 'signer unavailable' not in response.text
+    assert response.headers['cache-control'] == 'no-store'
+
+
+def test_network_discovery_is_read_only_admin_only_and_uses_original_peer(client, portal, monkeypatch):
+    from app import network_discovery
+    from app.settings import settings
+    seen = {}
+    def inspect(data, **context):
+        seen.update(context)
+        return {'suggestions': {}, 'server_ipv4': None, 'gateway_ipv4': None}
+    monkeypatch.setattr(network_discovery, 'discover', inspect)
+    body = client.get('/api/network/settings').json()
+    before = settings.server_conf.read_bytes()
+    assert client.post('/api/network/discovery', json=body).status_code == 403
+    assert portal.post('/api/network/discovery', json=body, headers=H).status_code == 403
+    response = client.post('/api/network/discovery', json=body, headers={**H, 'X-Forwarded-For': '203.0.113.99', 'X-Forwarded-Proto': 'https'})
+    assert response.status_code == 200
+    assert seen['peer'] == 'testclient'
+    assert seen['proxied'] is True
+    assert settings.server_conf.read_bytes() == before
+    assert response.headers['cache-control'] == 'no-store'

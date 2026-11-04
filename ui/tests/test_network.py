@@ -142,7 +142,8 @@ def test_shared_defaults_preserve_custom_gateway_addresses(config, monkeypatch):
     network.save_settings(network.NetworkSettings(**config))
     monkeypatch.setattr(settings, "profile_base_url", "https://other.example.test")
     db = SavedSettings(apple_relay={"url": "https://another.example.test:8443"})
-    assert network.get_settings(db)["gateway"] == network.Gateway(**config["gateway"]).model_dump()
+    expected = config["gateway"] | {"replace_services": True, "relay_public_url": "https://another.example.test:8443"}
+    assert network.get_settings(db)["gateway"] == network.Gateway(**expected).model_dump()
 
 
 def test_legacy_relay_lan_blocks_are_carried_into_shared_form(config):
@@ -178,6 +179,16 @@ def test_export_names_missing_fields(config):
     network.save_settings(network.NetworkSettings(**config))
     with pytest.raises(pki.PkiError, match="OpenVPN UI backend URL"):
         network.export_gateway()
+
+
+@pytest.mark.parametrize("field,value,label", [
+    ("target", "https://192.0.2.10:9443", "Dedicated portal listener"),
+    ("destinations", ["127.0.0.1"], "Portal DNS IPv4 addresses"),
+])
+def test_portal_errors_identify_the_actual_input(config, field, value, label):
+    config["portal"][field] = value
+    with pytest.raises(pki.PkiError, match=label):
+        network.save_settings(network.NetworkSettings(**config))
 
 
 @pytest.mark.parametrize("host,domain", [("vpn.example.test", "example.test"), ("example.test", "example.test"), ("192.0.2.20", "")])

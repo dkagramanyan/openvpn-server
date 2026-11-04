@@ -3,6 +3,15 @@
 
 ## Unreleased
 
+* Guide administrator setup through public addresses, detected internal IPs,
+  access/portal settings and deployment steps. Preserve edited values and public
+  ports; infer no private-service access grants. Allow staged portal listener
+  deployment and keep the gateway service inventory unless replacement is chosen.
+* Download Apple relay profiles through a native HTTP form with a session-bound
+  CSRF token. Handle plain-text/JSON gateway failures without Safari parser
+  errors. Add personal installation steps, inline feedback and simpler mobile
+  activity/password panels for client accounts.
+
 * Combine public VPN, gateway, portal and relay settings into one form. Reuse
   existing URLs, share domain/website/LAN inputs, preserve custom endpoints,
   and save current edits before downloading the private gateway export.
