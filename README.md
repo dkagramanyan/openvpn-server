@@ -505,10 +505,19 @@ or change your port forwarding, infer public NAT mappings, or automatically
 grant a detected network access to private services. A separate button allows
 the administrator to add the detected LAN to that allowlist explicitly.
 
-You can save and export the dedicated portal listener with guest access still
-disabled. Deploy it on the gateway first, then enable guest access and restart
-VPN. Existing additional gateway services are preserved unless **Manage and
-replace the gateway's additional services here** is checked.
+For ordinary portal access, enable **Allow guests to use the private portal**
+and export the Traefik settings. The guest subnet is added only to the portal's
+source allowlist; private/admin service networks are kept separate. The default
+portal sources also include the VPN/relay egress IP because Traefik may see that
+address after NAT. No dedicated listener or DNS redirect fields are required.
+
+**Advanced: routing through guest LAN blocks** retains optional dedicated portal
+routing when guests cannot otherwise reach the gateway. Existing dedicated
+settings are preserved. This option can be staged on the gateway before enabling
+its VPN/relay exception. The normal allowlist option does not relax guest LAN
+blocks or add a relay destination exception. Existing additional gateway services
+are preserved unless **Manage and replace the gateway's additional services here**
+is checked.
 
 **Save settings** applies the combined form. VPN profiles regenerate only when
 their endpoint changes. **Save and download Traefik settings** saves current edits

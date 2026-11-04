@@ -1120,6 +1120,7 @@ function networkSettingsCard(s, relay, publicSettings) {
   };
   const relayEnabled = h('input', { type: 'checkbox', checked: relay.enabled });
   const portalEnabled = h('input', { type: 'checkbox', checked: s.portal.enabled });
+  const isolatedPortal = h('input', { type: 'checkbox', checked: !!s.portal.target });
   const manageServices = h('input', { type: 'checkbox', checked: s.gateway.replace_services || s.gateway.services.length > 0 });
   const addressSummary = h('dl', { class: 'kv' });
   const forwarding = h('div', { class: 'forwarding-map', 'aria-label': 'Configured internal addresses' });
@@ -1130,7 +1131,10 @@ function networkSettingsCard(s, relay, publicSettings) {
     const address = detected?.server_ipv4 || parseURL(inputs['gateway.openvpn_backend'].value.trim())?.hostname;
     return /^\d+\.\d+\.\d+\.\d+$/.test(address || '') ? address + '/32' : null;
   };
-  const portalNetworks = () => split(inputs['gateway.portal_cidrs'].value).length ? split(inputs['gateway.portal_cidrs'].value) : [...new Set([...split(inputs['gateway.trusted_cidrs'].value), ...(serverCIDR() ? [serverCIDR()] : [])])];
+  const portalNetworks = (includeGuests = true) => [...new Set([
+    ...(split(inputs['gateway.portal_cidrs'].value).length ? split(inputs['gateway.portal_cidrs'].value) : [...split(inputs['gateway.trusted_cidrs'].value), ...(serverCIDR() ? [serverCIDR()] : [])]),
+    ...(includeGuests && portalEnabled.checked ? [inputs['guest_subnet'].value.trim()] : []),
+  ])];
   const refreshAddresses = () => {
     website.placeholder = defaultWebsite() || 'Set your domain above';
     vpnHost.placeholder = inputs['gateway.domain'].value.trim() || 'Set your domain above';
@@ -1165,9 +1169,10 @@ function networkSettingsCard(s, relay, publicSettings) {
     result.gateway.relay_host = parseURL(relayURL())?.hostname || '';
     result.gateway.relay_public_url = relayURL();
     result.gateway.relay_backend = relayBackend.value.trim() || defaultRelayBackend();
-    result.gateway.portal_cidrs = portalNetworks();
+    result.gateway.portal_cidrs = portalNetworks(false);
     if (vpnEndpoint()) result.remote = { host: vpnEndpoint(), ports: Object.fromEntries(vpnPorts.map(({ listener, input }) => [listener.proto, Number(input.value)])) };
     result.portal.enabled = portalEnabled.checked;
+    if (!isolatedPortal.checked) { result.portal.target = ''; result.portal.destinations = []; }
     result.portal.host = websiteHost();
     result.gateway.replace_services = manageServices.checked;
     result.gateway.services = manageServices.checked ? rows.filter(row => !row.removed).map(row => ({ name: row.name.value.trim(), host: row.host.value.trim(), url: row.url.value.trim(), paths: split(row.paths.value), public: row.public.checked, insecure_tls: row.insecure_tls.checked })) : [];
@@ -1184,7 +1189,7 @@ function networkSettingsCard(s, relay, publicSettings) {
     const flag = (control, message) => errors.push({ control, message });
     const validAddress = value => /^\d+\.\d+\.\d+\.\d+$/.test(value) && value.split('.').every(part => Number(part) <= 255);
     const target = inputs['portal.target'].value.trim();
-    if (portalEnabled.checked || target) {
+    if (isolatedPortal.checked && (portalEnabled.checked || target)) {
       const [address, port] = target.split(':');
       if (!validAddress(address || '') || !/^\d+$/.test(port || '') || Number(port) < 1024 || Number(port) > 65535 || ['80', '443'].includes(port)) flag(inputs['portal.target'], 'Use the gateway’s LAN IPv4 address and a dedicated port, for example ' + (detected?.gateway_ipv4 || '192.0.2.10') + ':9443.');
       if (portalEnabled.checked && !split(inputs['portal.destinations'].value).length) flag(inputs['portal.destinations'], 'Enter the IPv4 DNS answers for the portal. Try Detect addresses.');
@@ -1256,15 +1261,22 @@ function networkSettingsCard(s, relay, publicSettings) {
     } }, 'Allow the detected LAN into private services')),
     h('div', { class: 'form cols' }, input('lan_cidrs', 'LAN networks blocked for guests', 'Shared by OpenVPN and Apple relay.'), input('blocked_cidrs', 'Other networks blocked for guests', 'Include public addresses that route back into your local network.')),
     details('VPN addressing, DNS and routes', h('div', { class: 'form cols' }, input('vpn_subnet', 'VPN subnet'), input('guest_subnet', 'Guest subnet'), input('pool_first', 'First dynamic client address'), input('pool_last', 'Last dynamic client address'), input('dns_servers', 'VPN DNS servers'), input('routes', 'Additional VPN routes'))),
-    h('div', { class: 'portal-setup' }, h('h3', null, 'Private download portal'), h('p', null, 'First configure and deploy the dedicated gateway listener. Then enable guest access and restart VPN.'),
-      h('div', { class: 'form cols' }, input('portal.target', 'Dedicated portal listener', 'Gateway LAN IPv4:port. Suggested port 9443 serves only the portal; keep it off public port forwards.'), input('portal.destinations', 'Portal DNS IPv4 addresses', 'All IPv4 addresses clients may resolve for the website. These are redirected to the dedicated listener.')),
-      details('Portal access override', input('gateway.portal_cidrs', 'Networks allowed into the portal', 'Optional. Defaults to private-service access networks plus the VPN/relay server’s outgoing address.')),
-      h('label', { class: 'row' }, portalEnabled, 'Allow guests to use the private portal')));
+    h('div', { class: 'portal-setup' }, h('h3', null, 'User portal access'),
+      h('p', null, 'Allow guest source IPs only on the portal pages and downloads. Users still sign in; private and administrator services keep their own access rules.'),
+      h('label', { class: 'row' }, portalEnabled, 'Allow guests to use the private portal'),
+      input('gateway.portal_cidrs', 'Networks allowed into the portal', 'Optional override. Defaults include private-service networks and the VPN/relay server source IP. Enabling guests adds the guest subnet to the export.'),
+      details('Advanced: routing through guest LAN blocks',
+        h('p', { class: 'small muted' }, 'Use this only when VPN or relay guest isolation blocks the path to the gateway. Existing dedicated routing is preserved until you disable it.'),
+        h('label', { class: 'row' }, isolatedPortal, 'Use dedicated portal routing'),
+        h('div', { class: 'form cols', id: 'isolated-portal-fields', hidden: !isolatedPortal.checked },
+          input('portal.target', 'Dedicated portal listener', 'Gateway LAN IPv4:port serving only portal paths. Deploy it before enabling dedicated routing.'),
+          input('portal.destinations', 'Portal DNS IPv4 addresses', 'IPv4 DNS answers redirected to the dedicated listener.')))));
+
   const serviceFields = h('div', { class: 'form', hidden: !manageServices.checked }, h('p', { class: 'notice' }, 'This replaces the gateway’s service inventory. Include every service you want to keep.'), services, h('div', null, h('button', { class: 'btn', onClick: () => addService() }, 'Add service')));
   manageServices.addEventListener('change', () => { serviceFields.hidden = !manageServices.checked; });
   const applyStep = step('4', 'Save and apply', 'Save your settings, deploy the gateway file, then restart VPN only when VPN or firewall changes are ready.',
     details('Additional gateway services', h('label', { class: 'row' }, manageServices, 'Manage and replace the gateway’s additional services here'), h('p', { class: 'small muted' }, 'Leave this off to keep the gateway’s existing service inventory.'), serviceFields),
-    h('ol', { class: 'setup-steps' }, h('li', null, 'Save and download the Traefik settings file.'), h('li', null, 'Copy network.private.json to your gateway. Run ', h('code', null, './manage setup --network-file ./network.private.json'), ', then ', h('code', null, 'sudo docker compose up -d --build --remove-orphans'), '.'), h('li', null, 'After the gateway listener is running, enable guest portal access and choose Save and restart VPN.')),
+    h('ol', { class: 'setup-steps' }, h('li', null, 'Save and download the Traefik settings file.'), h('li', null, 'Copy network.private.json to your gateway. Run ', h('code', null, './manage setup --network-file ./network.private.json'), ', then ', h('code', null, 'sudo docker compose up -d --build --remove-orphans'), '.'), h('li', null, 'Use Save and restart VPN only when VPN/firewall settings or advanced portal routing changed. A Traefik allowlist-only change does not need a VPN restart.')),
     resultMessage, h('div', { class: 'row settings-actions' },
       h('button', { class: 'btn', onClick: event => busy(event.currentTarget, async () => { await save(false); success('Settings saved. Download and deploy the gateway file if addresses or routing changed.'); }) }, 'Save settings'),
       h('button', { class: 'btn primary', onClick: event => busy(event.currentTarget, async () => {
@@ -1278,6 +1290,9 @@ function networkSettingsCard(s, relay, publicSettings) {
       h('button', { class: 'btn', onClick: event => busy(event.currentTarget, async () => { await save(true); success('Settings saved. VPN is restarting; connected VPN clients will reconnect.'); }) }, 'Save and restart VPN')));
   const root = h('div', { class: 'form network-settings' }, publicStep, internalStep, accessStep, applyStep);
   for (const control of [inputs['gateway.domain'], inputs['gateway.openvpn_backend'], inputs['gateway.trusted_cidrs'], inputs['gateway.portal_cidrs'], website, vpnHost, ...vpnPorts.map(port => port.input), relayBackend, relayPort, customRelay]) control.addEventListener('input', refreshAddresses);
+  portalEnabled.addEventListener('change', refreshAddresses);
+  inputs['guest_subnet'].addEventListener('input', refreshAddresses);
+  isolatedPortal.addEventListener('change', () => { root.querySelector('#isolated-portal-fields').hidden = !isolatedPortal.checked; });
   refreshAddresses();
   detect();
   return card('Network and private portal', root);

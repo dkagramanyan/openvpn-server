@@ -3,6 +3,11 @@
 
 ## Unreleased
 
+* Make guest portal access a portal-only Traefik source allowlist by default.
+  Include the guest subnet in the export without granting private/admin access.
+  Move dedicated listener and DNS redirection fields into an optional advanced
+  section; preserve existing isolated routing and guest LAN restrictions.
+
 * Guide administrator setup through public addresses, detected internal IPs,
   access/portal settings and deployment steps. Preserve edited values and public
   ports; infer no private-service access grants. Allow staged portal listener

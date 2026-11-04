@@ -110,6 +110,25 @@ def test_ui_policy_changes_reach_relay_authorization(config, monkeypatch):
     config["portal"]["enabled"] = False
     network.save_settings(network.NetworkSettings(**config))
     assert relay.authorize(DB(), "Bearer guest:token")["portal"] is None
+    config["portal"].update(enabled=True, target="", destinations=[])
+    network.save_settings(network.NetworkSettings(**config))
+    assert relay.authorize(DB(), "Bearer guest:token")["portal"] is None
+
+
+def test_guest_portal_allowlist_does_not_require_dedicated_routing_or_grant_admin_access(config):
+    config["portal"].update(enabled=True, target="", destinations=[])
+    config["gateway"]["portal_cidrs"] = []
+    private_networks = config["gateway"]["trusted_cidrs"][:]
+    network.save_settings(network.NetworkSettings(**config))
+    exported = network.export_gateway()
+    assert exported["portal"]["target"] == ""
+    assert exported["gateway"]["portal_cidrs"] == [*private_networks, config["guest_subnet"]]
+    assert exported["gateway"]["trusted_cidrs"] == private_networks
+    assert exported["gateway"]["trusted_cidrs"] != exported["gateway"]["portal_cidrs"]
+    text = settings.network_file.read_text()
+    assert "GUEST_PORTAL_HOST=\n" in text
+    assert "GUEST_PORTAL_TARGET=\n" in text
+    assert network.get_settings()["lan_cidrs"] == config["lan_cidrs"]
 
 
 class SavedSettings:

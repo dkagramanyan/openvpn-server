@@ -57,6 +57,10 @@ def scenario(browser, portal=False):
                 network.update({key:value for key,value in body.items() if key not in ('relay','remote')})
                 relay.update(body['relay'])
                 result = {'settings':network, 'relay':relay, 'restart_required':True}
+            elif path == '/api/network/traefik.json':
+                result = dict(version=1,gateway=copy.deepcopy(network['gateway']),portal=copy.deepcopy(network['portal']))
+                if network['portal']['enabled']:
+                    result['gateway']['portal_cidrs'] = list(dict.fromkeys([*result['gateway']['portal_cidrs'], network['guest_subnet']]))
             else:
                 data = {
                     '/api/me':dict(username='alice-login' if portal else 'admin', role='client' if portal else 'admin', client_name='alice' if portal else None, guest_sub='10.8.0.128/25'),
@@ -107,9 +111,18 @@ def scenario(browser, portal=False):
         page.get_by_text('VPN server: 192.0.2.20',exact=False).wait_for()
         assert page.get_by_label('VPN server web address',exact=True).input_value()=='http://192.0.2.99:8088'
         page.get_by_label('Allow guests to use the private portal',exact=True).check()
+        with page.expect_download() as simple_download:
+            page.get_by_role('button',name='Save and download Traefik settings',exact=True).click()
+        simple=json.loads(Path(simple_download.value.path()).read_text())
+        assert simple['portal']['target']=='' and simple['portal']['destinations']==[]
+        assert '10.8.0.128/25' in simple['gateway']['portal_cidrs']
+        assert '10.8.0.128/25' not in simple['gateway']['trusted_cidrs']
+        page.get_by_text('Advanced: routing through guest LAN blocks',exact=True).click()
+        page.get_by_label('Use dedicated portal routing',exact=True).check()
+        saves_before = len(saved)
         page.get_by_label('Dedicated portal listener',exact=True).fill('missing-port')
         page.get_by_role('button',name='Save settings',exact=True).click()
-        assert not saved
+        assert len(saved)==saves_before
         assert page.get_by_label('Dedicated portal listener',exact=True).get_attribute('aria-invalid')=='true'
         page.get_by_label('Dedicated portal listener',exact=True).fill('192.0.2.10:9443')
         with page.expect_download() as download:

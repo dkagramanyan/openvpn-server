@@ -211,9 +211,9 @@ def validate(body):
     for key in ("domain", "openvpn_host", "relay_host"):
         if gateway[key]: gateway[key] = hostname(gateway[key])
     portal["host"] = hostname(portal["host"]) if portal["host"] else gateway["openvpn_host"]
-    if portal["enabled"] or portal["target"]:
-        if portal["enabled"]:
-            portal["host"] = hostname(portal["host"])
+    if portal["enabled"]:
+        portal["host"] = hostname(portal["host"])
+    if portal["target"]:
         try:
             portal["target"] = endpoint(portal["target"], portal=True)
         except PkiError:
@@ -280,12 +280,13 @@ def save_settings(body):
         route = ipaddress.IPv4Network(value)
         lines.append(f'push "route {route.network_address} {route.netmask}"')
     portal = data["portal"]
+    isolated_portal = portal["enabled"] and bool(portal["target"])
     fields = {"TRUST_SUB": data["vpn_subnet"], "GUEST_SUB": data["guest_subnet"],
         "LAN_CIDRS": " ".join(data["lan_cidrs"]), "GUEST_BLOCK": " ".join(data["blocked_cidrs"]),
         "PROXY_CIDRS": " ".join(data["proxy_cidrs"]),
-        "GUEST_PORTAL_HOST": portal["host"] if portal["enabled"] else "",
-        "GUEST_PORTAL_TARGET": portal["target"] if portal["enabled"] else "",
-        "GUEST_PORTAL_DESTINATIONS": " ".join(portal["destinations"]) if portal["enabled"] else "",
+        "GUEST_PORTAL_HOST": portal["host"] if isolated_portal else "",
+        "GUEST_PORTAL_TARGET": portal["target"] if isolated_portal else "",
+        "GUEST_PORTAL_DESTINATIONS": " ".join(portal["destinations"]) if isolated_portal else "",
         "NETWORK_JSON": json.dumps(data, separators=(",", ":"))}
     path = settings.network_file
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -322,6 +323,8 @@ def export_gateway(db=None):
         raise PkiError("Complete these settings before exporting: " + ", ".join(missing))
     if data["portal"]["enabled"] and data["portal"]["host"] != gateway["openvpn_host"]:
         raise PkiError("The private portal and gateway OpenVPN host must match")
+    if data["portal"]["enabled"]:
+        gateway["portal_cidrs"] = list(dict.fromkeys([*(gateway["portal_cidrs"] or gateway["trusted_cidrs"]), data["guest_subnet"]]))
     return {"version": 1, "gateway": gateway, "portal": data["portal"]}
 
 

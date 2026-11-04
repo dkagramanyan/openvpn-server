@@ -226,4 +226,4 @@ def authorize(db, authorization: str, *, strict_state: bool = False) -> dict | N
     portal = network.get("portal", {})
     return {"client": name, "allowed_cidrs": allowed,
             "blocked_cidrs": blocked, "guest": guest, "url": config["url"],
-            "portal": portal if guest and portal.get("enabled") else None}
+            "portal": portal if guest and portal.get("enabled") and portal.get("target") else None}
