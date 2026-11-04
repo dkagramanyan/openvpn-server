@@ -8,10 +8,10 @@ import (
 	"strings"
 )
 
-// Guests may reach only the gateway's guest portal listener: the personal
-// portal plus the guest links the administrator added. That listener serves
-// nothing else, so a guest never reaches the regular HTTPS listener, where the
-// relay's LAN source address would count as trusted.
+// Guests reach the gateway only through its guest portal listener: the
+// personal portal plus the guest links the administrator added. That listener
+// serves nothing else, so a guest never reaches the regular HTTPS listener,
+// where the relay's LAN source address would count as trusted.
 type guestPortal struct {
 	hosts  map[string]bool // the portal hostname and the guest links' hostnames
 	target netip.AddrPort
@@ -44,26 +44,24 @@ func parseGuestPortal(c portalConfig) (*guestPortal, error) {
 	return portal, nil
 }
 
-// resolveDestination returns the addresses a flow may dial. A guest may open
-// only the portal and guest-link hostnames on TCP 443, pinned to the portal
-// listener without DNS; the HTTPS bytes (SNI, Host) pass unchanged to the
-// gateway, which routes only those hostnames (and the links' paths).
+// resolveDestination returns the addresses a flow may dial. A guest's TCP 443
+// flow to the portal or a guest-link hostname is pinned to the portal listener
+// without DNS; the HTTPS bytes (SNI, Host) pass unchanged to the gateway, which
+// routes only those hostnames (and the links' paths). Anything else a guest
+// opens is resolved and checked like a full client's, minus local networks.
 func (s *relayServer) resolveDestination(ctx context.Context, target string, p policy, tcp bool) (context.Context, []netip.AddrPort, error) {
 	if !p.compiled {
 		if err := p.compile(); err != nil {
 			return ctx, nil, errDestinationDenied
 		}
 	}
-	if !p.Guest {
-		addresses, err := resolveAll(ctx, target, p)
-		return ctx, addresses, err
-	}
 	host, port, err := net.SplitHostPort(target)
 	if err != nil {
 		return ctx, nil, errInvalidTarget
 	}
-	if p.portal == nil || !tcp || port != "443" || !p.portal.hosts[normalHost(host)] {
-		return ctx, nil, errDestinationDenied
+	if !p.Guest || p.portal == nil || !tcp || port != "443" || !p.portal.hosts[normalHost(host)] {
+		addresses, err := resolveAll(ctx, target, p)
+		return ctx, addresses, err
 	}
 	ctx = context.WithValue(ctx, portalFlowKey{}, p.portal.target)
 	return ctx, []netip.AddrPort{p.portal.target}, nil

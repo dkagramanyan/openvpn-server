@@ -340,24 +340,23 @@ tls:
         assert denied.returncode != 0
         activity = json.loads(api("/api/relay/status"))["events"]
         assert any(e["guest"] and e["kind"] == "denied" and e["reason"] == "destination_denied" for e in activity)
-        assert subprocess.run([*curl, "https://example.com/"], capture_output=True).returncode != 0
         # The portal host goes to the gateway's portal listener, which serves only portal pages.
         inner_tls = ["--insecure"]   # the fixture certificate is for localhost
         assert "OpenVPN" in command(*curl, *inner_tls, "https://openvpn.example.test/portal")
         hidden = subprocess.run([*[x for x in curl if x != "--fail"], *inner_tls, "--output", "/dev/null", "--write-out", "%{http_code}",
                                  "https://openvpn.example.test/api/clients"], capture_output=True, text=True)
         assert hidden.stdout.endswith("404"), hidden.stdout
-        # A guest link reaches its route on the portal listener; another hostname is refused by the relay.
+        # A guest link reaches its route on the portal listener; another hostname of the domain is not pinned there.
         status = lambda url: subprocess.run([*[x for x in curl if x not in ("--fail", "%{http_connect}", "--write-out")], *inner_tls,
                                              "--output", "/dev/null", "--write-out", "%{http_code}", url], capture_output=True, text=True).stdout
         assert status("https://files.example.test/share/x") == "404"   # answered by the backend behind the link route
-        assert status("https://grafana.example.test/") == "000"        # CONNECT refused
-        print("PASS: a relay guest reaches only the portal pages and guest links: no LAN, no internet, no admin API")
+        assert status("https://grafana.example.test/") == "000"        # CONNECT refused (no such public name)
+        print("PASS: a relay guest reaches the portal pages and guest links but not the LAN or the admin API")
         guest_signed = api("/api/clients/alice/relay.mobileconfig", {}, "POST")
         guest_xml = command("openssl", "cms", "-verify", "-binary", "-inform", "DER", "-purpose", "any", data=guest_signed, env=env)
         guest_payload = plistlib.loads(guest_xml.encode())["PayloadContent"][0]
         assert token == guest_payload["Relays"][0]["AdditionalHTTPHeaderFields"]["Authorization"]
-        assert guest_payload["MatchDomains"] == ["openvpn.example.test", "files.example.test"]
+        assert guest_payload["MatchDomains"] == []   # everything through the relay
         api("/api/clients/alice/access", {"guest": False}, "PUT")
         time.sleep(2)
         assert "OpenVPN" in command(*curl, "http://" + address + ":8080/")

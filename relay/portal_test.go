@@ -15,13 +15,14 @@ import (
 	"time"
 )
 
-func TestGuestReachesOnlyThePortal(t *testing.T) {
+func TestGuestPortalIsPinnedAndInternetIsOpen(t *testing.T) {
 	portal, err := parseGuestPortal(portalConfig{Host: "OpenVPN.Example.test", Target: "192.0.2.13:9443"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	s := &relayServer{}
-	p := policy{Portal: &portalConfig{Host: "openvpn.example.test", Target: portal.target.String(), Hosts: []string{"files.example.test"}}, Guest: true}
+	p := policy{Portal: &portalConfig{Host: "openvpn.example.test", Target: portal.target.String(), Hosts: []string{"files.example.test"}},
+		Guest: true, CIDRs: []string{"0.0.0.0/0", "::/0"}}
 	for _, target := range []string{"openvpn.example.test:443", "OPENVPN.EXAMPLE.TEST.:443", "files.example.test:443"} {
 		ctx, addresses, err := s.resolveDestination(context.Background(), target, p, true)
 		if err != nil || len(addresses) != 1 || addresses[0] != portal.target || !s.portalFlow(ctx, portal.target.Addr(), p) {
@@ -31,24 +32,35 @@ func TestGuestReachesOnlyThePortal(t *testing.T) {
 			t.Fatal("portal flow escaped its pinned destination")
 		}
 	}
-	// No internet, no LAN, no other port or protocol, not even the portal's own addresses.
-	for _, target := range []string{"example.com:443", "8.8.8.8:443", "grafana.example.test:443", "files.example.test:80", "192.0.2.13:443", "192.0.2.13:9443", "openvpn.example.test:80", "openvpn.example.test:8443", "127.0.0.1:443"} {
-		if _, _, err := s.resolveDestination(context.Background(), target, p, true); err == nil {
-			t.Fatalf("guest allowed %s", target)
+	// The internet is open, through the relay host's own DNS and routes.
+	ctx, addresses, err := s.resolveDestination(context.Background(), "8.8.8.8:443", p, true)
+	if err != nil || len(addresses) != 1 || addresses[0].String() != "8.8.8.8:443" || s.portalFlow(ctx, addresses[0].Addr(), p) {
+		t.Fatalf("guest internet: %v %v", addresses, err)
+	}
+	// Nothing local, on any port or protocol.
+	for _, target := range []string{"127.0.0.1:443", "10.0.0.5:443", "192.168.1.1:80", "[fd00::1]:443", net.JoinHostPort(localIP(t), "443")} {
+		for _, tcp := range []bool{true, false} {
+			if _, _, err := s.resolveDestination(context.Background(), target, p, tcp); err == nil {
+				t.Fatalf("guest allowed %s (tcp %v)", target, tcp)
+			}
 		}
 	}
-	if _, _, err := s.resolveDestination(context.Background(), "openvpn.example.test:443", p, false); err == nil {
-		t.Fatal("guest allowed UDP to the portal")
+	// Only TCP 443 to a portal hostname is pinned.
+	for _, c := range []struct {
+		target string
+		tcp    bool
+		p      policy
+	}{{"openvpn.example.test:443", false, p}, {"openvpn.example.test:80", true, p}, {"openvpn.example.test:443", true, policy{Guest: true}}} {
+		ctx, addresses, _ := s.resolveDestination(context.Background(), c.target, c.p, c.tcp)
+		if len(addresses) == 1 && addresses[0] == portal.target || s.portalFlow(ctx, portal.target.Addr(), c.p) {
+			t.Fatalf("pinned %s (tcp %v)", c.target, c.tcp)
+		}
 	}
 	if s.portalFlow(context.Background(), portal.target.Addr(), p) {
 		t.Fatal("a flow without the pinned portal target passed")
 	}
-	noPortal := policy{Guest: true}
-	if _, _, err := s.resolveDestination(context.Background(), "openvpn.example.test:443", noPortal, true); err == nil {
-		t.Fatal("guest without a configured portal reached it")
-	}
 	full := policy{CIDRs: []string{"0.0.0.0/0"}}
-	_, addresses, err := s.resolveDestination(context.Background(), "192.0.2.13:443", full, true)
+	_, addresses, err = s.resolveDestination(context.Background(), "192.0.2.13:443", full, true)
 	if err != nil || addresses[0].Port() != 443 {
 		t.Fatal("full-access route changed")
 	}

@@ -144,16 +144,20 @@ say "Wait for the timeout and the collector"
 sleep 30
 api check || fail "the UI does not match what happened"
 
-say "A guest reaches only the portal; a full client reaches the home networks and the internet"
-# Three networks behind the server, each with a web server: the home LAN, a network server.conf
-# pushes a route to, and a public one that stands for the internet. "nat-unprotected" makes
-# Docker route into them like a plain LAN instead of dropping what comes from elsewhere.
-for net in home:192.0.2 routed:203.0.113 inet:198.51.100; do
+say "A guest reaches the internet and the portal, not the LAN; a full client reaches everything"
+# Two networks behind the server, each with a web server: the home LAN and a network server.conf
+# pushes a route to. "nat-unprotected" makes Docker route into them like a plain LAN instead of
+# dropping what comes from elsewhere.
+for net in home:192.0.2 routed:203.0.113; do
     docker network create -o com.docker.network.bridge.gateway_mode_ipv4=nat-unprotected \
         --subnet "${net#*:}.0/24" "${net%%:*}" >/dev/null
     docker run -d --name "web-${net%%:*}" --network "${net%%:*}" --ip "${net#*:}.10" --entrypoint python \
         openvpn-ui:local -m http.server 8000 >/dev/null
 done
+# The internet: a public address behind a router on the home LAN, so not one of the server's own networks.
+docker run -d --name web-inet --network home --ip 192.0.2.11 --cap-add NET_ADMIN --entrypoint sh openvpn-ui:local \
+    -c 'ip addr add 198.51.100.10/32 dev eth0 && { python -m http.server 443 & exec python -m http.server 8000; }' >/dev/null
+ip route add 198.51.100.0/24 via 192.0.2.11
 # The gateway's guest portal listener, on the home LAN.
 docker run -d --name portal-gw --network home --ip 192.0.2.20 --entrypoint python openvpn-ui:local -m http.server 9443 >/dev/null
 api portal 192.0.2.20:9443
@@ -165,21 +169,21 @@ client alice-phone $NET.10 alice.ovpn --explicit-exit-notify 1
 client gina-phone $NET.30 gina.ovpn --explicit-exit-notify 1
 [ "$(vpn_ip alice-phone)" = 10.8.0.100 ] || fail "alice did not get her static address"
 vpn_ip gina-phone | grep -qE '^10\.8\.0\.(1[3-9][0-9]|12[89]|2[0-4][0-9]|25[0-4])$' || fail "the guest got $(vpn_ip gina-phone), outside the guest range"
-for target in 192.0.2.10:8000 203.0.113.10:8000 198.51.100.10:8000 10.8.0.1:8080 198.51.100.1:8080; do
+for target in 192.0.2.10:8000 203.0.113.10:8000 198.51.100.10:8000 10.8.0.1:8080 192.0.2.1:8080; do
     reaches alice-phone $target || fail "alice (full access) cannot reach $target"
 done
-# HTTPS to any address lands on the portal listener, whatever the guest's DNS answered ...
-for target in 198.51.100.10:443 192.0.2.10:443; do
-    reaches gina-phone $target || fail "the guest's $target did not reach the portal listener"
+# The internet, and HTTPS to the gateway lands on its portal listener ...
+for target in 198.51.100.10:8000 198.51.100.10:443 192.0.2.20:443; do
+    reaches gina-phone $target || fail "the guest cannot reach $target"
 done
-# ... and nothing else: not the internet, not the home networks, not the listener directly,
-# not the server host (its tunnel address or another one of its addresses), not a published port
-for target in 198.51.100.10:8000 192.0.2.10:8000 203.0.113.10:8000 192.0.2.20:9443 10.8.0.1:8080 198.51.100.1:8080 "$TARGET:8000"; do
+# ... but nothing local: not the home networks, not the listener directly, not the server
+# host (its tunnel address or another one of its addresses), not a published port
+for target in 192.0.2.10:8000 192.0.2.10:443 203.0.113.10:8000 192.0.2.20:9443 10.8.0.1:8080 192.0.2.1:8080 "$TARGET:8000"; do
     reaches gina-phone $target && fail "the guest reaches $target"
 done
 docker exec gina-phone ping -c 1 -W 2 10.8.0.100 >/dev/null 2>&1 && fail "the guest can ping another client"
 docker exec openvpn ip6tables -S OVPN-INPUT | grep -q -- '-s fd00:8::/64 -i tun+ -j DROP' || fail "no IPv6 rule for the tunnel"
-echo "    guest $(vpn_ip gina-phone): the portal only"
+echo "    guest $(vpn_ip gina-phone): the internet and the portal, no LAN"
 
 say "One certificate on two devices: the second gets an address of its own"
 client alice-laptop $NET.11 alice.ovpn --explicit-exit-notify 1

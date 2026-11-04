@@ -126,7 +126,7 @@ function clientsView(el) {
       h('thead', null, h('tr', null, th('Name', 'name'), th('Status'), th('Expires', 'expires'), th('Last seen', 'seen'), th('Download', 'dl', 'r'), th('Upload', 'ul', 'r'), th('Sessions', 'sessions', 'r'), h('th', null))),
       h('tbody', null, list.map(c => h('tr', { class: 'clickable', onClick: e => { if (!e.target.closest('button,a')) go('#/clients/' + encodeURIComponent(c.name)); } },
         h('td', { class: 'name-cell' }, c.name, c.note ? h('span', { class: 'sub' }, c.note) : null),
-        h('td', null, h('div', { class: 'row', style: 'gap:6px' }, stateBadge(c), c.tfa ? h('span', { class: 'badge plain', title: 'Two-factor authentication enabled' }, '2FA') : null, c.guest ? h('span', { class: 'subnet', title: 'Guest: only the personal portal' }, 'guest') : c.static_ip ? h('span', { class: 'subnet', title: 'Static IP' }, c.static_ip) : null, c.previous ? h('span', { class: 'badge plain expiring', title: 'Previous certificate still valid' }, 'renewed') : null)),
+        h('td', null, h('div', { class: 'row', style: 'gap:6px' }, stateBadge(c), c.tfa ? h('span', { class: 'badge plain', title: 'Two-factor authentication enabled' }, '2FA') : null, c.guest ? h('span', { class: 'subnet', title: 'Guest: internet and the personal portal, no LAN' }, 'guest') : c.static_ip ? h('span', { class: 'subnet', title: 'Static IP' }, c.static_ip) : null, c.previous ? h('span', { class: 'badge plain expiring', title: 'Previous certificate still valid' }, 'renewed') : null)),
         h('td', { class: 'num' }, c.expires ? [fmtDate(c.expires), h('span', { class: 'muted small' }, ' · ' + fmtDays(c.days_left))] : '—'),
         h('td', null, c.online ? h('span', { class: 'ink2' }, 'now') : fmtAgo(c.total.last_seen)),
         h('td', { class: 'r num' }, fmtBytes(c.traffic.bytes_out)), h('td', { class: 'r num' }, fmtBytes(c.traffic.bytes_in)),
@@ -154,7 +154,7 @@ function newClientDialog(after) {
   const setAccess = g => {
     guest = g;
     access.querySelectorAll('button').forEach((b, i) => b.classList.toggle('active', (i === 1) === g));
-    accessHelp.textContent = g ? 'Only the personal portal (password, profile downloads): no internet, no LAN, not this server or other VPN clients.' : 'Internet, your LAN and this server.';
+    accessHelp.textContent = g ? 'The internet and the personal portal (password, profile downloads): no LAN, not this server or other VPN clients.' : 'Internet, your LAN and this server.';
     ip.disabled = g;
     if (g) ip.value = '';
     ip.placeholder = g ? 'a free guest address per device' : 'optional - dynamic if empty';
@@ -228,8 +228,8 @@ function clientDetailView(el) {
     const accessSeg = h('div', { class: 'seg', role: 'group', 'aria-label': 'Access' }, [['Full access', false], ['Guest', true]].map(([label, g]) =>
       h('button', { class: c.guest === g ? 'active' : '', disabled: c.state !== 'valid', onClick: async () => {
         if (c.guest === g) return;
-        const text = g ? `${name} will reach only the personal portal: no internet, no LAN, not this server or other VPN clients.` : `${name} will reach the internet, your LAN and this server.`;
-        if (await confirmDialog(g ? 'Make guest' : 'Give full access', text + ' OpenVPN changes apply on reconnect. The relay applies them within seconds; download the Apple relay profile again, because guest and full-access profiles route different traffic.', g ? 'Make guest' : 'Give full access')) {
+        const text = g ? `${name} will reach the internet and the personal portal: no LAN, not this server or other VPN clients.` : `${name} will reach the internet, your LAN and this server.`;
+        if (await confirmDialog(g ? 'Make guest' : 'Give full access', text + ' OpenVPN changes apply on reconnect. The relay applies them within seconds.', g ? 'Make guest' : 'Give full access')) {
           await withToast(api(`/api/clients/${enc}/access`, { method: 'PUT', body: { guest: g } }), 'Access changed'); load();
         } } }, label)));
     const kv = (pairs) => h('dl', { class: 'kv' }, pairs.map(([k, v]) => [h('dt', null, k), h('dd', null, v)]));

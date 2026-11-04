@@ -15,7 +15,8 @@ live status, traffic statistics and a personal portal for every client.
   dependencies, light and dark theme.
 * **Personal portal** (`/portal`): a client signs in to download its own
   profiles and change its password.
-* **Guests** reach nothing but that portal: no internet, no LAN.
+* **Guests** get the internet (through your network and its filtering) and that
+  portal, but no LAN.
 * **Security**: unprivileged containers (`NET_ADMIN` only for OpenVPN), the
   management interface on `127.0.0.1` behind a generated password, `tls-crypt`,
   TLS 1.2+ with a pinned cipher list, EC certificates, CRL auto-renewal, strict
@@ -77,31 +78,39 @@ holds the TLS certificates. Its configuration lives in the
 [Traefik repository](https://github.com/dkagramanyan/traefik); this server
 hands it a settings file (see [Network settings](#network-settings-and-the-gateway-file)).
 
-## Guests: the personal portal only
+## Guests: internet, the personal portal, no LAN
 
 A client is either **full access** (internet, LAN, this server) or **guest**.
-A guest, over OpenVPN or the Apple relay, reaches its personal portal at
-`https://openvpn.<domain>/portal` (password, profile downloads) and the
-**guest links** you allow. No internet, no LAN, no other website, no
-administrator page.
+A guest, over OpenVPN or the Apple relay, gets the internet through this
+server, so whatever your LAN router does to this server's traffic (podkop or
+other filtering, its DNS) applies to guests too. Of your own network a guest
+reaches only its personal portal at `https://openvpn.<domain>/portal`
+(password, profile downloads) and the **guest links** you allow: no LAN, no
+other website of yours, no administrator page.
 
 | | OpenVPN | Apple relay |
 |---|---|---|
 | Full access | everything: internet, LAN, this server | everything: internet and LAN |
-| Guest | the pushed DNS servers + the portal and guest links | the portal and guest links |
+| Guest | internet, the pushed DNS servers, the portal and guest links | internet, the portal and guest links |
 
-How it is enforced:
+How it is enforced (`bin/guest-portal.sh`):
 
 * **OpenVPN guests** (`10.8.0.128/25`): the firewall allows the pushed DNS
-  servers and redirects every guest HTTPS connection (TCP 443, any address) to
-  the gateway's portal listener (`bin/guest-portal.sh`). Everything else from
-  the guest subnet is dropped. So the portal opens whatever address a guest's
-  DNS returns for `openvpn.<domain>`, and every other HTTPS site fails.
-* **Relay guests**: the relay accepts only `openvpn.<domain>:443` and the guest
-  links' hostnames on 443, and connects them straight to the portal listener;
-  every other destination is refused. A guest's relay profile routes only those
-  hostnames through the relay, so the device keeps its own internet connection
-  while the profile is installed.
+  servers, redirects a guest's HTTPS connection to the gateway (TCP 443 to the
+  portal listener's address) to the portal listener, and drops everything
+  local: private ranges (`10/8`, `172.16/12`, `192.168/16`, `100.64/10`,
+  link-local), the networks of this host's interfaces, the routes pushed in
+  `server.conf`, other VPN clients, ping, and this host itself. The rest goes
+  out to the internet. Your LAN DNS should answer `openvpn.<domain>` (and the
+  guest links' hostnames) with the gateway's LAN address, as for full clients.
+* **Relay guests**: the relay connects `openvpn.<domain>:443` and the guest
+  links' hostnames on 443 straight to the portal listener. Any other
+  destination is resolved with this host's DNS and allowed unless it is local:
+  private ranges, `100.64/10`, the relay host's own networks and the routes in
+  Settings → Network.
+* **Your public address**: a guest who opens your public IP reaches the gateway
+  through your router (hairpin NAT). Keep the address your router uses for that
+  out of the gateway's trusted networks, or guests count as trusted there.
 * **The portal listener** (Traefik entrypoint `portal`, normally the gateway's
   LAN address, port 9443) serves only the OpenVPN website and adds
   `X-OpenVPN-Portal-Only: 1`; with it, the UI answers only `/portal`,
@@ -115,13 +124,13 @@ or *the whole website*. The gateway adds a route for each link on the portal
 listener, using the backend of its existing route for that hostname; guests see
 the links on their portal page. Add a link, download the gateway file and apply
 it on the gateway; the relay picks it up within seconds, guest relay profiles
-need a new download. A page that loads scripts or images from elsewhere on its
+does not need a new profile. A page that loads scripts or images from elsewhere on its
 website may need the whole website.
 
-Without a portal listener in Settings, guests reach nothing at all (DNS only).
-Changing a client between guest and full access applies to OpenVPN on the next
-connection and to the relay within seconds; download the relay profile again,
-because the two roles route different traffic.
+Without a portal listener in Settings, guests get the internet but not their
+portal. Changing a client between guest and full access applies to OpenVPN on
+the next connection and to the relay within seconds; the relay profile stays
+the same.
 
 ## Network settings and the gateway file
 
@@ -239,8 +248,8 @@ over privately or on the LAN.
 
 ## Upgrading to 2.0
 
-2.0 moves the UI's state from SQLite to PostgreSQL, adds the Apple relay and
-makes guests portal-only. From 1.x:
+2.0 moves the UI's state from SQLite to PostgreSQL and adds the Apple relay
+and the guests' portal. From 1.x (or 2.x):
 
 ```shell
 cd ~/openvpn-server &&
@@ -533,7 +542,7 @@ from it, and dropping a revoked entry would make that certificate valid again.
 |---|---|
 | `10.8.0.2-99` | dynamic pool (full access) |
 | `10.8.0.100-127` | static IPs (full access) |
-| `10.8.0.128/25` (`GUEST_SUB`) | guests: the pushed DNS servers and the personal portal only |
+| `10.8.0.128/25` (`GUEST_SUB`) | guests: internet, the pushed DNS servers and the personal portal; no LAN |
 
 One certificate may be used on several devices at once (`duplicate-cn`).
 `bin/client-access.sh` (`client-connect`) gives every device its own address:
@@ -550,8 +559,9 @@ connection for up to two minutes, and for that time counts twice and gets a
 second address.
 
 For guests the entrypoint allows the pushed DNS servers and the portal
-redirect (see [Guests](#guests-the-personal-portal-only)) and drops everything
-else, including traffic to other VPN clients and to the server host itself.
+redirect (see [Guests](#guests-internet-the-personal-portal-no-lan)) and drops
+everything local, including traffic to other VPN clients and to the server
+host itself; the rest goes to the internet.
 The rules live in the chains `OVPN-NAT`, `OVPN-INPUT`, `OVPN-FORWARD` (hooked
 into `DOCKER-USER` when Docker manages the firewall, else the top of
 `FORWARD`) and `OVPN-ACCEPT` (end of `FORWARD`). They are flushed and rebuilt
@@ -713,7 +723,7 @@ tests/e2e/run.sh                         # end-to-end test (needs Docker)
 The end-to-end test builds the images and runs the whole service with real
 OpenVPN clients inside one Docker-in-Docker container, so its networks, tun
 devices and firewall rules never touch the machine it runs on. It covers UDP
-and the TCP fallback, the SQLite import, portal-only guests, two devices on one
+and the TCP fallback, the SQLite import, the guest rules, two devices on one
 certificate, the device limit, revocation, the MSS clamp and backups (plain and
 encrypted) with a restore. It runs without kernel offload. `E2E_KEEP=1` keeps
 the container for a look at the UI.

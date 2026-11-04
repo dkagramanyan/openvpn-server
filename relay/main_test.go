@@ -241,12 +241,21 @@ func TestRelayTCPUDPAndRevocation(t *testing.T) {
 	}
 }
 
-func TestGuestPolicyDeniesEveryResolvedAddress(t *testing.T) {
-	p := policy{Guest: true, CIDRs: []string{"0.0.0.0/0", "::/0"}}
-	for _, ip := range []string{"8.8.8.8", "1.1.1.1", "::ffff:8.8.8.8", "2001:4860:4860::8888", "192.168.1.1", localIP(t)} {
-		if p.allows(netip.MustParseAddr(ip)) {
-			t.Errorf("guest destination allowed: %s", ip)
+func TestGuestPolicyAllowsInternetButNothingLocal(t *testing.T) {
+	p := policy{Guest: true, CIDRs: []string{"0.0.0.0/0", "::/0"}, BlockedCIDRs: []string{"198.51.100.0/24"}}
+	// 198.18.0.0/15: the fake addresses a filtering router (podkop) answers with.
+	for _, ip := range []string{"8.8.8.8", "1.1.1.1", "::ffff:8.8.8.8", "2001:4860:4860::8888", "198.18.0.5"} {
+		if !p.allows(netip.MustParseAddr(ip)) {
+			t.Errorf("guest internet destination denied: %s", ip)
 		}
+	}
+	for _, ip := range []string{"192.168.1.1", "::ffff:192.168.1.1", "10.0.0.1", "172.16.0.1", "100.64.0.1", "fd00::1", "127.0.0.1", "198.51.100.7", localIP(t)} {
+		if p.allows(netip.MustParseAddr(ip)) {
+			t.Errorf("guest local destination allowed: %s", ip)
+		}
+	}
+	if (&policy{Guest: true, BlockedCIDRs: []string{"bad"}}).compile() == nil {
+		t.Error("accepted an invalid blocked CIDR")
 	}
 	full := policy{CIDRs: []string{"invalid"}}
 	if full.allows(netip.MustParseAddr("8.8.8.8")) {

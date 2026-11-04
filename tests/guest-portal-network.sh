@@ -35,7 +35,9 @@ nsenter -t "$guest_pid" -n ip addr add 10.8.0.10/24 dev guest0
 nsenter -t "$guest_pid" -n ip link set guest0 up
 nsenter -t "$guest_pid" -n ip route add default via 10.8.0.1
 nsenter -t "$target_pid" -n ip addr add 192.0.2.13/24 dev target0
+nsenter -t "$target_pid" -n ip addr add 198.51.100.4/24 dev target0   # "the internet"
 nsenter -t "$target_pid" -n ip link set target0 up
+ip route add 198.51.100.0/24 via 192.0.2.13
 # No route to the VPN subnet on the Pi: MASQUERADE must supply the return path.
 sysctl -q -w net.ipv4.ip_forward=1
 iptables -P FORWARD DROP
@@ -45,13 +47,15 @@ iptables -t nat -N OVPN-NAT
 iptables -t nat -A POSTROUTING -j OVPN-NAT
 iptables -N OVPN-FORWARD
 iptables -A FORWARD -j OVPN-FORWARD
+warn() { echo "WARNING: $*" >&2; }
 source "$root/bin/guest-portal.sh"
 GUEST_SUB=10.8.0.128/25
 GUEST_PORTAL_TARGET=192.0.2.13:9443
 guest_portal_validate
 guest_portal_rules -A
 guest_portal_rules -C
-iptables -A OVPN-FORWARD -s "$GUEST_SUB" -j DROP     # as the entrypoint: nothing else for guests
+printf '%s\n' 'push "dhcp-option DNS 192.0.2.13"' 'push "route 203.0.113.0 255.255.255.0"' > "$scratch/server.conf"
+guest_rules "$scratch/server.conf"     # as the entrypoint
 iptables -A FORWARD -i 'tun+' -j ACCEPT
 iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 iptables -t nat -A OVPN-NAT -s 10.8.0.0/24 -o lan0 -j MASQUERADE
@@ -67,8 +71,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(str(self.server.server_port).encode())
     def log_message(self, *_): pass
-for port in (443, 8080, 9443):
-    server = Server(('192.0.2.13', port), Handler)
+for address, port in (('192.0.2.13', 443), ('192.0.2.13', 8080), ('192.0.2.13', 9443), ('198.51.100.4', 443), ('198.51.100.4', 8080)):
+    server = Server((address, port), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
 threading.Event().wait()
 PY
@@ -79,14 +83,20 @@ for attempt in $(seq 100); do
 done
 curl --noproxy '*' -fsS --max-time 1 http://192.0.2.13:9443/ >/dev/null
 request() { nsenter -t "$guest_pid" -n curl --noproxy '*' --interface "$1" -fsS --max-time 1 "http://$2/"; }
-# Any HTTPS destination of a guest lands on the portal listener.
+# A guest's HTTPS to the gateway lands on the portal listener; the internet is open.
 [[ $(request 10.8.0.129 192.0.2.13:443) == 9443 ]]
-[[ $(request 10.8.0.129 198.51.100.4:443) == 9443 ]]
+[[ $(request 10.8.0.129 198.51.100.4:443) == 443 ]]
+[[ $(request 10.8.0.129 198.51.100.4:8080) == 8080 ]]
+# Nothing else on the LAN.
 for port in 8080 9443; do
     if request 10.8.0.129 "192.0.2.13:$port" 2>/dev/null; then
-        echo "Guest reached forbidden direct port $port" >&2; exit 1
+        echo "Guest reached forbidden LAN port $port" >&2; exit 1
     fi
 done
+for net in 10.0.0.0/8 192.168.0.0/16 192.0.2.0/24 203.0.113.0/24; do
+    iptables -C OVPN-FORWARD -s "$GUEST_SUB" -d "$net" -j DROP
+done
+iptables -C OVPN-FORWARD -s "$GUEST_SUB" -d 192.0.2.13 -p udp --dport 53 -j ACCEPT
 [[ $(request 10.8.0.10 192.0.2.13:443) == 443 ]]
 [[ $(request 10.8.0.10 192.0.2.13:8080) == 8080 ]]
-echo 'PASS: guest HTTPS goes to the portal listener, nothing else is reachable; full access unchanged'
+echo 'PASS: guests reach the internet and, on the gateway, only the portal listener; no LAN; full access unchanged'

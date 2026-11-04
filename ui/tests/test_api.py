@@ -642,7 +642,7 @@ def test_full_access_relay_routes_internet_and_lan(client, configured):
     assert "Internet and LAN" in profile["PayloadDescription"]
     policy = client.post("/api/relay/authorize", headers={"Authorization": token}).json()
     assert policy == {"client": "alice", "guest": False, "allowed_cidrs": ["0.0.0.0/0", "::/0"],
-                      "url": configured["url"], "portal": None,
+                      "blocked_cidrs": [], "url": configured["url"], "portal": None,
                       "credential_id": hashlib.sha256(token.removeprefix("Bearer ").partition(":")[2].encode()).hexdigest()}
 
 
@@ -748,11 +748,11 @@ def test_guest_and_non_guest_relay_profiles(client, configured, guest_portal):
         assert client.post("/api/relay/authorize", headers={"Authorization": full_token}).json()["guest"] is True
         profile, guest_token = download(client)
         assert guest_token == full_token
-        # Only the portal goes through the relay; the device keeps its own internet.
-        assert profile["PayloadContent"][0]["MatchDomains"] == ["openvpn.example.com", "files.example.com"]
-        assert "Guest" in profile["PayloadDisplayName"]
+        # Everything goes through the relay, which keeps guests off the LAN.
+        assert profile["PayloadContent"][0]["MatchDomains"] == []
+        assert "Guest" in profile["PayloadDisplayName"] and "without your local network" in profile["PayloadDescription"]
         policy = client.post("/api/relay/authorize", headers={"Authorization": guest_token}).json()
-        assert policy["guest"] is True and policy["allowed_cidrs"] == [] and policy["portal"] == guest_portal
+        assert policy["guest"] is True and policy["allowed_cidrs"] == ["0.0.0.0/0", "::/0"] and policy["portal"] == guest_portal
         assert client.get("/api/clients/alice").json()["relay_available"]
         # Saving the unchanged role must not invalidate a working profile.
         client.put("/api/clients/alice/access", json={"guest": True}, headers=H)
@@ -766,11 +766,10 @@ def test_guest_and_non_guest_relay_profiles(client, configured, guest_portal):
         pki.set_guest("alice", False)
 
 
-def test_guest_relay_profile_needs_the_portal_listener(client, configured, monkeypatch):
+def test_guest_relay_profile_works_without_the_portal_listener(client, configured, monkeypatch):
     monkeypatch.setattr(relay.network, "guest_portal", lambda: None)
     monkeypatch.setattr(relay, "is_guest", lambda name: True)
-    response = client.post("/api/clients/alice/relay.mobileconfig", headers=H)
-    assert response.status_code == 400 and "portal listener" in response.json()["detail"]
+    assert client.post("/api/clients/alice/relay.mobileconfig", headers=H).status_code == 200
 
 
 def test_ui_certificate_renewal_preserves_relay_profile(client, configured, monkeypatch):

@@ -26,7 +26,7 @@ def test_guest_https_goes_only_to_the_portal_listener():
     for command in (dnat, accept, masquerade):
         assert command[command.index("-s") + 1] == "10.8.0.128/25"
         assert command[command.index("-p") + 1] == "tcp"
-    assert "-d" not in dnat   # whatever address the guest's DNS returned
+    assert dnat[dnat.index("-d") + 1] == "192.0.2.13"   # only HTTPS to the gateway; the internet stays open
     assert dnat[dnat.index("--dport") + 1] == "443"
     assert dnat[dnat.index("--to-destination") + 1] == "192.0.2.13:9443"
     assert accept[accept.index("-d") + 1] == "192.0.2.13"

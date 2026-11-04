@@ -1,6 +1,25 @@
 <!-- Network addresses in examples are synthetic; deployment-specific notes are omitted. -->
 # Changelog
 
+## 2.2.0 - 2026-11-04
+
+* **Guests get the internet again**, through this server and therefore through
+  your LAN router's filtering (podkop) and DNS. They still reach nothing local:
+  no LAN, no private ranges, no pushed route, no other VPN client, not this
+  server. Of your websites they open only their portal and the guest links.
+  Full-access clients are unchanged.
+* OpenVPN guests: only HTTPS to the gateway's portal-listener address is
+  redirected to the portal listener (2.0 redirected every HTTPS connection).
+  Blocked: private ranges, the host's own networks and the pushed routes.
+* Relay guests: the relay pins the portal and guest-link hostnames to the
+  portal listener as before; anything else is resolved with the host's DNS and
+  allowed unless it is local (private ranges, `100.64/10`, the relay host's
+  networks, the routes in Settings → Network: the policy's new `blocked_cidrs`).
+  Guest relay profiles send everything through the relay, like full-access
+  ones; **guests download their relay profile once more** after the upgrade.
+* Upgrade: `git pull`, `bin/upgrade-relay.sh` and `docker compose up -d --build`
+  (the guest firewall is in the OpenVPN image).
+
 ## 2.1.0 - 2026-11-04
 
 * **One sign-in for administrators and clients**, at `/` and `/portal`; each

@@ -28,7 +28,7 @@ function connectCard(profile) {
   const downloadError = h('div', { class: 'notice', role: 'alert', hidden: true });
   const showError = error => { downloadError.hidden = false; downloadError.textContent = error.message; };
   const access = profile.guest
-    ? ['Guest access', (profile.links || []).length ? 'Your profiles open only this page and the pages listed below. They do not give internet or local network access.' : 'Your profiles open only this page. They do not give internet or local network access.']
+    ? ['Guest access', 'Internet through this server, without local network access.']
     : ['Full access', 'Internet and local network access through this server.'];
 
   const appleMethod = h('details', { class: 'connection-method', open: apple },

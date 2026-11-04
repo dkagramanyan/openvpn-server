@@ -104,10 +104,6 @@ def profile(db, name: str) -> bytes:
     if not cert:
         raise PkiError("Relay profiles require a valid client certificate")
     guest = is_guest(name)
-    portal = network.guest_portal()
-    if guest and not portal:
-        raise PkiError("Guest relay profiles open only the personal portal. Set the guest portal listener "
-                       "in Settings → Network first")
     # Unexpected certificate replacement cannot inherit an earlier credential.
     # An explicit UI renewal updates this binding without changing the secret.
     with db.tx() as conn:
@@ -133,17 +129,16 @@ def profile(db, name: str) -> bytes:
                 "PayloadUUID": str(uuid.uuid5(uuid.NAMESPACE_URL, identifier + suffix)).upper(),
                 "PayloadDisplayName": title}
 
-    title = ("Guest Portal Relay · " if guest else "Full Access Relay · ") + name
+    title = ("Guest Relay · " if guest else "Full Access Relay · ") + name
     relay = payload("com.apple.relay.managed", ".relay", title)
     url_key = "HTTP2RelayURL" if config["transport"] == "http2" else "HTTP3RelayURL"
     relay.update({"Relays": [{url_key: config["url"] + "/.well-known/masque/udp/{target_host}/{target_port}/",
                               "AdditionalHTTPHeaderFields": {"Authorization": "Bearer " + token}}],
-                  # Guests send only the portal and their links through the relay; the rest stays
-                  # on the device's own connection. Full access routes everything.
-                  "MatchDomains": [portal["host"], *portal["hosts"]] if guest else []})
+                  "MatchDomains": []})   # everything goes through the relay
     result = payload("Configuration", "", title)
     result.update({"PayloadContent": [relay], "PayloadDescription":
-                   ("Guest access to your personal portal page only. " if guest else "Internet and LAN access through your server. ")
+                   ("Internet access through your server, without your local network. " if guest
+                    else "Internet and LAN access through your server. ")
                    + "This profile contains a personal access credential."})
     return sign_profile(plistlib.dumps(result, sort_keys=False), urlsplit(config["url"]).hostname, db=db)
 
@@ -182,12 +177,14 @@ def authorize(db, authorization: str, *, strict_state: bool = False) -> dict | N
         return None
     try:
         portal = network.guest_portal() if guest else None
+        routes = settings.read_network().get("routes", []) if guest else []
     except (OSError, ValueError):
         if strict_state:
             raise   # the policy service answers 503: state unavailable, not "denied"
         return None
-    # Full access: internet and LAN. Guests: nothing but the personal portal,
-    # which the relay pins to the gateway's portal listener.
+    # Full access: internet and LAN. Guests: the internet without anything local
+    # (the relay also refuses private ranges and its host's own networks) and
+    # the personal portal, which the relay pins to the gateway's portal listener.
     return {"client": name, "credential_id": hashlib.sha256(grant["secret"].encode()).hexdigest(),
-            "guest": guest, "url": config["url"], "allowed_cidrs": [] if guest else ["0.0.0.0/0", "::/0"],
-            "portal": portal}
+            "guest": guest, "url": config["url"], "allowed_cidrs": ["0.0.0.0/0", "::/0"],
+            "blocked_cidrs": routes, "portal": portal}

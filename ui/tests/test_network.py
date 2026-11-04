@@ -111,19 +111,21 @@ def test_custom_services_cannot_take_the_website_hostname(config):
         network.save_settings(network.NetworkSettings(**config))
 
 
-def test_guest_relay_policy_is_the_portal_only(config, monkeypatch):
+def test_guest_relay_policy_is_internet_without_lan(config, monkeypatch):
     from app import relay
+    config["routes"] = ["203.0.113.0/24"]
     network.save_settings(network.NetworkSettings(**config))
     monkeypatch.setattr(relay, "eligible", lambda name: {"serial": "01"})
     guest = {"value": True}
     monkeypatch.setattr(relay, "is_guest", lambda name: guest["value"])
     db = SavedSettings(apple_relay={"enabled": True, "url": "https://relay.example.test"}, **{"relay_client:alice": {"secret": "token", "serial": "01"}})
     policy = relay.authorize(db, "Bearer alice:token")
-    assert policy["guest"] and policy["allowed_cidrs"] == []
+    assert policy["guest"] and policy["allowed_cidrs"] == ["0.0.0.0/0", "::/0"]
+    assert policy["blocked_cidrs"] == ["203.0.113.0/24"]   # the relay adds private ranges and its own networks
     assert policy["portal"] == {"host": "vpn.example.test", "target": "192.0.2.10:9443", "hosts": []}
     guest["value"] = False
     policy = relay.authorize(db, "Bearer alice:token")
-    assert policy["allowed_cidrs"] == ["0.0.0.0/0", "::/0"] and policy["portal"] is None
+    assert policy["allowed_cidrs"] == ["0.0.0.0/0", "::/0"] and policy["portal"] is None and policy["blocked_cidrs"] == []
     guest["value"] = True
     config["gateway"]["portal_listener"] = ""
     network.save_settings(network.NetworkSettings(**config))

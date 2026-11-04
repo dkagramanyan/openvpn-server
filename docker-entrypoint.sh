@@ -205,14 +205,7 @@ firewall() {
     guest_portal_rules -A
     iptables -t nat -A OVPN-NAT -s "$TRUST_SUB" -o "$egress" -j MASQUERADE   # guests are inside TRUST_SUB
 
-    # Guests: the pushed DNS servers and the personal portal (guest_portal_rules
-    # above), nothing else - no internet, no LAN, no other VPN client, no ping
-    # and nothing on this host.
-    for dns in $(sed -n -e 's/^[[:space:]]*push[[:space:]]\+"dhcp-option DNS \([0-9.]\+\)".*/\1/p' \
-                        -e 's/^[[:space:]]*push[[:space:]]\+"dns server [0-9]\+ address \([0-9.]\+\)".*/\1/p' "$SERVER_CONF" | sort -u); do
-        for p in udp tcp; do iptables -A OVPN-FORWARD -s "$GUEST_SUB" -d "$dns" -p $p --dport 53 -j ACCEPT; done
-    done
-    iptables -A OVPN-FORWARD -s "$GUEST_SUB" -j DROP
+    guest_rules "$SERVER_CONF"
     iptables -A OVPN-INPUT -i 'tun+' -s "$GUEST_SUB" -j DROP
 
     # Custom rules supplied by the user (see fw-rules.sh).
@@ -287,7 +280,7 @@ firewall_intact() {
         && iptables -t nat -S OVPN-NAT 2>/dev/null | grep -q MASQUERADE \
         && iptables -C INPUT -j OVPN-INPUT 2>/dev/null \
         && iptables -C OVPN-INPUT -i 'tun+' -s "$GUEST_SUB" -j DROP 2>/dev/null \
-        && iptables -C OVPN-FORWARD -s "$GUEST_SUB" -j DROP 2>/dev/null \
+        && iptables -C OVPN-FORWARD -s "$GUEST_SUB" -d 10.0.0.0/8 -j DROP 2>/dev/null \
         && iptables -C "$(forward_first)" -j OVPN-FORWARD 2>/dev/null \
         && iptables -C FORWARD -j OVPN-ACCEPT 2>/dev/null \
         && iptables -C OVPN-ACCEPT -i 'tun+' -j ACCEPT 2>/dev/null
