@@ -178,6 +178,10 @@ func TestHTTP2AndHTTP3TogetherWithOneCredential(t *testing.T) {
 	if f := seen["http2"]; f.Protocol != "TCP" || f.BytesDown != 8 || f.SessionID != seen["http3"].SessionID {
 		t.Fatalf("HTTP/2 flow: %+v (HTTP/3 session %s)", f, seen["http3"].SessionID)
 	}
+	// The numeric destination actually dialled, for classifying the traffic.
+	if seen["http3"].Address != udp.LocalAddr().String() || seen["http2"].Address != tcp.Addr().String() {
+		t.Fatalf("dialled addresses: %q %q", seen["http3"].Address, seen["http2"].Address)
+	}
 	output.Close()
 	resp.Body.Close()
 

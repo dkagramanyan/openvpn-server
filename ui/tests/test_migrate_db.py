@@ -42,7 +42,7 @@ def test_import_preserves_every_table_accounts_credentials_history_and_source(tm
     before = hashlib.sha256(path.read_bytes()).digest()
     db = Database()
     result = import_sqlite(path, db)
-    legacy_tables = set(TABLES) - {'relay_sessions', 'relay_flows'}
+    legacy_tables = set(TABLES) - {'relay_sessions', 'relay_flows', 'section_traffic', 'section_domains', 'section_pending'}
     assert result['verified'] and set(result['imported']) == legacy_tables
     assert db.query('SELECT * FROM relay_sessions') == []
     with sqlite3.connect(path) as source:

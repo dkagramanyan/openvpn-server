@@ -26,7 +26,7 @@ RUN apk add --no-cache curl \
 FROM ${PYTHON_IMAGE}
 
 RUN apk --no-cache --no-progress upgrade \
-    && apk add --no-cache --no-progress bash openssl openvpn oath-toolkit-oathtool libqrencode-tools tzdata age postgresql18-client
+    && apk add --no-cache --no-progress bash openssl openvpn oath-toolkit-oathtool libqrencode-tools tzdata age postgresql18-client openssh-client-default openssh-keygen
 
 COPY --from=easyrsa /out/usr/share/easy-rsa/ /usr/share/easy-rsa/
 

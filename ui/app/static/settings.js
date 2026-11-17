@@ -316,6 +316,7 @@ function settingsView(el) {
       [general, relay, network] = await Promise.all([api('/api/settings'), api('/api/relay/settings'), api('/api/network/settings')]);
     } catch (e) { toast(e.message, 'err'); return; }
     body.append(networkSettingsCard(network, relay, general),
+      routerCard(),
       h('div', { class: 'grid two' }, passwordCard(), appearanceCard()),
       card('About', h('dl', { class: 'kv' },
         h('dt', null, 'UI version'), h('dd', null, general.version),

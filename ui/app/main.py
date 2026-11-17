@@ -11,6 +11,7 @@ import json
 import logging
 import re
 import secrets
+import subprocess
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -24,7 +25,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Str
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import __version__, auth, backup, guest_check, pki, relay, relay_services, relay_history, watchdog, network, network_discovery
+from . import __version__, auth, backup, guest_check, pki, relay, relay_services, relay_history, sections, watchdog, network, network_discovery
 from .collector import Collector, Maintenance
 from .db import Database, HOUR_RETENTION, MINUTE_RETENTION, RELAY_FLOW_RETENTION, empty_point
 from .mgmt import Management, ManagementError
@@ -54,6 +55,7 @@ collector = Collector(db, mgmt, settings.poll_interval, settings.status_file,
                       (settings.log_dir / "openvpn.log", settings.log_dir / "oath.log"))
 maintenance = Maintenance(db, [lambda: pki.ensure_crl_fresh(), backup.ensure_recent])
 relay_collector = relay_history.RelayCollector(db, collector.set_relay)
+section_collector = sections.SectionCollector(db)
 limiter = auth.LoginLimiter()
 
 
@@ -122,6 +124,7 @@ async def lifespan(_: FastAPI):
     collector.start()
     maintenance.start()
     relay_collector.start()
+    section_collector.start()
     dog = watchdog.start()
     yield
     if dog:
@@ -129,6 +132,7 @@ async def lifespan(_: FastAPI):
     collector.stop()
     maintenance.stop()
     relay_collector.stop()
+    section_collector.stop()
     mgmt.close()
 
 
@@ -336,6 +340,14 @@ class AccessBody(BaseModel):
 class PortalBody(BaseModel):
     username: str = Field(min_length=1, max_length=64, pattern=r"^[a-zA-Z0-9_.@-]+$")
     password: str = Field(min_length=8, max_length=256)
+
+
+class RouterBody(BaseModel):
+    address: str = Field(default="", max_length=300)
+
+
+class RouterKeyBody(BaseModel):
+    replace: bool = False
 
 
 class ShareBody(BaseModel):
@@ -645,6 +657,14 @@ def own_openvpn_profile(user: dict[str, Any] = SignedIn):
                     headers={"Content-Disposition": f'attachment; filename="{name}.ovpn"'})
 
 
+@app.get("/api/portal/sections")
+def own_sections(period: Period = Depends(), user: dict[str, Any] = SignedIn):
+    """The signed-in client's own traffic by podkop section, with its own domains."""
+    if user["role"] != "client":
+        raise HTTPException(400, "This page is for client accounts")
+    return {**period.info(), **sections.report(db, period.start, period.end, user["client_name"], domains=True)}
+
+
 @app.get("/api/portal/relay/status")
 def own_relay_status(user: dict[str, Any] = SignedIn):
     if user["role"] != "client":
@@ -879,6 +899,72 @@ def client_detail(name: str, tz: int = 0, user: dict[str, Any] = Authed):
     row["tfa_uri"] = pki.tfa_uri(name) if row["tfa"] else None
     row["rejections"] = db.rejections(now - 30 * 86400, name)
     return row
+
+
+@app.get("/api/sections")
+def sections_overview(period: Period = Depends(), user: dict[str, Any] = Authed):
+    """Every client's traffic by podkop section in a period, with the top clients of each."""
+    return {**period.info(), **sections.report(db, period.start, period.end), "router": router_status()}
+
+
+@app.get("/api/clients/{name}/sections")
+def client_sections(name: str, period: Period = Depends(), user: dict[str, Any] = Authed):
+    """A client's traffic by podkop section; top domains while the period lies in the last 7 days."""
+    pki.validate_name(name)
+    return {**period.info(), **sections.report(db, period.start, period.end, name, domains=True)}
+
+
+def router_status() -> dict[str, Any]:
+    config = sections.get_router(db)
+    status = section_collector.status
+    pending = db.one("SELECT COUNT(*) AS n, MIN(queued_at) AS oldest FROM section_pending")
+    return {"address": config.get("address", ""), "key": sections.key_path().is_file(),
+            "line": sections.authorized_line(), "last_ok": status.get("last_ok"), "last_error": status.get("last_error"),
+            "error": status.get("error"), "agent": status.get("agent"), "sections": section_collector.sections,
+            "subnets": len(section_collector.ranges) if section_collector.ranges is not None else None,
+            "pending": int(pending["n"]) if pending else 0, "unmapped": status.get("unmapped", 0)}
+
+
+@app.get("/api/router")
+def get_router(user: dict[str, Any] = Authed):
+    return router_status()
+
+
+@app.put("/api/router", dependencies=[Csrf])
+def put_router(body: RouterBody, user: dict[str, Any] = Authed):
+    try:
+        address = sections.validate_address(body.address)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+    db.set_setting("router_sections", json.dumps({"address": address}))
+    event("router_sections_changed", user, detail=address or "off")
+    return router_status()
+
+
+@app.post("/api/router/key", dependencies=[Csrf])
+def create_router_key(body: RouterKeyBody, user: dict[str, Any] = Authed):
+    """A new key for the router lookup. Only the public half and its authorized_keys line leave the server."""
+    try:
+        sections.create_key(replace=body.replace)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from None
+    except (OSError, subprocess.SubprocessError):
+        raise HTTPException(500, "Could not create the key (is ssh-keygen installed?)") from None
+    event("router_key_created", user)
+    return router_status()
+
+
+@app.post("/api/router/test", dependencies=[Csrf])
+def test_router(user: dict[str, Any] = Authed):
+    address = sections.get_router(db).get("address")
+    if not address:
+        raise HTTPException(400, "Set the router address first")
+    try:
+        data = sections.ssh_call(address, {"domains": [], "addresses": [], "subnets": True})
+    except sections.SectionsUnavailable as exc:
+        return {"ok": False, "error": str(exc)}
+    names = [s for s in data.get("sections") or [] if isinstance(s, str)]
+    return {"ok": True, "agent": data.get("agent"), "sections": names, "subnets": len(data.get("subnets") or []), "boot_id": bool(data.get("boot_id"))}
 
 
 @app.get("/api/clients/{name}/relay-flows")

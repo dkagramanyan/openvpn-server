@@ -81,13 +81,13 @@ def record_flows(db, instance, events, default_transport=None, now=None):
             # The session row knows the name the history is kept under (an archived earlier certificate).
             owner = conn.execute('SELECT client_name FROM relay_sessions WHERE id = ?', (e.get('session_id') or '',)).fetchone()
             saved += conn.execute('''INSERT INTO relay_flows (instance, id, session_id, client_name, ts, kind, protocol,
-                transport, target, reason, upstream_error, status, duration_ms, bytes_up, bytes_down)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (instance, id) DO NOTHING''',
+                transport, target, reason, upstream_error, status, duration_ms, bytes_up, bytes_down, address)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (instance, id) DO NOTHING''',
                 (instance, int(e['id']), e.get('session_id') or None, owner['client_name'] if owner else e['client'],
                  int(e.get('ts') or now), e['kind'], e.get('protocol') or None,
                  e.get('transport') or default_transport, (e.get('target') or '')[:300] or None, e.get('reason') or None,
                  e.get('upstream_error') or None, e.get('status') or None, int(e.get('duration_ms') or 0),
-                 int(e.get('bytes_up') or 0), int(e.get('bytes_down') or 0))).rowcount
+                 int(e.get('bytes_up') or 0), int(e.get('bytes_down') or 0), (e.get('address') or '')[:64] or None)).rowcount
     return saved
 
 

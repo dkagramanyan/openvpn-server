@@ -1,6 +1,20 @@
 <!-- Network addresses in examples are synthetic; deployment-specific notes are omitted. -->
 # Changelog
 
+## 2.4.0 - unreleased
+
+### Traffic by podkop section
+* For each client, OpenVPN and Apple relay traffic per podkop section of the
+  LAN router (youtube, meta, main, ..., direct), on the dashboard, the client's
+  page and the client's portal, for any period. Totals are kept for good,
+  the domains behind them for 7 days.
+* The OpenVPN container records the end of every VPN client connection with
+  its bytes (`log/flows.log`, conntrack); it needs
+  `net.netfilter.nf_conntrack_acct=1` on the host.
+* The relay reports the address it connected to for every connection.
+* **Settings → Router**: the router's SSH address and a key that may run only
+  `podkop-agent sections` (podkop-agent 0.27 or newer).
+
 ## 2.3.0 - 2026-11-18
 
 Installed OpenVPN and Apple relay profiles keep working; no profile has to be

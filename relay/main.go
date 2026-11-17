@@ -195,6 +195,7 @@ func (s *relayServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		defer conn.Close()
+		flow.dialled(addr)
 		flow.connected()
 		if r.ProtoMajor == 2 {
 			s.proxyHTTP2UDP(w, r, conn, token, addr.Addr(), p.URL)
@@ -211,6 +212,7 @@ func (s *relayServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.Close()
+	flow.dialled(addr)
 	flow.connected()
 	if r.ProtoMajor == 2 {
 		s.proxyHTTP2TCP(w, r, conn.(*net.TCPConn), token, addr.Addr(), p.URL)

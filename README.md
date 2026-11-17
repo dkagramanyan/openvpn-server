@@ -269,6 +269,58 @@ QUIC wants larger socket buffers than Linux allows by default; on this host:
 two lines in `/etc/sysctl.d/`).
 `APPLE_RELAY_TRANSPORT=http2` or `http3` alone still work as before.
 
+## Traffic by podkop section
+
+If the LAN router runs [podkop](https://github.com/itdoginfo/podkop) with
+`podkop-agent` 0.27 or newer, the UI counts each client's traffic per podkop
+section (youtube, meta, main, ...), for OpenVPN and the Apple relay alike:
+**Traffic by section** on the dashboard, on a client's page and in the client's
+own portal, for the chosen period.
+
+How it works. podkop sends a section's names to FakeIP addresses
+(`198.18.0.0/15`) and its address lists to sing-box; everything else leaves
+directly. This server knows who opened each connection and how many bytes it
+carried; the router knows which section a destination belongs to:
+
+* OpenVPN: the container writes the end of every VPN client's connection with
+  its bytes to `log/flows.log` (conntrack). The client is the one that had that
+  VPN address at the time.
+* Apple relay: every finished relay connection is saved with the name the
+  device asked for and the address the relay connected to.
+* Every 30 s the UI asks the router about the new destinations, over SSH with
+  its own key, which may run nothing but `podkop-agent sections`. The router
+  answers only about the names and addresses it is asked about.
+
+Setup:
+
+1. On this server's host, turn on connection accounting (a host setting in
+   host network mode, like IPv4 forwarding):
+   `sudo sysctl -w net.netfilter.nf_conntrack_acct=1`, and put
+   `net.netfilter.nf_conntrack_acct = 1` into `/etc/sysctl.d/99-openvpn.conf`.
+   The OpenVPN container warns in its log while it is off.
+2. **Settings → Router**: enter the router's SSH address (`root@192.168.1.1`),
+   **Create key**, and add the line shown to the router's
+   `/etc/dropbear/authorized_keys`; it looks like
+   `restrict,command="/usr/bin/podkop-agent --sections-only" ssh-ed25519 AAAA... openvpn-server-sections`.
+   **Test** shows how many sections and address ranges the router reports.
+   The key lives in `config/router/` (not in git, included in backups).
+
+What the numbers mean:
+
+* **Direct**: traffic that did not go through podkop.
+* **Through podkop, section unknown**: through podkop, but the router had not
+  seen the name (a connection too short for its 15-second look at sing-box,
+  to a name nobody else used), or the router was rebooted before the answer
+  (FakeIP addresses are handed out again after a reboot), or it did not answer
+  for an hour. The card shows the share of such traffic.
+* Totals per section are kept for good (per hour for 90 days, then per day).
+  The domains behind them are kept for **7 days**.
+* Not counted: connections that started before accounting was switched on,
+  IPv6, and podkop's separate Discord voice ports (they count as direct).
+  LAN destinations of full-access OpenVPN clients count as direct.
+
+Leave the router address empty to switch the counting off.
+
 ## Sign-in and the personal portal
 
 Administrators and clients use the same sign-in form, at `/` or `/portal`;

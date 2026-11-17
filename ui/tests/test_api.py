@@ -1311,3 +1311,64 @@ def test_portal_sees_only_its_own_saved_relay_connections(client, configured, po
     assert [f["target"] for f in response.json()["flows"]] == ["mine.example:443"]
     assert "dave" not in response.text and "earlier.example" not in response.text
     assert portal.get("/api/clients/alice/relay-flows").status_code == 403
+
+
+def test_traffic_by_section_reports_and_router_settings(client, monkeypatch, tmp_path):
+    import time
+    from app import sections
+    now = int(time.time())
+    h = now - now % 3600
+    with db.tx() as conn:
+        for name, source, section, bi, bo in (("alice", "vpn", "youtube", 10, 1000), ("bob", "relay", "youtube", 5, 500),
+                                              ("alice", "vpn", "", 1, 100)):
+            conn.execute("INSERT INTO section_traffic (ts, client_name, source, section, bytes_in, bytes_out, flows) "
+                         "VALUES (?, ?, ?, ?, ?, ?, 1) ON CONFLICT DO NOTHING", (h, name, source, section, bi, bo))
+        conn.execute("INSERT INTO section_domains (ts, client_name, source, section, domain, bytes_in, bytes_out, flows) "
+                     "VALUES (?, 'alice', 'vpn', 'youtube', 'www.youtube.com', 10, 1000, 1) ON CONFLICT DO NOTHING", (h,))
+    every = client.get("/api/sections?range=today&tz=0").json()
+    assert {"range", "start", "end", "sections", "unknown_share", "router"} <= set(every)
+    youtube = next(s for s in every["sections"] if s["section"] == "youtube")
+    assert youtube["bytes_out"] >= 1500 and {c["name"] for c in youtube["clients"]} >= {"alice", "bob"}
+    alice = client.get("/api/clients/alice/sections?range=week&tz=0").json()
+    yt = next(s for s in alice["sections"] if s["section"] == "youtube")
+    assert yt["domains"][0]["domain"] == "www.youtube.com" and "clients" not in yt
+    assert all(s["section"] != "" or s["vpn"]["bytes_out"] >= 100 for s in alice["sections"])
+    assert client.get("/api/clients/..%2Fx/sections").status_code in (400, 404)
+
+    # Router: an address, a key whose private half never leaves the server, a test call.
+    monkeypatch.setattr(sections, "router_dir", lambda: tmp_path / "router")
+    assert client.put("/api/router", json={"address": "root@host;reboot"}, headers=H).status_code == 400
+    r = client.put("/api/router", json={"address": "171.134.51.1"}, headers=H).json()
+    assert r["address"] == "root@171.134.51.1" and r["key"] is False and r["line"] is None
+    r = client.post("/api/router/key", json={}, headers=H)
+    assert r.status_code == 200 and r.json()["line"].startswith('restrict,command="/usr/bin/podkop-agent --sections-only" ssh-ed25519 ')
+    assert "PRIVATE" not in r.text
+    assert client.post("/api/router/key", json={}, headers=H).status_code == 409
+    assert client.post("/api/router/key", json={"replace": True}, headers=H).json()["line"] != r.json()["line"]
+    monkeypatch.setattr(sections, "ssh_call", lambda address, request: {"boot_id": "b", "sections": ["youtube", "main"],
+                                                                         "subnets": ["1.2.3.0/24"], "domains": {}, "addresses": {}})
+    assert client.post("/api/router/test", headers=H).json() == {"ok": True, "sections": ["youtube", "main"], "subnets": 1, "boot_id": True}
+
+    def refuse(address, request):
+        raise sections.SectionsUnavailable("router refused the call: Permission denied")
+    monkeypatch.setattr(sections, "ssh_call", refuse)
+    assert client.post("/api/router/test", headers=H).json() == {"ok": False, "error": "router refused the call: Permission denied"}
+    assert client.put("/api/router", json={"address": ""}, headers=H).json()["address"] == ""
+
+
+def test_portal_sees_only_its_own_sections(client, portal):
+    import time
+    now = int(time.time())
+    h = now - now % 3600
+    with db.tx() as conn:
+        conn.execute("INSERT INTO section_traffic (ts, client_name, source, section, bytes_in, bytes_out, flows) "
+                     "VALUES (?, 'dave', 'vpn', 'secret-section', 1, 1, 1) ON CONFLICT DO NOTHING", (h,))
+        conn.execute("INSERT INTO section_domains (ts, client_name, source, section, domain, bytes_in, bytes_out, flows) "
+                     "VALUES (?, 'dave', 'vpn', 'secret-section', 'dave-only.example', 1, 1, 1) ON CONFLICT DO NOTHING", (h,))
+        conn.execute("INSERT INTO section_traffic (ts, client_name, source, section, bytes_in, bytes_out, flows) "
+                     "VALUES (?, 'alice', 'relay', 'main', 2, 20, 1) ON CONFLICT DO NOTHING", (h,))
+    response = portal.get("/api/portal/sections?range=today&tz=0")
+    assert response.status_code == 200
+    assert "dave" not in response.text and "secret-section" not in response.text
+    assert any(s["section"] == "main" for s in response.json()["sections"])
+    assert portal.get("/api/sections").status_code == 403 and portal.get("/api/router").status_code == 403

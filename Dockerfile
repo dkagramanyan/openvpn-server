@@ -61,7 +61,7 @@ LABEL org.opencontainers.image.title="openvpn-server" \
 RUN apk --no-cache --no-progress upgrade \
     && apk add --no-cache --no-progress \
         bash openssl lz4-libs lzo libcap-ng libnl3 \
-        iptables ip6tables iproute2-minimal \
+        iptables ip6tables iproute2-minimal conntrack-tools \
         oath-toolkit-oathtool libqrencode-tools \
         ca-certificates tzdata
 

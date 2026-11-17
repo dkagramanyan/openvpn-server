@@ -48,6 +48,7 @@ function viaTag(s) {
 }
 
 function dashboardView(el) {
+  const sectionsBox = sectionsCard('/api/sections', { clients: true });
   let data = null, src = 'all';
   const sub = h('span', null, 'loading…');
   const body = h('div', { class: 'stack' });
@@ -114,6 +115,7 @@ function dashboardView(el) {
         h('div', { class: 'row', style: 'justify-content:space-between;flex-wrap:wrap' }, h('span', { class: 'small muted' }, 'Charts and top clients show'), sourceSeg),
         h('div', { class: 'grid two' }, h('section', { class: 'card' }, h('div', { class: 'card-h' }, h('h2', { id: 'hour-title' })), h('div', { class: 'card-b' }, hourEl)), h('section', { class: 'card' }, h('div', { class: 'card-h' }, h('h2', { id: 'top-title' })), h('div', { class: 'card-b', id: 'top' }))),
         h('section', { class: 'card' }, h('div', { class: 'card-h' }, h('h2', { id: 'range-title' })), h('div', { class: 'card-b' }, rangeEl)),
+        sectionsBox.card,
         card('Connected clients', liveTable),
         h('div', { id: 'rej' }));
       hourChart = lineChart(hourEl, hourOpts); rangeChart = lineChart(rangeEl, rangeOpts);
@@ -136,6 +138,7 @@ function dashboardView(el) {
     body.classList.add('loading');
     try {
       data = await api(`/api/overview?${rangeQuery()}`);
+      sectionsBox.load();
     } catch (e) { toast(e.message, 'err'); body.classList.remove('loading'); return; }
     state.live = data.live;
     showPeriod(data);
@@ -266,6 +269,7 @@ function clientDetailView(el) {
   const sourceSeg = h('div', { class: 'seg', role: 'group', 'aria-label': 'Traffic source' }, SOURCES.map(([v, label]) =>
     h('button', { class: v === src ? 'active' : '', onClick: e => { src = v; sourceSeg.querySelectorAll('button').forEach(b => b.classList.toggle('active', b === e.currentTarget)); redrawDaily(); } }, label)));
   const flowsCard = relayFlowsCard(name);
+  const sectionsBox = sectionsCard(`/api/clients/${enc}/sections`, { period: true });
 
   async function load() {
     body.classList.add('loading');
@@ -326,8 +330,10 @@ function clientDetailView(el) {
           ].filter(Boolean))),
           card('Note', h('div', { class: 'stack', style: 'gap:8px' }, noteIn, h('div', null, h('button', { class: 'btn sm', onClick: () => withToast(api(`/api/clients/${enc}/note`, { method: 'PUT', body: { note: noteIn.value } }), 'Note saved') }, 'Save note')))))),
       c.rejections.length ? card('Rejected OpenVPN connection attempts · last 30 days', rejectionsTable(c.rejections, false)) : '',
+      sectionsBox.card,
       card('Sessions · last 100', sessionsTable(c.sessions, false), h('a', { class: 'btn sm', href: '#/sessions/' + enc }, 'Every session')),
       flowsCard);
+    sectionsBox.load();
     const dailyOpts = () => ({ ts: c.daily.map(p => p.ts), series: [{ label: 'Download', cls: 's1', values: c.daily.map(p => trafficOf(p, 'out', src)) }, { label: 'Upload', cls: 's2', values: c.daily.map(p => trafficOf(p, 'in', src)) }], fmtY: v => fmtBytes(v, 0), fmtX: fmtDate, fmtXFull: fmtDate, height: 220, aria: 'Daily traffic' });
     dailyChart = lineChart(dailyEl, dailyOpts());
     redrawDaily = () => dailyChart.update(dailyOpts());

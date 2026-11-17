@@ -14,3 +14,4 @@ server.conf.bak
 server.conf
 config/client.conf
 config/client.conf.bak
+config/router/

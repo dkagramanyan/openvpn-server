@@ -24,6 +24,7 @@ OVPN_LOG_MAX_BYTES=${OVPN_LOG_MAX_BYTES:-10485760}
 OVPN_CRL_RENEW_DAYS=${OVPN_CRL_RENEW_DAYS:-30}
 OVPN_MSS=${OVPN_MSS:-1400}
 OVPN_MAX_DEVICES=${OVPN_MAX_DEVICES:-10}
+OVPN_FLOW_LOG_MAX_BYTES=${OVPN_FLOW_LOG_MAX_BYTES:-33554432}
 
 log()  { printf '%s [entrypoint] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
 warn() { printf '%s [entrypoint] WARNING: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >&2; }
@@ -298,6 +299,35 @@ rotate_log() {
         cp -f "$f" "$f.1" && : > "$f"
     fi
 }
+rotate_flows() {
+    local f=$LOG_DIR/flows.log
+    [[ -f $f ]] || return 0
+    if (( $(stat -c %s "$f") > OVPN_FLOW_LOG_MAX_BYTES )); then
+        cp -f "$f" "$f.1" && : > "$f"
+    fi
+}
+
+# Ends of the VPN clients' connections with their bytes (log/flows.log), for
+# the UI's traffic by podkop section. Byte counts need connection accounting,
+# a host setting in host network mode, like IPv4 forwarding.
+FLOW_PID=
+start_flow_log() {
+    command -v conntrack >/dev/null || return 0
+    sysctl -q -w net.netfilter.nf_conntrack_acct=1 2>/dev/null || true
+    if [[ $(cat /proc/sys/net/netfilter/nf_conntrack_acct 2>/dev/null) != 1 ]]; then
+        warn "Connection accounting is off, so traffic by section has no byte counts. On the host:
+      sudo sysctl -w net.netfilter.nf_conntrack_acct=1   (persist it: net.netfilter.nf_conntrack_acct = 1 in /etc/sysctl.d/99-openvpn.conf)"
+    fi
+    local net mask
+    net=$(sed -n 's/^[[:space:]]*server[[:space:]]\+\([0-9.]\+\)[[:space:]].*/\1/p' "$SERVER_CONF" | head -1)
+    mask=$(sed -n 's/^[[:space:]]*server[[:space:]]\+[0-9.]\+[[:space:]]\+\([0-9.]\+\).*/\1/p' "$SERVER_CONF" | head -1)
+    [[ -n $net && -n $mask ]] || return 0
+    local lo=$(( $(ip2int "$net") & $(ip2int "$mask") ))
+    local hi=$(( lo + (~$(ip2int "$mask") & 0xFFFFFFFF) ))
+    /opt/app/bin/flow-log.sh "$lo" "$hi" "$LOG_DIR/flows.log" &
+    FLOW_PID=$!
+    log "Recording the ends of VPN connections in $LOG_DIR/flows.log"
+}
 
 if [[ $OVPN_LOG_STDOUT = 1 ]]; then
     touch "$LOG_DIR/openvpn.log"
@@ -373,6 +403,7 @@ reap_leases() {
 UNHEALTHY=0
 maintain() {
     rotate_log || warn "Cannot rotate $LOG_DIR/openvpn.log (is the disk full?)"
+    rotate_flows || warn "Cannot rotate $LOG_DIR/flows.log (is the disk full?)"
     reap_leases || true
     if ! firewall_intact; then
         warn "The firewall rules are gone (a firewall reload on the host?) - installing them again"
@@ -389,6 +420,7 @@ maintain() {
     fi
 }
 
+start_flow_log
 while :; do
     rotate_log || warn "Cannot rotate $LOG_DIR/openvpn.log (is the disk full?)"
     clean_stale_dco
@@ -430,4 +462,5 @@ while :; do
 done
 
 kill ${TAIL_PID:-} 2>/dev/null || true
+if [[ -n $FLOW_PID ]]; then pkill -P "$FLOW_PID" 2>/dev/null || true; kill "$FLOW_PID" 2>/dev/null || true; fi
 exit 0

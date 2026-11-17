@@ -10,7 +10,9 @@ function portalView(el) {
   (async () => {
     try {
       const profile = await api('/api/portal');
-      body.replaceChildren(connectCard(profile), relayActivityPanel(), h('details', { class: 'portal-panel' },
+      const own = sectionsCard('/api/portal/sections', { period: true });
+      own.load();
+      body.replaceChildren(connectCard(profile), relayActivityPanel(), own.card, h('details', { class: 'portal-panel' },
         h('summary', null, 'Change my password'), portalPasswordForm()));
     } catch (error) {
       body.replaceChildren(h('div', { class: 'notice', role: 'alert' }, error.message),

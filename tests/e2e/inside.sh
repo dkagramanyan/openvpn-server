@@ -93,6 +93,8 @@ docker compose run --rm --no-deps --entrypoint python openvpn-ui -m app.migrate_
 [ "$LEGACY_HASH" = "$(sha256sum db/openvpn-ui.db)" ] || fail "migration modified the legacy source"
 
 say "Start the service"
+# Connection accounting is a host setting: here the Docker-in-Docker container is the host.
+sysctl -q -w net.netfilter.nf_conntrack_acct=1
 up
 docker exec openvpn-ui python -c "from app.main import db; assert db.get_setting('legacy-preserved') == 'yes'; assert db.get_setting('migration:legacy_sqlite')"
 docker exec openvpn iptables -t mangle -S OVPN-MSS | grep -q 'set-mss 1400' || fail "no MSS clamp in the firewall"
@@ -225,6 +227,16 @@ fw -S OVPN-INPUT | grep -q DROP && fw -t nat -S OVPN-NAT | grep -q MASQUERADE ||
 docker exec openvpn test -e /tmp/openvpn-leases/10.8.0.200 && fail "the stale lease was not released"
 docker exec openvpn test -e /tmp/openvpn-leases/10.8.0.100 || fail "the lease of a connected client was released"
 [ "$(docker inspect -f '{{.RestartCount}}' openvpn-ui)" = 0 ] || fail "the UI restarted itself"
+
+say "The ends of the clients' connections are recorded with their bytes"
+# A closed TCP connection is forgotten (and reported) after TIME_WAIT, up to two minutes.
+for _ in $(seq 180); do
+    grep -qE 'src=10\.8\.0\.[0-9]+ dst=[0-9.]+ sport=[0-9]+ dport=8000 packets=[0-9]+ bytes=[1-9]' log/flows.log 2>/dev/null && break
+    sleep 1
+done
+grep -qE 'src=10\.8\.0\.[0-9]+ dst=[0-9.]+ sport=[0-9]+ dport=8000 packets=[0-9]+ bytes=[1-9]' log/flows.log \
+    || fail "no connection of a VPN client in log/flows.log"
+! grep -qvE 'src=10\.8\.0\.' log/flows.log || fail "log/flows.log holds connections that are not VPN clients'"
 
 say "At most OVPN_MAX_DEVICES connections per certificate"
 docker rm -f alice-phone alice-laptop gina-phone carl-pc >/dev/null

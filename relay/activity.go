@@ -60,6 +60,7 @@ type flowEvent struct {
 	Protocol      string `json:"protocol"`
 	Transport     string `json:"transport,omitempty"` // http2 or http3
 	Target        string `json:"target"`
+	Address       string `json:"address,omitempty"` // the numeric destination dialled (ip:port)
 	Reason        string `json:"reason"`
 	Duration      int64  `json:"duration_ms"`
 	BytesUp       int64  `json:"bytes_up"`
@@ -121,6 +122,17 @@ func (a *activityLog) begin() *flowLog {
 	defer a.mu.Unlock()
 	a.sequence++
 	return &flowLog{log: a, start: time.Now(), event: flowEvent{ID: a.sequence, Reason: "request_rejected"}}
+}
+
+// dialled records the numeric destination: the UI classifies traffic by it
+// (podkop's FakeIP range and address set).
+func (f *flowLog) dialled(addr netip.AddrPort) {
+	if f == nil || !addr.IsValid() {
+		return
+	}
+	f.mu.Lock()
+	f.event.Address = addr.String()
+	f.mu.Unlock()
 }
 
 func (f *flowLog) connected() {
