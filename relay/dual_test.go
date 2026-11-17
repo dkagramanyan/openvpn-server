@@ -287,3 +287,78 @@ func TestLookupsAreSharedAndExpire(t *testing.T) {
 		t.Fatal("literal address was looked up")
 	}
 }
+
+// The relay's own TLS listener: devices reach HTTP/2 without a proxy in front,
+// from any address, with the certificate HTTP/3 uses; anything but h2 is closed.
+func TestHTTP2OverTheRelaysOwnTLS(t *testing.T) {
+	ip := localIP(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	tlsServer := httptest.NewTLSServer(http.NotFoundHandler())
+	defer tlsServer.Close()
+	dir := t.TempDir()
+	writeCertificate(t, dir, tlsServer.TLS.Certificates[0])
+	files := &certificateFiles{chain: filepath.Join(dir, "fullchain.pem"), key: filepath.Join(dir, "privkey.pem")}
+	if d := files.details(); d == nil || d["ok"] != true || len(d["names"].([]string)) == 0 {
+		t.Fatalf("certificate details: %v", d)
+	}
+	raw, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	origin := "https://" + raw.Addr().String()
+	auth := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer alice:secret" {
+			w.WriteHeader(403)
+			return
+		}
+		json.NewEncoder(w).Encode(policy{Client: "alice", CredentialID: "c1", URL: origin, CIDRs: []string{ip + "/32"}})
+	}))
+	defer auth.Close()
+	s := &relayServer{api: auth.URL, client: auth.Client(), slots: make(chan struct{}, 32), recheck: time.Second,
+		policyTTL: time.Second, activity: newActivity("http2+http3"), quota: &flowQuota{maximum: 32}}
+	// No trusted proxies: 127.0.0.1 is accepted because the listener is direct, not because it is trusted.
+	go serveHTTP2Context(ctx, tls.NewListener(raw, files.tlsConfig("h2")), s, nil)
+
+	tcp, err := net.Listen("tcp", net.JoinHostPort(ip, "0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tcp.Close()
+	go func() {
+		for {
+			c, err := tcp.Accept()
+			if err != nil {
+				return
+			}
+			go func() { defer c.Close(); io.Copy(c, c) }()
+		}
+	}()
+	clientTLS := tlsServer.Client().Transport.(*http.Transport).TLSClientConfig.Clone()
+	clientTLS.NextProtos = []string{"h2"}
+	h2 := &http2.Transport{TLSClientConfig: clientTLS}
+	defer h2.CloseIdleConnections()
+	input, output := io.Pipe()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodConnect, origin, input)
+	req.Host = tcp.Addr().String()
+	req.Header.Set("Authorization", "Bearer alice:secret")
+	resp, err := h2.RoundTrip(req)
+	if err != nil || resp.StatusCode != 200 {
+		t.Fatalf("HTTP/2 over TLS: %v %v", resp, err)
+	}
+	go output.Write([]byte("tls-echo"))
+	if _, err := io.ReadFull(resp.Body, make([]byte, 8)); err != nil {
+		t.Fatal(err)
+	}
+	// A client that does not speak h2 gets no service.
+	plain := clientTLS.Clone()
+	plain.NextProtos = []string{"http/1.1"}
+	if conn, err := tls.Dial("tcp", raw.Addr().String(), plain); err == nil {
+		conn.SetDeadline(time.Now().Add(3 * time.Second))
+		conn.Write([]byte("GET / HTTP/1.1\r\nHost: x\r\n\r\n"))
+		if n, err := conn.Read(make([]byte, 64)); err == nil {
+			t.Fatalf("an http/1.1 client got %d bytes", n)
+		}
+		conn.Close()
+	}
+}

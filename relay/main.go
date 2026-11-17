@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"io"
 	"log"
@@ -316,12 +317,15 @@ func main() {
 	// opens before the listeners, and waitForPolicy polls only once a second,
 	// so without the second condition a check could pass before the relay
 	// accepts connections.
-	var http2Up, http3Up atomic.Bool
+	var http2Up, http2Direct, http3Up atomic.Bool
 	handler.activity.listening = func() map[string]bool {
-		return map[string]bool{"http2": http2Up.Load(), "http3": http3Up.Load()}
+		return map[string]bool{"http2": http2Up.Load() || http2Direct.Load(), "http2_direct": http2Direct.Load(), "http3": http3Up.Load()}
 	}
+	// One certificate for HTTP/3 and the direct HTTP/2 listener, reloaded within 30 s when renewed.
+	files := &certificateFiles{chain: "/tls/fullchain.pem", key: "/tls/privkey.pem"}
+	handler.activity.certificate = files.details
 	handler.activity.readiness = func(ctx context.Context) error {
-		if !http2Up.Load() && !http3Up.Load() {
+		if !http2Up.Load() && !http2Direct.Load() && !http3Up.Load() {
 			return errAuthUnavailable
 		}
 		return handler.checkReadiness(ctx)
@@ -340,7 +344,6 @@ func main() {
 	failed := make(chan error, 2)
 	var listeners sync.WaitGroup
 	if useHTTP3 {
-		files := &certificateFiles{chain: "/tls/fullchain.pem", key: "/tls/privkey.pem"}
 		if mode == "http3" {
 			if _, err := files.get(); err != nil {
 				log.Fatalf("HTTP/3 TLS setup required: put fullchain.pem and privkey.pem in APPLE_RELAY_TLS_DIR, readable by UID 65532: %v", err)
@@ -390,6 +393,37 @@ func main() {
 				failed <- err
 			}
 		}()
+		// HTTP/2 straight from the devices, over TLS with the relay's own certificate
+		// (the same TCP port number as HTTP/3's UDP one). "off" leaves it to the proxy.
+		if bind := env("RELAY_HTTP2_TLS_BIND", "off"); bind != "off" {
+			if _, err := files.get(); err != nil {
+				log.Printf("HTTP/2 over TLS on %s is waiting for /tls/fullchain.pem and /tls/privkey.pem (readable by UID 65532): %v", bind, err)
+			}
+			listeners.Add(1)
+			go func() {
+				defer listeners.Done()
+				// Like HTTP/3, a fault here (the port taken by a proxy on the same host,
+				// for example) never stops the gateway's backend: retry every 30 s.
+				for {
+					direct, err := net.Listen("tcp", bind)
+					if err == nil {
+						http2Direct.Store(true)
+						log.Printf("Apple Network Relay HTTP/2 listening on %s (TLS, the relay's own certificate)", direct.Addr())
+						err = serveHTTP2Context(ctx, tls.NewListener(direct, files.tlsConfig("h2")), handler, nil)
+						http2Direct.Store(false)
+					}
+					if ctx.Err() != nil {
+						return
+					}
+					log.Printf("HTTP/2 over TLS on %s stopped, retrying in 30 s: %v", bind, err)
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(30 * time.Second):
+					}
+				}
+			}()
+		}
 	}
 	select {
 	case err := <-failed:

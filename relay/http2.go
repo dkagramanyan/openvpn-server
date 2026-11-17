@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"log"
@@ -123,13 +124,17 @@ func serveHTTP2Context(ctx context.Context, listener net.Listener, handler http.
 		if err != nil {
 			return err
 		}
-		currentTrust := trusted
-		if relay, ok := handler.(*relayServer); ok && relay.proxyConfig != "" {
-			currentTrust = networkProxyTrust(relay.proxyConfig, trusted)
-		}
-		if !trustedProxy(conn.RemoteAddr().String(), currentTrust) {
-			conn.Close()
-			continue
+		// trusted == nil: devices connect directly over TLS (the relay's own
+		// listener), so every source is accepted; behind a proxy only the proxy is.
+		if trusted != nil {
+			currentTrust := trusted
+			if relay, ok := handler.(*relayServer); ok && relay.proxyConfig != "" {
+				currentTrust = networkProxyTrust(relay.proxyConfig, trusted)
+			}
+			if !trustedProxy(conn.RemoteAddr().String(), currentTrust) {
+				conn.Close()
+				continue
+			}
 		}
 		select {
 		case connections <- struct{}{}:
@@ -146,6 +151,14 @@ func serveHTTP2Context(ctx context.Context, listener net.Listener, handler http.
 					mu.Unlock()
 					<-connections
 				}()
+				if tc, ok := conn.(*tls.Conn); ok {
+					// The handshake runs here, not in Accept: a slow client holds only its own slot.
+					_ = tc.SetDeadline(time.Now().Add(10 * time.Second))
+					if err := tc.HandshakeContext(ctx); err != nil || tc.ConnectionState().NegotiatedProtocol != "h2" {
+						return
+					}
+					_ = tc.SetDeadline(time.Time{})
+				}
 				server.ServeConn(conn, &http2.ServeConnOpts{Handler: handler, BaseConfig: base})
 			}()
 		default:

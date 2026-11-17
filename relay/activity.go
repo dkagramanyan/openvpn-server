@@ -32,6 +32,7 @@ type activityLog struct {
 	limits          map[string]int
 	readiness       func(context.Context) error
 	listening       func() map[string]bool // which client listeners are open
+	certificate     func() map[string]any  // the TLS certificate in use, or nil
 	clients         map[string]*clientActivity
 	sequence        uint64
 	recorded        uint64
@@ -348,7 +349,11 @@ func (a *activityLog) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if a.listening != nil {
 		transports = a.listening()
 	}
-	json.NewEncoder(w).Encode(map[string]any{"ready": true, "transport": a.transport, "transports": transports, "started_at": a.started,
+	var certificate map[string]any
+	if a.certificate != nil {
+		certificate = a.certificate()
+	}
+	json.NewEncoder(w).Encode(map[string]any{"ready": true, "transport": a.transport, "transports": transports, "tls": certificate, "started_at": a.started,
 		"total": total, "denied": denied, "failed": failed, "logs_suppressed": suppressed, "clients": clients, "active": active, "events": events, "sessions": sessionSnapshot(sessions, active, time.Now().Unix()), "session_idle_seconds": relaySessionIdleSeconds, "instance": a.instance, "policy_ready": policyReady, "limits": a.limits, "metrics": a.runtime.snapshot()})
 }
 

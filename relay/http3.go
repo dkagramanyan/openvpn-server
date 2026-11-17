@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"io"
 	"log"
@@ -21,6 +22,28 @@ import (
 // certificateFiles serves the relay hostname's certificate from two PEM files
 // and picks up a renewed pair without a restart. A pair that fails to load
 // (for example while it is being replaced) keeps the previous one in use.
+// tlsConfig serves the relay's certificate for the given ALPN protocols.
+func (c *certificateFiles) tlsConfig(protocols ...string) *tls.Config {
+	return &tls.Config{MinVersion: tls.VersionTLS12, NextProtos: protocols,
+		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return c.get() }}
+}
+
+// details of the certificate in use, for the status page: names, expiry, issuer.
+func (c *certificateFiles) details() map[string]any {
+	pair, err := c.get()
+	if err != nil || pair == nil || len(pair.Certificate) == 0 {
+		return nil
+	}
+	leaf := pair.Leaf
+	if leaf == nil {
+		if leaf, err = x509.ParseCertificate(pair.Certificate[0]); err != nil {
+			return nil
+		}
+	}
+	return map[string]any{"names": leaf.DNSNames, "not_after": leaf.NotAfter.Unix(), "issuer": leaf.Issuer.CommonName,
+		"ok": time.Now().Before(leaf.NotAfter)}
+}
+
 type certificateFiles struct {
 	chain, key string
 	mu         sync.Mutex

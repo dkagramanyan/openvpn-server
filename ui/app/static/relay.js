@@ -78,7 +78,9 @@ function relayView(el) {
     const limits = info.limits;
     summary.replaceChildren(
       tile('Relay backend', !info.ready ? 'Unavailable' : info.policy_ready === false ? 'Policy unavailable' : 'Running', info.ready ? `started ${fmtDateTime(info.started_at)}` : info.message),
-      tile('Listening', !info.ready ? '—' : [open.http2 ? 'HTTP/2' : null, open.http3 ? 'HTTP/3' : null].filter(Boolean).join(' + ') || 'nothing', !info.ready ? '' : `HTTP/2 through the gateway: ${open.http2 ? 'open' : 'closed'} · HTTP/3 direct (UDP): ${open.http3 ? 'open' : 'closed'}`),
+      tile('Listening', !info.ready ? '—' : [open.http3 ? 'HTTP/3' : null, open.http2 ? 'HTTP/2' : null].filter(Boolean).join(' + ') || 'nothing', !info.ready ? '' : `HTTP/3 direct (UDP): ${open.http3 ? 'open' : 'closed'} · HTTP/2 ${open.http2_direct ? 'direct (TCP, TLS here)' : 'through the gateway'}: ${open.http2 ? 'open' : 'closed'}`),
+      tile('Certificate', !info.ready ? '—' : !info.tls ? 'none' : `${Math.max(0, Math.floor((info.tls.not_after - Date.now() / 1000) / 86400))} days left`,
+        !info.tls ? 'relay-tls/ is empty: HTTP/3 and direct HTTP/2 wait for it' : `${(info.tls.names || []).join(', ')} · ${info.tls.issuer || ''} · until ${fmtDate(info.tls.not_after)}`),
       tile('Open connections', info.ready ? fmtNum(info.active.length) : '—', limits ? `limit ${fmtNum(limits.flows)} in total · ${fmtNum(limits.per_client)} per client` : ''),
       tile('Since it started', info.ready ? fmtNum(info.total || 0) : '—', `accepted · ${fmtNum(info.failed || 0)} failed · ${fmtNum(info.denied || 0)} denied`));
     active.replaceChildren(groups(true));

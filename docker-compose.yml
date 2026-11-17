@@ -16,6 +16,9 @@ services:
       RELAY_HTTP2_BIND: ${APPLE_RELAY_HTTP2_BIND:-:8444}
       RELAY_TRUSTED_PROXIES: ${APPLE_RELAY_TRUSTED_PROXIES:-127.0.0.1/32 ::1/128}
       RELAY_BIND: ${APPLE_RELAY_BIND:-:8443}
+      # HTTP/2 straight from the devices over TLS (TCP of the same port as HTTP/3's
+      # UDP), with the certificate in relay-tls/. "off": HTTP/2 only through the gateway.
+      RELAY_HTTP2_TLS_BIND: ${APPLE_RELAY_HTTP2_TLS_BIND:-:8443}
       RELAY_MAX_FLOWS: ${APPLE_RELAY_MAX_FLOWS:-2048}
       RELAY_MAX_FLOWS_PER_CLIENT: ${APPLE_RELAY_MAX_FLOWS_PER_CLIENT:-512}
       RELAY_MAX_AUTH_CHECKS: ${APPLE_RELAY_MAX_AUTH_CHECKS:-64}
@@ -25,11 +28,41 @@ services:
       RELAY_MAX_H2_STREAMS: ${APPLE_RELAY_MAX_H2_STREAMS:-512}
       RELAY_NETWORK_CONFIG: /etc/relay-network/proxies.conf
       RELAY_AUTH_URL: ${APPLE_RELAY_AUTH_URL:-http://127.0.0.1:8447/api/relay/authorize}
-    # The certificate is for direct HTTP/3 only; HTTP/2 needs none here.
+    # The certificate for HTTP/3 and direct HTTP/2 (relay-cert keeps it renewed).
     volumes:
       - ${APPLE_RELAY_TLS_DIR:-./relay-tls}:/tls:ro
       - ./config/network:/etc/relay-network:ro
     cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    tmpfs: [/tmp]
+    logging: *logging
+    restart: unless-stopped
+
+  # The relay's certificate from Let's Encrypt, DNS challenge with the provider's
+  # service account (as the gateway's Traefik does), renewed when due. Idle until
+  # RELAY_CERT_DOMAIN and ACME_EMAIL are set in .env.
+  relay-cert:
+    image: goacme/lego:v5.6.0
+    entrypoint: [/bin/sh, /app/relay-cert.sh]
+    network_mode: host
+    environment:
+      RELAY_CERT_DOMAIN: ${RELAY_CERT_DOMAIN:-}
+      ACME_EMAIL: ${ACME_EMAIL:-}
+      ACME_DNS_PROVIDER: ${ACME_DNS_PROVIDER:-selectelv2}
+      ACME_DNS_RESOLVERS: ${ACME_DNS_RESOLVERS:-1.1.1.1:53,8.8.8.8:53}
+      ACME_CA_SERVER: ${ACME_CA_SERVER:-}
+      SELECTELV2_ACCOUNT_ID: ${SELECTELV2_ACCOUNT_ID:-}
+      SELECTELV2_PROJECT_ID: ${SELECTELV2_PROJECT_ID:-}
+      SELECTELV2_USERNAME: ${SELECTELV2_USERNAME:-}
+      SELECTELV2_PASSWORD: ${SELECTELV2_PASSWORD:-}
+    volumes:
+      - ./bin/relay-cert.sh:/app/relay-cert.sh:ro
+      - ./config/acme:/data
+      - ${APPLE_RELAY_TLS_DIR:-./relay-tls}:/tls
+    cap_drop: [ALL]
+    # write into relay-tls/ whoever owns it, and hand the files to the relay's user
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
     security_opt: [no-new-privileges:true]
     read_only: true
     tmpfs: [/tmp]

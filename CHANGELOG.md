@@ -1,6 +1,30 @@
 <!-- Network addresses in examples are synthetic; deployment-specific notes are omitted. -->
 # Changelog
 
+## 2.5.0 - 2026-11-18
+
+The Apple relay without the gateway in its path.
+
+* **HTTP/2 straight to this server.** The relay serves HTTP/2 over TLS itself
+  on TCP 8443 (`APPLE_RELAY_HTTP2_TLS_BIND`), with the certificate HTTP/3
+  already uses, next to HTTP/3 on UDP 8443. Profiles list HTTP/3 first and
+  HTTP/2 as the fallback at one address, so installed profiles keep working;
+  forward TCP and UDP 8443 from the router to this server. The plain backend
+  for the gateway (8444) stays open.
+* **The relay's certificate renews itself.** A new `relay-cert` service runs
+  lego (the ACME client inside Traefik) with the DNS challenge at the DNS
+  provider and the same service account as the gateway's Traefik
+  (`RELAY_CERT_DOMAIN`, `ACME_EMAIL`, `ACME_DNS_PROVIDER`, `SELECTELV2_*` in
+  `.env`), checks twice a day, and hands a renewed certificate to the relay,
+  which loads it within 30 s. No more copying from the gateway.
+* The Relay page shows the certificate (names, issuer, days left) and whether
+  HTTP/2 is served directly or through the gateway.
+* **Settings, redone.** Sections in a side list (a menu on a phone) with
+  deep links: Public addresses, Apple relay, Guests, VPN network, Gateway,
+  Router, Account. One action bar names the unsaved sections and what they
+  need (save, VPN restart, gateway file) and leads with the right button;
+  leaving with unsaved changes asks first. Long help is folded away.
+
 ## 2.4.1 - 2026-11-18
 
 * **HTTP/3 always on.** Every Apple relay profile now carries the HTTP/3

@@ -243,41 +243,52 @@ docker compose logs --tail=50 apple-relay relay-policy
 docker compose exec -T apple-relay wget -qO- http://127.0.0.1:8446/readyz
 ```
 
-### HTTP/3 next to HTTP/2
+### HTTP/3 and HTTP/2 straight to this server
 
-Over HTTP/2 every connection of a device shares one TCP connection that goes
-through the gateway (TLS there, then the LAN). Over HTTP/3 the device talks
-QUIC to this server directly, as OpenVPN does over UDP. The relay serves both
-at once (`APPLE_RELAY_TRANSPORT=http2+http3`, the default); HTTP/3 needs three
-things from you:
+The relay serves both transports itself, with its own certificate, on one port
+number: HTTP/3 on UDP 8443, HTTP/2 over TLS on TCP 8443. Every relay profile
+lists HTTP/3 first and HTTP/2 as the fallback, at the same address with the
+same credential, so a device uses HTTP/3 and falls back to HTTP/2 when UDP does
+not get through. Profiles installed before keep working (same address); a
+device gets HTTP/3 when its profile is downloaded again. The gateway's Traefik
+is no longer in the relay's path (its plain backend on 8444 stays open, for a
+gateway still forwarding TCP 8443).
 
-1. **The certificate of the relay hostname on this server**, in `relay-tls/`
-   (`fullchain.pem`, `privkey.pem`). Docker creates that folder as root on the
-   first start; give it to your user first: `sudo chown $USER relay-tls`.
-   Copy `bin/export-relay-cert.py` from this repository to the gateway and run
-   it there: `sudo python3 export-relay-cert.py --acme letsencrypt/acme.json
-   --hostname <relay host> --output /tmp/relay-tls` (the bare hostname: no
-   quotes, scheme or port), then copy the two files into `relay-tls/` here and
-   make them readable by the relay's user: `sudo chown 65532 relay-tls/*.pem`
-   (the export writes them with mode 0600). For a renewal, `sudo rm -f
-   relay-tls/*.pem` here first. The relay starts HTTP/3 when the files
-   appear and loads a renewed pair within 30 seconds, without a restart;
-   repeat the export after each renewal (a cron job on the gateway). An
-   HTTP/3 fault never stops HTTP/2.
-2. **UDP 8443 forwarded from the router to this server** (TCP 8443 stays on
-   the gateway). The relay URL does not change.
-3. Nothing to switch on: every relay profile carries the same address twice,
-   for HTTP/3 and HTTP/2, whenever the relay serves HTTP/3 (the default).
-   **Settings → Network** shows whether its HTTP/3 listener is open. That a
-   device prefers HTTP/3 and falls back to HTTP/2 is how Apple describes
-   relays; check a device's sessions on the Relay page (`h3` or `h2`).
+1. **The certificate**, issued and renewed by the `relay-cert` service: lego,
+   the ACME client inside Traefik, with the DNS challenge at your DNS provider
+   and the same service account as the gateway's Traefik. Put in `.env` (the
+   values of the gateway's `.env`):
 
-Profiles installed before keep working over HTTP/2 unchanged; a device gets
-HTTP/3 when its profile is downloaded again. The Relay page shows which
-listeners are open, and every relay session shows `h2` or `h3`.
-QUIC wants larger socket buffers than Linux allows by default; on this host:
-`sysctl -w net.core.rmem_max=7500000 net.core.wmem_max=7500000` (and the same
-two lines in `/etc/sysctl.d/`).
+   ```shell
+   RELAY_CERT_DOMAIN=relay.example.com      # the relay URL's hostname
+   ACME_EMAIL=you@example.com
+   ACME_DNS_PROVIDER=selectelv2
+   SELECTELV2_ACCOUNT_ID=...
+   SELECTELV2_PROJECT_ID=...
+   SELECTELV2_USERNAME=...
+   SELECTELV2_PASSWORD=...
+   ```
+
+   then `sudo docker compose up -d relay-cert` and watch
+   `sudo docker compose logs -f relay-cert` until it says "handed to the
+   relay". It checks twice a day and renews when a third of the lifetime is
+   left; the relay loads the new pair within 30 seconds, without a restart.
+   lego's account and certificates live in `config/acme/` (part of backups).
+   Another DNS provider: set `ACME_DNS_PROVIDER` to its lego code and add its
+   variables to the `relay-cert` service in `docker-compose.yml`. Without
+   `RELAY_CERT_DOMAIN` the service stays idle and `relay-tls/` can be filled
+   by hand (`fullchain.pem`, `privkey.pem`, owned by UID 65532, mode 0600).
+2. **The router**: forward **TCP and UDP 8443** to this server. The relay URL
+   does not change.
+3. **This host**: QUIC wants larger socket buffers than Linux allows by
+   default: `sudo sysctl -w net.core.rmem_max=7500000 net.core.wmem_max=7500000`
+   (and the same two lines in `/etc/sysctl.d/`). A host firewall must let in
+   TCP and UDP 8443.
+
+The **Relay** page shows which listeners are open (HTTP/2 direct or through the
+gateway), the certificate's names and days left, and every relay session shows
+`h3` or `h2`. `APPLE_RELAY_HTTP2_TLS_BIND=off` sends HTTP/2 through the gateway
+again (TCP 8443 forwarded to the gateway, as before 2.5);
 `APPLE_RELAY_TRANSPORT=http2` or `http3` alone still work as before.
 
 ## Traffic by podkop section
@@ -359,6 +370,24 @@ clients and trusted LAN networks through the gateway's regular HTTPS listener.
 From the open internet it is not reachable, so a first profile has to be handed
 over privately or on the LAN.
 
+## Upgrading to 2.5
+
+```shell
+cd ~/openvpn-server && git pull --ff-only
+# .env: RELAY_CERT_DOMAIN, ACME_EMAIL and the DNS provider's credentials (see below)
+sudo docker compose up -d --build
+sudo docker compose logs -f relay-cert     # until "handed to the relay"
+```
+
+In this order: deploy 2.5 first, check that the Relay page shows HTTP/2
+"direct" and the certificate, and only then forward TCP 8443 from the router
+to this server (UDP 8443 already comes here for HTTP/3). Forwarding TCP 8443
+here before 2.5 runs cuts off every HTTP/2 profile. The DNS provider's values
+are the ones in the gateway's `.env`: copy those lines over as they are. Profile
+signing stays on the gateway (its signer reads the gateway's certificate); the
+gateway is out of the relay's data path, not out of the picture. See
+[HTTP/3 and HTTP/2 straight to this server](#http3-and-http2-straight-to-this-server).
+
 ## Upgrading to 2.4
 
 ```shell
@@ -391,7 +420,7 @@ and relay profiles keep working. If your `.env` was copied from an older
 `.env.example`, delete its `APPLE_RELAY_MAX_FLOWS`, `..._PER_CLIENT`,
 `..._MAX_H2_STREAMS` and `APPLE_RELAY_TRANSPORT` lines to get the new defaults.
 The gateway needs no change. HTTP/3 is optional, see
-[HTTP/3 next to HTTP/2](#http3-next-to-http2).
+[HTTP/3 and HTTP/2 straight to this server](#http3-and-http2-straight-to-this-server).
 
 ## Upgrading to 2.0
 

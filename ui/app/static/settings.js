@@ -1,18 +1,22 @@
 'use strict';
-/* Settings page: network and gateway settings, password, appearance. */
+/* Settings page: one pane per subject (deep link #/settings/<pane>), the network form's
+   action bar with what is unsaved and what applying it takes, password, appearance. */
 
 /* --------------------------------------------------------------- network */
-// One form for everything the clients and the Traefik gateway need to know.
-// `saved` is GET /api/network/settings, `relay` GET /api/relay/settings and
-// `general` GET /api/settings (the profile address and OpenVPN's sockets).
-function networkSettingsCard(saved, relay, general) {
+// One form behind five panes (addresses, relay, guests, VPN network, gateway): everything the
+// clients and the Traefik gateway need to know, saved with one request. `saved` is
+// GET /api/network/settings, `relay` GET /api/relay/settings and `general` GET /api/settings.
+// The form keeps what was last saved, so it can tell which panes have unsaved changes and
+// what applying them takes: a VPN restart, the gateway file, or nothing more.
+function networkForm(saved, relay, general) {
   const gw = saved.gateway;
   const listText = list => (list || []).join(', ');
   const parseList = value => value.split(/[\s,]+/).filter(Boolean);
   const text = (value, attrs = {}) => h('input', { class: 'input', value: value || '', autocomplete: 'off', spellcheck: 'false', ...attrs });
   const hostOf = url => { try { return new URL(url).hostname; } catch (_) { return ''; } };
-  const section = (title, help, ...children) =>
-    h('section', { class: 'settings-section' }, h('h3', null, title), help ? h('p', { class: 'small muted' }, help) : null, ...children);
+  const group = (title, help, ...children) =>
+    h('section', { class: 'settings-section' }, title ? h('h3', null, title) : null, help ? h('p', { class: 'small muted' }, help) : null, ...children);
+  const more = (summary, ...children) => h('details', { class: 'settings-details' }, h('summary', null, summary), h('div', { class: 'form' }, ...children));
 
   /* -- inputs ------------------------------------------------------------ */
   const domain = text(gw.domain, { placeholder: 'example.com' });
@@ -24,12 +28,6 @@ function networkSettingsCard(saved, relay, general) {
   });
   const relayEnabled = h('input', { type: 'checkbox', checked: relay.enabled });
   const relayURL = text(relay.url || gw.relay_public_url);
-  const relayHTTP3State = h('span', null, 'Checking whether the relay accepts HTTP/3…');
-  api('/api/relay/status').then(status => {
-    const open = status.transports ? status.transports.http3 : status.transport === 'http3';
-    relayHTTP3State.textContent = !status.ready ? 'The relay is not reachable now, so its HTTP/3 listener cannot be checked.'
-      : open ? 'The relay reports its HTTP/3 listener open.' : 'The relay reports NO HTTP/3 listener: profiles with HTTP/3 would only add a delay before falling back.';
-  }, () => { relayHTTP3State.textContent = ''; });
   const backend = text(gw.openvpn_backend, { placeholder: 'http://192.0.2.20:8080' });
   const relayBackend = text(gw.relay_backend);
   const proxies = text(listText(saved.proxy_cidrs));
@@ -62,6 +60,31 @@ function networkSettingsCard(saved, relay, general) {
     portalPage.textContent = `https://${value(website, d.website) || 'openvpn.example.com'}/portal`;
   };
   [domain, website, backend].forEach(input => input.addEventListener('input', refresh));
+
+  /* -- the relay's listeners and certificate --------------------------------- */
+  const relayStatus = h('div', { class: 'status-list', role: 'status' }, h('div', { class: 'small muted' }, 'Asking the relay…'));
+  const statusRow = (ok, label, detail) => h('div', { class: 'status-row ' + (ok === null ? 'unknown' : ok ? 'ok' : 'bad') },
+    h('span', { class: 'status-dot' + (ok ? ' on' : '') }), h('strong', null, label), detail ? h('span', { class: 'small muted' }, detail) : null);
+  api('/api/relay/status').then(status => {
+    // Older relays report one "transport" and no "transports".
+    const open = status.transports || { http2: status.transport === 'http2', http3: status.transport === 'http3' };
+    const rows = [];
+    if (!status.ready) rows.push(statusRow(false, 'Relay not reachable', 'its listeners cannot be checked now'));
+    else {
+      rows.push(statusRow(!!open.http3, 'HTTP/3 (UDP)', open.http3 ? 'open: devices use it first' : 'closed: devices use HTTP/2'));
+      rows.push(statusRow(!!open.http2, 'HTTP/2 (TCP)', !open.http2 ? 'closed' : open.http2_direct ? 'open on this server (TLS here): the fallback' : 'open through the gateway: the fallback'));
+    }
+    const tls = status.tls;
+    if (tls && tls.not_after) {
+      const days = Math.floor((tls.not_after - Date.now() / 1000) / 86400);
+      const good = tls.ok !== false && days >= 21;
+      rows.push(statusRow(good, 'Certificate', `${(tls.names || []).join(', ') || 'relay'} · expires ${fmtDate(tls.not_after)} (${fmtDays(days)})`
+        + (tls.issuer ? ` · ${tls.issuer}` : '') + (days < 21 && days >= 0 ? ' · renew soon' : '')));
+    } else if (tls === null) {
+      rows.push(statusRow(false, 'Certificate', 'none on this server yet'));
+    }
+    relayStatus.replaceChildren(...rows);
+  }, () => { relayStatus.replaceChildren(statusRow(null, 'Relay status unavailable')); });
 
   /* -- guests: the gateway file's guest entries, and a check of what guests reach -- */
   // The same entries as network.export_gateway() writes (link_rule: host, and path "/" for the whole site).
@@ -118,6 +141,38 @@ function networkSettingsCard(saved, relay, general) {
     };
   };
 
+  /* -- what is unsaved, and what it takes ------------------------------------ */
+  // Each pane's share of the request body, and the parts the gateway file and the VPN restart carry.
+  const PARTS = {
+    addresses: b => [b.gateway.domain, b.gateway.openvpn_host, b.remote],
+    relay: b => [b.relay, b.gateway.relay_public_url],
+    guests: b => [b.gateway.portal_listener, b.gateway.guest_links],
+    vpn: b => [b.vpn_subnet, b.guest_subnet, b.pool_first, b.pool_last, b.dns_servers, b.routes],
+    gateway: b => [b.gateway.openvpn_backend, b.gateway.relay_backend, b.proxy_cidrs, b.gateway.trusted_cidrs,
+                   b.gateway.replace_services, b.gateway.services],
+  };
+  const GATEWAY_FILE = b => ['domain', 'openvpn_host', 'openvpn_backend', 'relay_host', 'relay_backend', 'relay_public_url',
+    'portal_listener', 'trusted_cidrs', 'guest_links', 'replace_services', 'services'].map(k => b.gateway[k]);
+  const snapshot = () => {
+    const b = collect();
+    return { parts: Object.fromEntries(Object.entries(PARTS).map(([k, f]) => [k, JSON.stringify(f(b))])),
+             gateway: JSON.stringify(GATEWAY_FILE(b)), restart: JSON.stringify(PARTS.vpn(b)) };
+  };
+  let baseline = null;
+  const changes = () => {
+    const now = snapshot();
+    return { panes: Object.keys(PARTS).filter(k => now.parts[k] !== baseline.parts[k]),
+             gateway: now.gateway !== baseline.gateway, restart: now.restart !== baseline.restart };
+  };
+  const listeners = [];
+  let pending = false;
+  const changed = () => {
+    if (pending || !baseline) return;
+    pending = true;
+    queueMicrotask(() => { pending = false; const c = changes(); listeners.forEach(fn => fn(c)); });
+  };
+  const markSaved = () => { baseline = snapshot(); savedGuests = guestText(); changed(); };
+
   /* -- address detection ---------------------------------------------------- */
   const detection = h('div', { class: 'detection-status', role: 'status' }, 'Looking up this server’s and the gateway’s addresses…');
   const suggestionTargets = { 'gateway.openvpn_backend': backend, 'gateway.portal_listener': portal, proxy_cidrs: proxies };
@@ -134,10 +189,12 @@ function networkSettingsCard(saved, relay, general) {
         filled.push(input.closest('.field').querySelector('label').textContent);
       }
       refresh();
+      showGuestBlock();
+      changed();
       detection.replaceChildren(
         h('strong', null, `Gateway: ${found.gateway_ipv4 || 'not found'} · This server: ${found.server_ipv4 || 'not found'}`),
         h('p', { class: 'small muted' }, filled.length
-          ? `Filled in: ${filled.join(', ')}. Check them before saving.`
+          ? `Filled in: ${filled.join(', ')}. Check them, then save.`
           : 'Nothing was changed; fields that already have a value are kept.'));
     } catch (error) {
       detection.textContent = 'Addresses could not be detected; enter them by hand. ' + error.message;
@@ -145,18 +202,15 @@ function networkSettingsCard(saved, relay, general) {
   };
 
   /* -- actions -------------------------------------------------------------- */
-  const message = h('div', { class: 'notice', role: 'status', hidden: true });
-  const say = (text, kind = 'status') => { message.hidden = false; message.textContent = text; message.setAttribute('role', kind); };
   const save = async () => {
-    const guests = guestText();
     await api('/api/network/settings', { method: 'PUT', body: collect() });
-    savedGuests = guests;
+    markSaved();
   };
-  const action = (label, primary, run) => h('button', { class: 'btn' + (primary ? ' primary' : ''), onClick: async event => {
-    const button = event.currentTarget;
-    button.disabled = true; message.hidden = true;
-    try { say(await run()); } catch (error) { say(error.message, 'alert'); } finally { button.disabled = false; }
-  } }, label);
+  const restartVPN = async () => {
+    await save();
+    await api('/api/server/restart', { method: 'POST' });
+    return 'Saved. The VPN is restarting; connected clients reconnect by themselves.';
+  };
   const downloadGatewayFile = async () => {
     await save();
     const response = await fetch('/api/network/traefik.json');
@@ -165,76 +219,76 @@ function networkSettingsCard(saved, relay, general) {
     const link = h('a', { href: url, download: 'network.private.json' });
     document.body.append(link); link.click(); link.remove();
     setTimeout(() => URL.revokeObjectURL(url), 60000);
-    return 'Saved. Copy network.private.json to the gateway and apply it there (see the steps below).';
+    return 'Saved. Copy network.private.json to the gateway and apply it there (Gateway → Applying the gateway file).';
   };
 
-  /* -- layout ---------------------------------------------------------------- */
+  /* -- panes ---------------------------------------------------------------- */
   const portField = p => field(`Public ${p.proto.toUpperCase()} port`, p.input);
-  const root = h('div', { class: 'form network-settings' },
-    section('Public addresses', 'What clients connect to. Empty fields use the value shown in grey.',
-      h('div', { class: 'form cols' },
-        field('Domain', domain),
-        field('Website and personal portal', website),
-        field('VPN address in profiles', vpnHost),
-        h('div', { class: 'form cols' }, ...vpnPorts.map(portField)),
-        field('Apple relay URL', relayURL, 'Clients connect here; the gateway forwards it to this server.'),
-        h('label', { class: 'check' }, relayEnabled, 'Offer Apple relay profiles'),
-        h('div', { class: 'full field' }, h('strong', null, 'HTTP/3'),
-          h('div', { class: 'help' }, 'Every relay profile carries the relay address for HTTP/3 (UDP, straight to this server) next to HTTP/2 (TCP, through the gateway), which stays as the fallback. HTTP/3 needs the relay\'s UDP port forwarded from the router to this server and the relay hostname\'s certificate on this server. Profiles installed before 2.4.1 keep working over HTTP/2; download them again for HTTP/3. ', relayHTTP3State)))),
-    section('Guests', null,
-      h('p', null, 'Guests of OpenVPN and the Apple relay get the internet through your network (with its filtering) but no LAN access. Of your websites they can open only their personal portal, ',
-        portalPage, ', to change their password and download their profiles, and the guest links below.'),
-      field('Guest portal listener on the gateway', portal,
-        'The gateway’s LAN address and its portal port (9443). A guest’s HTTPS connections to the gateway go there. Empty: guests cannot open the portal.'),
-      links.element,
-      h('div', { class: 'form' },
-        h('strong', null, 'For network.private.json on the gateway'),
-        h('p', { class: 'small muted' }, 'Replace these two entries in the gateway’s network.private.json and keep the rest, then run ',
-          h('code', null, './manage setup --network-file ./network.private.json'), ' and ', h('code', null, 'sudo docker compose up -d'),
-          '. Each link’s hostname must already be a website on the gateway. Save and download gateway file gives the whole file instead.'),
-        guestBlock,
-        h('div', { class: 'row' },
-          h('button', { class: 'btn', type: 'button', onClick: copyGuestBlock }, 'Copy'),
-          h('button', { class: 'btn', type: 'button', onClick: checkGuests }, 'Check guest access'))),
-      guestCheck),
-    section('Gateway', 'How the Traefik gateway reaches this server, and which of its addresses this server trusts.',
-      h('div', { class: 'form cols' },
-        field('This server’s web address', backend, 'As the gateway reaches the web UI, including the port.'),
-        field('This server’s relay address', relayBackend, 'Where the gateway forwards Apple relay connections.'),
-        field('Gateway addresses', proxies, 'Its source addresses here. Only they may set the client address of a request.')),
-      detection,
-      h('div', null, h('button', { class: 'btn', onClick: detect }, 'Detect addresses'))),
-    section('VPN network', 'Changes take effect when the VPN restarts. Static client addresses must stay inside the subnet.',
-      h('div', { class: 'form cols' },
-        field('VPN subnet', vpn.vpn_subnet), field('Guest subnet', vpn.guest_subnet, 'Part of the VPN subnet; one address per guest device.'),
-        field('First pool address', vpn.pool_first), field('Last pool address', vpn.pool_last),
-        field('DNS servers', vpn.dns_servers, 'Guests can reach these for name lookups.'),
-        field('Pushed routes', vpn.routes, 'Networks full-access clients reach through the VPN.'))),
-    h('details', { class: 'settings-details' }, h('summary', null, 'Advanced gateway settings'),
-      h('div', { class: 'form' },
+  const panes = {
+    addresses: h('div', { class: 'stack' },
+      group(null, 'Empty fields use the value shown in grey.',
+        h('div', { class: 'form cols' },
+          field('Domain', domain),
+          field('Website and personal portal', website),
+          field('VPN address in profiles', vpnHost, 'The server name OpenVPN profiles connect to.'),
+          h('div', { class: 'form cols' }, ...vpnPorts.map(portField))))),
+    relay: h('div', { class: 'stack' },
+      group('Listeners', null, relayStatus,
+        more('How devices use HTTP/3 and HTTP/2',
+          h('p', { class: 'small', style: 'margin:0' }, 'Every relay profile carries the relay address twice: HTTP/3 (UDP, straight to this server) first and HTTP/2 (TCP) as the fallback, with one credential. HTTP/3 needs the relay’s UDP port forwarded from the router to this server and the relay hostname’s certificate here. Profiles installed before 2.4.1 keep working over HTTP/2; download them again for HTTP/3.'))),
+      group('Profiles', null,
+        h('div', { class: 'form' },
+          field('Apple relay URL', relayURL, 'The HTTPS address in relay profiles, e.g. https://example.com:8443.'),
+          h('label', { class: 'check' }, relayEnabled, 'Offer Apple relay profiles')))),
+    guests: h('div', { class: 'stack' },
+      group(null, null,
+        h('p', { class: 'small', style: 'margin:0' }, 'Guests get the internet through your network but no LAN. Of your websites they open only their portal, ',
+          portalPage, ', and the guest links below.'),
+        field('Guest portal listener on the gateway', portal, 'The gateway’s LAN address and portal port, e.g. 192.0.2.10:9443. Empty: no portal for guests.')),
+      group(null, null, links.element),
+      group('Check', null,
+        h('div', { class: 'row' }, h('button', { class: 'btn', type: 'button', onClick: checkGuests }, 'Check guest access'),
+          h('span', { class: 'small muted' }, 'Opens the saved portal and links from here, the way a guest’s connection goes.')),
+        guestCheck,
+        more('Only these entries, for network.private.json',
+          h('p', { class: 'small muted', style: 'margin:0' }, 'Replace these two entries in the gateway’s network.private.json and keep the rest, then run ',
+            h('code', null, './manage setup --network-file ./network.private.json'), ' and ', h('code', null, 'sudo docker compose up -d'),
+            '. Each link’s hostname must already be a website on the gateway.'),
+          guestBlock,
+          h('div', null, h('button', { class: 'btn', type: 'button', onClick: copyGuestBlock }, 'Copy'))))),
+    vpn: h('div', { class: 'stack' },
+      group(null, 'Static client addresses must stay inside the subnet.',
+        h('div', { class: 'form cols' },
+          field('VPN subnet', vpn.vpn_subnet), field('Guest subnet', vpn.guest_subnet, 'Part of the VPN subnet; one address per guest device.'),
+          field('First pool address', vpn.pool_first), field('Last pool address', vpn.pool_last),
+          field('DNS servers', vpn.dns_servers, 'Guests can reach these for name lookups.'),
+          field('Pushed routes', vpn.routes, 'Networks full-access clients reach through the VPN.')))),
+    gateway: h('div', { class: 'stack' },
+      group('This server, as the gateway sees it', null,
+        h('div', { class: 'form cols' },
+          field('This server’s web address', backend, 'How the gateway reaches the web UI, with the port.'),
+          field('This server’s relay address', relayBackend, 'Where the gateway forwards Apple relay connections.'),
+          field('Gateway addresses', proxies, 'Its source addresses here. Only they may set a request’s client address.')),
+        detection,
+        h('div', null, h('button', { class: 'btn', type: 'button', onClick: detect }, 'Detect addresses'))),
+      more('Advanced: trusted networks and additional websites',
         field('Networks allowed into private websites', trusted,
           'Replaces the gateway’s list of networks trusted with its private websites. Empty keeps its current list.'),
-        services.element)),
-    message,
-    h('div', { class: 'row settings-actions' },
-      action('Save', false, async () => { await save(); return 'Saved. Restart the VPN to apply network changes.'; }),
-      action('Save and restart VPN', false, async () => {
-        await save();
-        await api('/api/server/restart', { method: 'POST' });
-        return 'Saved. The VPN is restarting; connected clients reconnect by themselves.';
-      }),
-      action('Save and download gateway file', true, downloadGatewayFile)),
-    h('details', { class: 'settings-details' }, h('summary', null, 'Applying the gateway file'),
-      h('ol', { class: 'setup-steps' },
-        h('li', null, 'Save and download the gateway file.'),
-        h('li', null, 'Copy network.private.json into the Traefik folder on the gateway and run ',
-          h('code', null, './manage setup --network-file ./network.private.json'), ', then ',
-          h('code', null, 'sudo docker compose up -d'), '.'),
-        h('li', null, 'Back here, use Save and restart VPN.'))));
+        services.element),
+      more('Applying the gateway file',
+        h('ol', { class: 'setup-steps' },
+          h('li', null, 'Save and download the gateway file (the button below).'),
+          h('li', null, 'Copy network.private.json into the Traefik folder on the gateway and run ',
+            h('code', null, './manage setup --network-file ./network.private.json'), ', then ',
+            h('code', null, 'sudo docker compose up -d'), '.'),
+          h('li', null, 'If the VPN network changed too, use Save and restart VPN here.')))),
+  };
+  Object.values(panes).forEach(pane => ['input', 'change', 'click'].forEach(type => pane.addEventListener(type, changed)));
   refresh();
   showGuestBlock();
+  baseline = snapshot();      // before detection: what it fills in counts as unsaved
   detect();
-  return card('Network', root);
+  return { panes, save, restartVPN, downloadGatewayFile, changes: () => changes(), onChange: fn => listeners.push(fn), markSaved };
 }
 
 // Extra pages guests may open: websites under your domain, served by the gateway.
@@ -260,7 +314,7 @@ function guestLinkEditor(saved, onChange) {
   return {
     element: h('div', { class: 'form' },
       h('strong', null, 'Guest links'),
-      h('p', { class: 'small muted' }, 'Pages under your domain that guests may open as well. They appear on the guests’ portal page. ' +
+      h('p', { class: 'small muted', style: 'margin:0' }, 'Pages under your domain that guests may open as well. They appear on the guests’ portal page. ' +
         'After a change, apply the gateway file on the gateway. A page that loads files from elsewhere on its website may need the whole website.'),
       list, h('div', null, h('button', { class: 'btn', type: 'button', onClick: () => add() }, 'Add link'))),
     collect: () => rows.filter(row => row.url.value.trim())
@@ -306,22 +360,137 @@ function serviceEditor(gw) {
 }
 
 /* ------------------------------------------------------------------ page */
+// What each pane is for, and what saving it takes ("needs"): shown in the sub-navigation and the pane header.
+const SETTINGS_PANES = [
+  { id: 'addresses', title: 'Public addresses', hint: 'Domain and what profiles connect to', form: true, needs: ['gateway', 'profiles'] },
+  { id: 'relay', title: 'Apple relay', hint: 'Listeners, certificate, relay URL', form: true, needs: ['gateway', 'profiles'] },
+  { id: 'guests', title: 'Guests', hint: 'Portal and guest links', form: true, needs: ['gateway'] },
+  { id: 'vpn', title: 'VPN network', hint: 'Subnets, pool, DNS, routes', form: true, needs: ['restart'] },
+  { id: 'gateway', title: 'Gateway', hint: 'How Traefik reaches this server', form: true, needs: ['gateway'] },
+  { id: 'router', title: 'Router', hint: 'Traffic by podkop section', needs: ['own'] },
+  { id: 'account', title: 'Account', hint: 'Password, appearance, version', needs: ['own'] },
+];
+const SETTINGS_NEEDS = {
+  restart: ['Applies after a VPN restart', 'restart'],
+  gateway: ['Apply the gateway file on the gateway', 'gateway'],
+  profiles: ['New downloads of profiles carry it', 'profiles'],
+  own: ['Saved by its own buttons', 'own'],
+};
+
 function settingsView(el) {
-  const body = h('div', { class: 'stack' });
-  el.append(topbar('Settings'), body);
+  const body = h('div', { class: 'settings-layout' }, h('div', { class: 'small muted' }, 'Loading…'));
+  el.append(topbar('Settings', 'Network, relay, guests, gateway, router and your account'), body);
   (async () => {
     let general, relay, network;
     try {
       [general, relay, network] = await Promise.all([api('/api/settings'), api('/api/relay/settings'), api('/api/network/settings')]);
-    } catch (e) { toast(e.message, 'err'); return; }
-    body.append(networkSettingsCard(network, relay, general),
-      routerCard(),
-      h('div', { class: 'grid two' }, passwordCard(), appearanceCard()),
-      card('About', h('dl', { class: 'kv' },
-        h('dt', null, 'UI version'), h('dd', null, general.version),
-        h('dt', null, 'Signed in as'), h('dd', null, state.user.username),
-        h('dt', null, 'Poll interval'), h('dd', null, `${general.poll_interval} s`),
-        h('dt', null, '2FA issuer'), h('dd', null, general.tfa_issuer))));
+    } catch (e) { body.replaceChildren(h('div', { class: 'empty' }, e.message)); toast(e.message, 'err'); return; }
+    const form = networkForm(network, relay, general);
+    const panes = {
+      ...form.panes,
+      router: routerCard(),
+      account: h('div', { class: 'stack' }, h('div', { class: 'grid two' }, passwordCard(), appearanceCard()),
+        card('About', h('dl', { class: 'kv' },
+          h('dt', null, 'UI version'), h('dd', null, general.version),
+          h('dt', null, 'Signed in as'), h('dd', null, state.user.username),
+          h('dt', null, 'Poll interval'), h('dd', null, `${general.poll_interval} s`),
+          h('dt', null, '2FA issuer'), h('dd', null, general.tfa_issuer)))),
+    };
+
+    /* -- navigation: a list on wide screens, a menu on narrow ones -- */
+    const stored = (() => { try { return localStorage.getItem('settings-pane'); } catch (_) { return null; } })();
+    const known = id => SETTINGS_PANES.some(p => p.id === id);
+    let current = known(state.route.param) ? state.route.param : known(stored) ? stored : 'addresses';
+    const navButtons = {};
+    const nav = h('nav', { class: 'settings-nav', 'aria-label': 'Settings sections' }, SETTINGS_PANES.map(p => {
+      navButtons[p.id] = h('button', { type: 'button', class: 'settings-nav-item', onClick: () => show(p.id) },
+        h('span', { class: 'settings-nav-title' }, p.title, h('span', { class: 'dirty-dot', title: 'Unsaved changes', hidden: true })),
+        h('span', { class: 'settings-nav-hint' }, p.hint));
+      return navButtons[p.id];
+    }));
+    const picker = h('select', { class: 'input settings-picker', 'aria-label': 'Settings section', onChange: e => show(e.target.value) },
+      SETTINGS_PANES.map(p => h('option', { value: p.id }, p.title)));
+    const header = h('div', { class: 'settings-pane-head' });
+    const content = h('div', { class: 'settings-pane-body network-settings' });
+
+    /* -- the action bar of the network form -- */
+    const status = h('div', { class: 'settings-bar-status', role: 'status', 'aria-live': 'polite' });
+    const busy = fn => async event => {
+      const buttons = bar.querySelectorAll('button');
+      buttons.forEach(b => { b.disabled = true; });
+      try { const said = await fn(event); if (said) { toast(said, 'ok'); lastSaid = said; } }
+      catch (error) { toast(error.message, 'err'); lastSaid = error.message; }
+      finally { buttons.forEach(b => { b.disabled = false; }); update(form.changes()); }
+    };
+    let lastSaid = '';
+    const saveBtn = h('button', { class: 'btn', type: 'button', onClick: busy(async () => { await form.save(); return 'Saved.'; }) }, 'Save');
+    const restartBtn = h('button', { class: 'btn', type: 'button', onClick: busy(form.restartVPN) }, 'Save and restart VPN');
+    const gatewayBtn = h('button', { class: 'btn', type: 'button', onClick: busy(form.downloadGatewayFile) }, 'Save and download gateway file');
+    const discardBtn = h('button', { class: 'btn ghost', type: 'button', onClick: async () => {
+      if (!await confirmDialog('Discard changes', 'Unsaved changes in ' + paneTitles(form.changes().panes) + ' are dropped and the saved settings shown again.', 'Discard', true)) return;
+      form.markSaved(); renderView();
+    } }, 'Discard');
+    const bar = h('div', { class: 'settings-bar' }, status, h('div', { class: 'settings-bar-actions' }, discardBtn, saveBtn, restartBtn, gatewayBtn));
+    const paneTitles = ids => ids.map(id => SETTINGS_PANES.find(p => p.id === id).title).join(', ');
+    const update = c => {
+      const dirty = c.panes.length > 0;
+      SETTINGS_PANES.forEach(p => { navButtons[p.id].querySelector('.dirty-dot').hidden = !c.panes.includes(p.id); });
+      [...picker.options].forEach(o => { const p = SETTINGS_PANES.find(q => q.id === o.value); o.textContent = p.title + (c.panes.includes(p.id) ? ' •' : ''); });
+      bar.classList.toggle('dirty', dirty);
+      discardBtn.hidden = !dirty;
+      saveBtn.disabled = !dirty;
+      // The button that does what the changes need is the primary one.
+      saveBtn.classList.toggle('primary', dirty && !c.restart && !c.gateway);
+      restartBtn.classList.toggle('primary', c.restart);
+      gatewayBtn.classList.toggle('primary', c.gateway && !c.restart);
+      if (!dirty) {
+        status.replaceChildren(h('strong', null, 'All changes saved'), lastSaid ? h('span', { class: 'small muted' }, lastSaid) : null);
+        return;
+      }
+      lastSaid = '';
+      const needs = [];
+      if (c.restart) needs.push(h('span', { class: 'need-chip restart' }, 'Needs a VPN restart'));
+      if (c.gateway) needs.push(h('span', { class: 'need-chip gateway' }, 'Needs the gateway file'));
+      if (!needs.length) needs.push(h('span', { class: 'need-chip' }, 'Saving is enough'));
+      status.replaceChildren(h('strong', null, 'Unsaved: ' + paneTitles(c.panes)), h('div', { class: 'row needs' }, needs));
+    };
+    form.onChange(update);
+
+    const show = id => {
+      current = id;
+      state.route.param = id;     // a re-render (Discard) opens the same pane
+      const p = SETTINGS_PANES.find(q => q.id === id);
+      Object.entries(navButtons).forEach(([key, b]) => { b.classList.toggle('active', key === id); b.setAttribute('aria-current', key === id ? 'page' : 'false'); });
+      picker.value = id;
+      header.replaceChildren(h('h2', null, p.title), h('p', { class: 'small muted' }, p.hint),
+        h('div', { class: 'row needs' }, p.needs.map(n => h('span', { class: 'need-chip ' + SETTINGS_NEEDS[n][1] }, SETTINGS_NEEDS[n][0]))));
+      content.replaceChildren(panes[id]);
+      bar.hidden = !p.form;
+      try { localStorage.setItem('settings-pane', id); } catch (_) { /* private mode */ }
+      history.replaceState(null, '', '#/settings/' + id);
+    };
+    body.replaceChildren(nav, h('div', { class: 'settings-main' }, picker, h('div', { class: 'card settings-pane' }, header, content, bar)));
+    show(current);
+    update(form.changes());
+
+    /* -- unsaved changes: ask before leaving the page -- */
+    const dirtyNow = () => body.isConnected && form.changes().panes.length > 0;
+    const guardClick = async event => {
+      if (!body.isConnected) { cleanup(); return; }
+      const a = event.target.closest('a[href^="#/"]');
+      if (!a || !dirtyNow()) return;
+      const href = a.getAttribute('href');
+      event.preventDefault(); event.stopPropagation();
+      const sub = href.match(/^#\/settings(?:\/([\w-]+))?$/);
+      if (sub) { if (sub[1] && known(sub[1])) show(sub[1]); return; }   // staying on this page keeps the changes
+      if (await confirmDialog('Leave without saving?', 'Unsaved changes in ' + paneTitles(form.changes().panes) + ' will be lost.', 'Leave', true)) {
+        cleanup(); go(href);
+      }
+    };
+    const guardUnload = event => { if (dirtyNow()) { event.preventDefault(); event.returnValue = ''; } else if (!body.isConnected) cleanup(); };
+    const cleanup = () => { document.removeEventListener('click', guardClick, true); window.removeEventListener('beforeunload', guardUnload); };
+    document.addEventListener('click', guardClick, true);
+    window.addEventListener('beforeunload', guardUnload);
   })();
   return null;
 }
