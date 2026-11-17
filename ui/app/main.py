@@ -919,7 +919,7 @@ def router_status() -> dict[str, Any]:
     status = section_collector.status
     pending = db.one("SELECT COUNT(*) AS n, MIN(queued_at) AS oldest FROM section_pending")
     return {"address": config.get("address", ""), "key": sections.key_path().is_file(),
-            "line": sections.authorized_line(), "last_ok": status.get("last_ok"), "last_error": status.get("last_error"),
+            "line": sections.authorized_line(), "command": sections.router_command(), "last_ok": status.get("last_ok"), "last_error": status.get("last_error"),
             "error": status.get("error"), "agent": status.get("agent"), "sections": section_collector.sections,
             "subnets": len(section_collector.ranges) if section_collector.ranges is not None else None,
             "pending": int(pending["n"]) if pending else 0, "unmapped": status.get("unmapped", 0)}
@@ -938,6 +938,12 @@ def put_router(body: RouterBody, user: dict[str, Any] = Authed):
         raise HTTPException(400, str(exc)) from None
     db.set_setting("router_sections", json.dumps({"address": address}))
     event("router_sections_changed", user, detail=address or "off")
+    if address and not sections.key_path().is_file():      # the command for the router is ready at once
+        try:
+            sections.create_key()
+            event("router_key_created", user)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            log.warning("could not create the router key")
     return router_status()
 
 

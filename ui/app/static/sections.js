@@ -69,18 +69,19 @@ function sectionsCard(url, opts) {
 function routerCard() {
   const address = h('input', { class: 'input', placeholder: 'root@192.168.1.1', autocomplete: 'off', 'aria-label': 'Router SSH address' });
   const status = h('div', { class: 'stack', style: 'gap:6px' });
-  const line = h('div', { class: 'uri mono small' });
+  const line = h('div', { class: 'uri mono small', style: 'word-break:break-all' });
+  const copy = () => navigator.clipboard.writeText(line.textContent).then(() => toast('Command copied', 'ok'), () => toast('Copying needs HTTPS - select the command instead', 'err'));
   const lineBox = h('div', { class: 'stack', style: 'gap:6px', hidden: true },
-    h('span', { class: 'small' }, 'Add this line to the router\'s /etc/dropbear/authorized_keys. It lets this key run nothing but the section lookup:'),
-    line, h('div', null, h('button', { class: 'btn sm', onClick: () => navigator.clipboard.writeText(line.textContent).then(() => toast('Line copied', 'ok'), () => toast('Copying needs HTTPS - select the line instead', 'err')) }, 'Copy line')));
+    h('span', { class: 'small' }, 'Paste this command into the router\'s terminal (SSH as root), once. It adds this server\'s key, which can run nothing but the section lookup, and replaces an older key of this server:'),
+    line, h('div', null, h('button', { class: 'btn sm', onClick: copy }, 'Copy command')));
   const keyButton = h('button', { class: 'btn' });
   let initialized = false, info = null;
   function show(r) {
     info = r;
     if (!initialized) { address.value = r.address || ''; initialized = true; }
     keyButton.textContent = r.key ? 'Replace key' : 'Create key';
-    lineBox.hidden = !r.line;
-    line.textContent = r.line || '';
+    lineBox.hidden = !r.command;
+    line.textContent = r.command || '';
     const parts = [];
     if (!r.address) parts.push(h('strong', null, 'Off: no router address'));
     else if (r.error) parts.push(h('strong', null, 'Router not answering: '), h('span', null, r.error));
@@ -91,7 +92,7 @@ function routerCard() {
   }
   async function load() { try { show(await api('/api/router')); } catch (e) { status.textContent = e.message; } }
   keyButton.addEventListener('click', async () => {
-    if (info && info.key && !await confirmDialog('Replace the key', 'The router then refuses the old key: replace the line in its authorized_keys too.', 'Replace', true)) return;
+    if (info && info.key && !await confirmDialog('Replace the key', 'The router refuses the old key from then on: paste the new command into its terminal.', 'Replace', true)) return;
     try { show(await withToast(api('/api/router/key', { method: 'POST', body: { replace: !!(info && info.key) } }), 'Key created')); } catch (_) {}
   });
   const result = card('Router · traffic by podkop section', h('div', { class: 'form' },

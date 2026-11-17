@@ -1346,8 +1346,10 @@ def test_traffic_by_section_reports_and_router_settings(client, monkeypatch, tmp
     monkeypatch.setattr(sections, "router_dir", lambda: tmp_path / "router")
     assert client.put("/api/router", json={"address": "root@host;reboot"}, headers=H).status_code == 400
     r = client.put("/api/router", json={"address": "171.134.51.1"}, headers=H).json()
-    assert r["address"] == "root@171.134.51.1" and r["key"] is False and r["line"] is None
-    r = client.post("/api/router/key", json={}, headers=H)
+    # saving the address makes the key, and the command for the router's terminal is ready
+    assert r["address"] == "root@171.134.51.1" and r["key"] is True
+    assert r["command"].startswith("sed -i ") and f"echo '{r['line']}' >> /etc/dropbear/authorized_keys" in r["command"]
+    r = client.put("/api/router", json={"address": "171.134.51.1"}, headers=H)
     assert r.status_code == 200 and r.json()["line"].startswith('restrict,command="/usr/bin/podkop-agent --sections-only" ssh-ed25519 ')
     assert "PRIVATE" not in r.text
     assert client.post("/api/router/key", json={}, headers=H).status_code == 409

@@ -305,11 +305,14 @@ Setup:
    `sudo sysctl -w net.netfilter.nf_conntrack_acct=1`, and put
    `net.netfilter.nf_conntrack_acct = 1` into `/etc/sysctl.d/99-openvpn.conf`.
    The OpenVPN container warns in its log while it is off.
-2. **Settings → Router**: enter the router's SSH address (`root@192.168.1.1`),
-   **Create key**, and add the line shown to the router's
-   `/etc/dropbear/authorized_keys`; it looks like
-   `restrict,command="/usr/bin/podkop-agent --sections-only" ssh-ed25519 AAAA... openvpn-server-sections`.
-   **Test** shows how many sections and address ranges the router reports.
+2. **Settings → Router**: enter the router's SSH address (`root@192.168.1.1`)
+   and **Save**. The card then shows one command: paste it into the router's
+   terminal (SSH as root), once. It adds this server's key to
+   `/etc/dropbear/authorized_keys` as
+   `restrict,command="/usr/bin/podkop-agent --sections-only" ssh-ed25519 AAAA... openvpn-server-sections`,
+   a key that can run nothing but the section lookup. **Test** shows how many
+   sections and address ranges the router reports.
+   The key lives in `config/router/` (not in git, included in backups).
    From then on the server asks the router by itself, at least every 5
    minutes: the card shows whether it answers and the agent's version, and
    the event log records when the router stops answering and when it is back.

@@ -53,6 +53,9 @@ def test_validate_address_and_authorized_line(tmp_path, monkeypatch):
     assert line.startswith('restrict,command="/usr/bin/podkop-agent --sections-only" ssh-ed25519 ')
     assert line.endswith(" openvpn-server-sections") and "PRIVATE" not in line
     assert oct(os.stat(tmp_path / "router/id_ed25519").st_mode & 0o777) == "0o600"
+    command = sections.router_command()
+    assert command.startswith("sed -i '/ openvpn-server-sections$/d' /etc/dropbear/authorized_keys")
+    assert f"echo '{line}' >> /etc/dropbear/authorized_keys" in command and command.count("'") % 2 == 0
     with pytest.raises(ValueError):
         sections.create_key()
     assert sections.create_key(replace=True) != line

@@ -85,6 +85,16 @@ def authorized_line() -> str | None:
     return f'restrict,command="/usr/bin/podkop-agent --sections-only" {kind} {blob} {KEY_COMMENT}'
 
 
+def router_command() -> str | None:
+    """One line for the router's terminal: this key's line into authorized_keys, replacing an older one of ours."""
+    line = authorized_line()
+    if line is None:
+        return None
+    keys = "/etc/dropbear/authorized_keys"
+    return (f"sed -i '/ {KEY_COMMENT}$/d' {keys} 2>/dev/null; echo '{line}' >> {keys} && chmod 600 {keys} "
+            "&& echo 'key added: press Test in the OpenVPN UI'")
+
+
 def create_key(replace: bool = False) -> str:
     path = key_path()
     if path.exists() and not replace:
