@@ -14,6 +14,10 @@
 * The relay reports the address it connected to for every connection.
 * **Settings → Router**: the router's SSH address and a key that may run only
   `podkop-agent sections` (podkop-agent 0.27 or newer).
+* The server checks the router by itself every 5 minutes, traffic or not:
+  the card shows whether it answers, the agent's version, its sections and
+  address ranges. The router going silent and coming back are events, and the
+  traffic cards say so while it is silent.
 
 ## 2.3.0 - 2026-11-18
 

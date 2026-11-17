@@ -1347,7 +1347,7 @@ def test_traffic_by_section_reports_and_router_settings(client, monkeypatch, tmp
     assert client.post("/api/router/key", json={"replace": True}, headers=H).json()["line"] != r.json()["line"]
     monkeypatch.setattr(sections, "ssh_call", lambda address, request: {"boot_id": "b", "sections": ["youtube", "main"],
                                                                          "subnets": ["1.2.3.0/24"], "domains": {}, "addresses": {}})
-    assert client.post("/api/router/test", headers=H).json() == {"ok": True, "sections": ["youtube", "main"], "subnets": 1, "boot_id": True}
+    assert client.post("/api/router/test", headers=H).json() == {"ok": True, "agent": None, "sections": ["youtube", "main"], "subnets": 1, "boot_id": True}
 
     def refuse(address, request):
         raise sections.SectionsUnavailable("router refused the call: Permission denied")

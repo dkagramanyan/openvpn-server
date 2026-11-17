@@ -303,6 +303,9 @@ Setup:
    `/etc/dropbear/authorized_keys`; it looks like
    `restrict,command="/usr/bin/podkop-agent --sections-only" ssh-ed25519 AAAA... openvpn-server-sections`.
    **Test** shows how many sections and address ranges the router reports.
+   From then on the server asks the router by itself, at least every 5
+   minutes: the card shows whether it answers and the agent's version, and
+   the event log records when the router stops answering and when it is back.
    The key lives in `config/router/` (not in git, included in backups).
 
 What the numbers mean:
