@@ -252,12 +252,15 @@ at once (`APPLE_RELAY_TRANSPORT=http2+http3`, the default); HTTP/3 needs three
 things from you:
 
 1. **The certificate of the relay hostname on this server**, in `relay-tls/`
-   (`fullchain.pem`, `privkey.pem`). Copy `bin/export-relay-cert.py` from this
-   repository to the gateway and run it there: `sudo python3
-   export-relay-cert.py --acme letsencrypt/acme.json --hostname <relay host>
-   --output relay-tls`, then copy the two files into `relay-tls/` here and make
-   them readable by the relay's user: `sudo chown 65532 relay-tls/*.pem` (the
-   export writes them with mode 0600). The relay starts HTTP/3 when the files
+   (`fullchain.pem`, `privkey.pem`). Docker creates that folder as root on the
+   first start; give it to your user first: `sudo chown $USER relay-tls`.
+   Copy `bin/export-relay-cert.py` from this repository to the gateway and run
+   it there: `sudo python3 export-relay-cert.py --acme letsencrypt/acme.json
+   --hostname <relay host> --output /tmp/relay-tls` (the bare hostname: no
+   quotes, scheme or port), then copy the two files into `relay-tls/` here and
+   make them readable by the relay's user: `sudo chown 65532 relay-tls/*.pem`
+   (the export writes them with mode 0600). For a renewal, `sudo rm -f
+   relay-tls/*.pem` here first. The relay starts HTTP/3 when the files
    appear and loads a renewed pair within 30 seconds, without a restart;
    repeat the export after each renewal (a cron job on the gateway). An
    HTTP/3 fault never stops HTTP/2.
