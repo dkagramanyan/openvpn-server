@@ -355,6 +355,24 @@ clients and trusted LAN networks through the gateway's regular HTTPS listener.
 From the open internet it is not reachable, so a first profile has to be handed
 over privately or on the LAN.
 
+## Upgrading to 2.4
+
+```shell
+cd ~/openvpn-server &&
+sudo ./backup.sh &&                        # the new database layout cannot go back to 2.3
+git checkout main && git pull --ff-only &&
+sudo sysctl -w net.netfilter.nf_conntrack_acct=1 net.netfilter.nf_conntrack_timestamp=1 &&
+printf 'net.netfilter.nf_conntrack_acct = 1\nnet.netfilter.nf_conntrack_timestamp = 1\n' |
+  sudo tee /etc/sysctl.d/99-openvpn.conf &&
+sudo docker compose up -d --build          # OpenVPN clients reconnect once
+```
+
+The database is upgraded on the first start; installed OpenVPN and relay
+profiles keep working. `git checkout main` is needed once, only on a checkout
+that was switched to a test branch. The two host settings are for
+[Traffic by podkop section](#traffic-by-podkop-section), which also needs
+podkop-agent 0.27 on the router and **Settings → Router** here.
+
 ## Upgrading to 2.3
 
 ```shell
