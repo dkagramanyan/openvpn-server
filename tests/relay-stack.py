@@ -307,7 +307,7 @@ tls:
         # The united pages read what the real relay reports: listeners, the event
         # log position, and per-client relay traffic and connections.
         relay_state = json.loads(api("/api/relay/status"))
-        assert relay_state["transports"] == {"http2": True, "http3": False}, relay_state.get("transports")
+        assert relay_state["transports"] == {"http2": True, "http2_direct": False, "http3": False}, relay_state.get("transports")
         assert all(e["seq"] and e["transport"] == "http2" for e in relay_state["events"]), relay_state["events"][:2]
         for _ in range(30):
             saved = json.loads(api("/api/clients/alice/relay-flows"))
