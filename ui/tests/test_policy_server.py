@@ -72,3 +72,15 @@ def test_request_with_a_body_closes_the_connection(service):
     connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
     status, _, header = ask(connection, body=b"x" * 10)
     assert status == 200 and header == "close"
+
+
+def test_dropped_connection_is_not_logged_as_a_failed_request(service, caplog):
+    import socket, struct, time
+    port, _ = service
+    raw = socket.create_connection(("127.0.0.1", port))
+    raw.sendall(b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n")
+    raw.recv(200)
+    raw.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))   # close with a reset
+    raw.close()
+    time.sleep(0.3)
+    assert "Policy request failed" not in caplog.text
