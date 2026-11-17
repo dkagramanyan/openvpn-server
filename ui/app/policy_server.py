@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import psycopg
+import sys
 from psycopg import sql as pgsql
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -164,6 +165,9 @@ class PolicyServer(ThreadingHTTPServer):
             self.slots.release()
 
     def handle_error(self, request, address):
+        # A client that drops a kept connection is not a failed request.
+        if isinstance(sys.exc_info()[1], ConnectionError):
+            return
         log.warning("Policy request failed; request details suppressed")
 
     def get_request(self):

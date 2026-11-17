@@ -117,6 +117,7 @@ func (s *relayServer) authorizeBackend(ctx context.Context, token string) (polic
 				}
 				return p, nil
 			}
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 			resp.Body.Close()
 			if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 				s.metrics.observe("authorization_denials", time.Time{})
@@ -160,7 +161,10 @@ func (s *relayServer) checkReadiness(ctx context.Context) error {
 	if err != nil {
 		return errAuthUnavailable
 	}
+	// Read the short answer: closing with unread bytes resets the connection
+	// instead of returning it for the next check.
 	defer response.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
 	if response.StatusCode != http.StatusOK {
 		return errAuthUnavailable
 	}
