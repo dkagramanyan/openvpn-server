@@ -48,11 +48,22 @@ func TestActivityTracksConnectionsWithoutCredentials(t *testing.T) {
 
 func TestActivityRetentionIsBounded(t *testing.T) {
 	a := newActivity("http2")
-	for range 550 {
+	for range eventRing + 50 {
 		a.record(flowEvent{Kind: "test"})
 	}
 	a.record(flowEvent{Kind: "test"})
-	if len(a.events) != 500 {
+	if len(a.events) != eventRing {
 		t.Fatal("unbounded activity retention")
+	}
+	// The page gets the latest events; the UI's saver continues after a position.
+	if state := readActivity(t, a, "/status"); len(state.Events) != statusEvents || state.Events[statusEvents-1].Seq != eventRing+51 {
+		t.Fatalf("status events: %d, last %d", len(state.Events), state.Events[len(state.Events)-1].Seq)
+	}
+	state := readActivity(t, a, "/status?since=4000")
+	if len(state.Events) != eventRing+51-4000 || state.Events[0].Seq != 4001 {
+		t.Fatalf("since: %d events from %d", len(state.Events), state.Events[0].Seq)
+	}
+	if state := readActivity(t, a, "/status?since=99999"); len(state.Events) != 0 {
+		t.Fatal("events after the end of the log")
 	}
 }

@@ -3,7 +3,7 @@
 # OpenVPN web UI image. Build context is the repository root:
 #   docker build -f ui/Dockerfile .
 
-ARG ALPINE_VERSION=3.24.2
+ARG ALPINE_VERSION=3.24.4
 ARG PYTHON_IMAGE=python:3.14-alpine3.24
 
 # --------------------------------------------------------------------------

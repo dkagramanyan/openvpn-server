@@ -1123,6 +1123,16 @@ def test_network_discovery_is_read_only_admin_only_and_uses_original_peer(client
     assert response.headers['cache-control'] == 'no-store'
 
 
+def test_guest_check_is_admin_only(client, portal, monkeypatch):
+    from app import guest_check
+    monkeypatch.setattr(guest_check, 'check', lambda db=None: {'listener': '192.0.2.10:9443', 'targets': []})
+    assert client.post('/api/network/guest-check').status_code == 403
+    assert portal.post('/api/network/guest-check', headers=H).status_code == 403
+    response = client.post('/api/network/guest-check', headers=H)
+    assert response.status_code == 200 and response.json()['targets'] == []
+    assert response.headers['cache-control'] == 'no-store'
+
+
 def test_restricted_gateway_route_enforces_portal_boundary_even_for_admin(client, portal):
     restricted = {'X-OpenVPN-Portal-Only': '1'}
     assert client.get('/', headers=restricted, follow_redirects=False).headers['location'] == '/portal'
@@ -1153,3 +1163,151 @@ def test_portal_relay_sessions_are_bound_to_current_credential(client, configure
         assert 'bob' not in json.dumps(result)
     finally:
         db.execute("DELETE FROM relay_sessions WHERE id LIKE 'test:%'")
+
+
+# -- united clients: OpenVPN and the Apple relay together -------------------------
+def relay_session(identifier, name, now, **changes):
+    row = dict(id=identifier, client=name, credential_id="cred-" + name, transport="http3", started_at=now - 120,
+               last_seen=now, active=2, accepted=5, denied=1, failed=0, bytes_up=1000, bytes_down=5000, uncounted_flows=0)
+    return {**row, **changes}
+
+
+def relay_event(identifier, name, session, now, **changes):
+    row = dict(id=identifier, seq=identifier, session_id=session, ts=now - 30, kind="closed", client=name, protocol="TCP",
+               transport="http3", target=f"site{identifier}.example:443", reason="connection_closed", status=200,
+               duration_ms=900, bytes_up=10, bytes_down=20)
+    return {**row, **changes}
+
+
+def test_relay_only_client_is_online_active_and_listed_with_its_sessions(client, monkeypatch):
+    import time
+    from app.main import collector
+    from app import relay_history, relay_services
+    issue(TMP / "pki", "carol", "client", "20260101000000Z", "20360101000000Z")
+    now = int(time.time())
+    relay_history.record(db, dict(ready=True, instance="u1", sessions=[relay_session("u1:1", "carol", now)]), now=now)
+    assert relay_history.record_flows(db, "u1", [relay_event(1, "carol", "u1:1", now),
+                                                 relay_event(2, "carol", "u1:1", now, kind="denied", reason="destination_denied",
+                                                             target="printer.lan:631")], now=now) == 2
+    live = dict(client="carol", guest=False, active=2, tcp=1, udp=1, destinations=2, bytes_up=1000, bytes_down=5000,
+                rate_up=10.0, rate_down=50.0)
+    collector.set_relay([live], True)
+    monkeypatch.setattr(relay_services, "runtime_status", lambda client=None, since=None: {
+        "ready": True, "active": [{"client": "carol", "target": "open.example:443", "ts": now},
+                                  {"client": "alice", "target": "other.example:443", "ts": now}]})
+    try:
+        rows = {r["name"]: r for r in client.get("/api/clients?range=today").json()["clients"]}
+        carol = rows["carol"]
+        assert carol["online"] and carol["online_via"] == ["relay"] and carol["relay_live"]["active"] == 2
+        assert carol["traffic"] == {"bytes_in": 1000, "bytes_out": 5000, "vpn": {"bytes_in": 0, "bytes_out": 0},
+                                    "relay": {"bytes_in": 1000, "bytes_out": 5000}}      # relay up = in, down = out
+        assert carol["total"]["sessions"] == 1 and carol["total"]["relay_sessions"] == 1 and carol["total"]["vpn_visits"] == 0
+        assert carol["total"]["last_seen"] == now and carol["total"]["bytes_out"] == 5000
+        assert not rows["alice"]["online"] and rows["alice"]["online_via"] == []
+
+        data = client.get("/api/overview?range=today").json()
+        assert data["live"]["relay"] == [live] and data["live"]["relay_ready"] is True and data["live"]["clients"] == []
+        totals = data["totals"]
+        assert totals["relay"] == {"bytes_in": 1000, "bytes_out": 5000} and totals["relay_clients"] == 1
+        assert totals["clients"] >= 1 and totals["relay_sessions"] == 1
+        assert totals["bytes_out"] == totals["vpn"]["bytes_out"] + 5000
+        assert {"name": "carol", "bytes_in": 1000, "bytes_out": 5000, "vpn": {"bytes_in": 0, "bytes_out": 0},
+                "relay": {"bytes_in": 1000, "bytes_out": 5000}} in data["top"]
+        assert sum(p["relay_out"] for p in data["series"]) == 5000 and sum(p["relay_in"] for p in data["hour"]) == 1000
+        assert data["start"] < now < data["end"] and data["bucket"] == 600
+        series = client.get("/api/traffic?range=today&name=carol").json()
+        assert series["totals"]["relay"]["bytes_out"] == 5000 and series["totals"]["vpn"]["bytes_out"] == 0
+
+        only = client.get("/api/sessions?via=relay&name=carol").json()
+        assert only["total"] == 1
+        session = only["sessions"][0]
+        assert (session["via"], session["client_name"], session["transport"], session["state"]) == ("relay", "carol", "http3", "active")
+        assert (session["bytes_in"], session["bytes_out"], session["connections"], session["open"], session["denied"]) == (1000, 5000, 5, 2, 1)
+        assert client.get("/api/sessions?via=relay&name=alice").json()["total"] == 0
+        assert client.get("/api/sessions?via=relay&active=true").json()["total"] == 1
+        both = client.get("/api/sessions?via=all&merge=true").json()
+        assert both["total"] == client.get("/api/sessions?merge=true").json()["total"] + client.get("/api/sessions?via=relay").json()["total"]
+        assert {s["via"] for s in both["sessions"]} == {"vpn", "relay"}
+        starts = [s["connected_at"] for s in both["sessions"]]
+        assert starts == sorted(starts, reverse=True)
+        page = client.get("/api/sessions?via=all&merge=true&limit=1&offset=1").json()["sessions"]
+        assert page == both["sessions"][1:2]
+        assert client.get("/api/sessions?via=bogus").status_code == 400
+
+        detail = client.get("/api/clients/carol").json()
+        assert [s["via"] for s in detail["sessions"]] == ["relay"] and sum(p["relay_out"] for p in detail["daily"]) == 5000
+        log = client.get("/api/clients/carol/relay-flows").json()
+        assert log["total"] == 2 and log["retention_days"] == 7 and log["ready"] is True
+        assert {f["target"] for f in log["flows"]} == {"site1.example:443", "printer.lan:631"}
+        assert [f["target"] for f in log["active"]] == ["open.example:443"]          # never another client's
+        assert client.get("/api/clients/carol/relay-flows?q=printer").json()["total"] == 1
+        assert len(client.get("/api/clients/carol/relay-flows?limit=1&offset=1").json()["flows"]) == 1
+        assert client.get("/api/clients/alice/relay-flows").json()["total"] == 0
+        assert client.get("/api/clients/bad%20name/relay-flows").status_code == 400
+    finally:
+        collector.set_relay([], False)
+
+
+def test_calendar_periods_reach_every_period_endpoint(client):
+    for name in ("today", "yesterday", "week", "month", "last_month", "all", "24h", "7d", "30d", "90d"):
+        for path in ("/api/overview", "/api/clients", "/api/connections", "/api/traffic"):
+            response = client.get(f"{path}?range={name}&tz=10800")
+            assert response.status_code == 200, (path, name, response.text)
+            data = response.json()
+            assert data["range"] == name and data["start"] < data["end"] and data["bucket"] in (600, 3600, 86400)
+    custom = client.get("/api/overview?range=custom&from=2026-11-01&to=2026-11-03&tz=10800").json()
+    assert custom["end"] - custom["start"] == 3 * 86400 and custom["start"] % 86400 == 86400 - 10800
+    assert custom["bucket"] in (3600, 86400) and len(custom["series"]) * custom["bucket"] == 3 * 86400
+    assert client.get("/api/overview?range=custom&from=2026-11-03&to=2026-11-01").status_code == 400
+    assert client.get("/api/clients?range=custom").status_code == 400
+    assert client.get("/api/traffic?range=bogus").status_code == 400
+
+
+def test_http3_setting_adds_a_second_address_and_installed_profiles_keep_working(client, configured, monkeypatch):
+    from app.settings import settings
+    assert configured["http3"] is False
+    before = client.post("/api/clients/alice/relay.mobileconfig", headers=H).content
+    profile, token = download(client)
+    endpoint = profile["PayloadContent"][0]["Relays"][0]
+    assert list(endpoint) == ["HTTP2RelayURL", "AdditionalHTTPHeaderFields"]      # exactly the profile of 2.2
+    response = client.put("/api/relay/settings", json={**configured, "http3": True}, headers=H)
+    assert response.status_code == 200 and response.json()["http3"] is True
+    dual, dual_token = download(client)
+    both = dual["PayloadContent"][0]["Relays"][0]
+    assert list(both) == ["HTTP3RelayURL", "HTTP2RelayURL", "AdditionalHTTPHeaderFields"]
+    assert both["HTTP3RelayURL"] == both["HTTP2RelayURL"] == endpoint["HTTP2RelayURL"]
+    assert dual_token == token                                                     # the installed credential
+    for key in ("PayloadIdentifier", "PayloadUUID"):
+        assert dual[key] == profile[key] and dual["PayloadContent"][0][key] == profile["PayloadContent"][0][key]
+    # The profile installed before the change still authorizes, and the policy is what it was.
+    policy = client.post("/api/relay/authorize", headers={"Authorization": token}).json()
+    assert policy["client"] == "alice" and policy["url"] == configured["url"]
+    # A service that runs both transports does not change the profiles by itself.
+    monkeypatch.setattr(settings, "relay_transport", "http2+http3")
+    assert list(download(client)[0]["PayloadContent"][0]["Relays"][0])[0] == "HTTP3RelayURL"
+    assert client.put("/api/relay/settings", json={**configured, "http3": False}, headers=H).json()["http3"] is False
+    assert client.post("/api/clients/alice/relay.mobileconfig", headers=H).content == before
+    # Settings saved by 2.2 have no "http3": off, and the credential issued then still works.
+    db.set_setting("apple_relay", json.dumps({"enabled": True, "url": configured["url"]}))
+    assert client.get("/api/relay/settings").json()["http3"] is False
+    assert client.post("/api/clients/alice/relay.mobileconfig", headers=H).content == before
+    assert client.post("/api/relay/authorize", headers={"Authorization": token}).status_code == 200
+
+
+def test_portal_sees_only_its_own_saved_relay_connections(client, configured, portal, monkeypatch):
+    import time
+    from app import relay_history, relay_services
+    download(client)                                    # alice now has a relay credential
+    credential, now = relay.credential_id(db, "alice"), int(time.time())
+    relay_history.record(db, dict(ready=True, instance="p1", sessions=[
+        relay_session("p1:1", "alice", now, credential_id=credential),
+        relay_session("p1:2", "alice", now, credential_id="an-earlier-credential"),
+        relay_session("p1:3", "dave", now)]), now=now)
+    relay_history.record_flows(db, "p1", [relay_event(1, "alice", "p1:1", now, target="mine.example:443"),
+                                          relay_event(2, "alice", "p1:2", now, target="earlier.example:443"),
+                                          relay_event(3, "dave", "p1:3", now, target="private-dave.example:443")], now=now)
+    monkeypatch.setattr(relay_services, "runtime_status", lambda client=None, since=None: {"ready": True, "policy_ready": True})
+    response = portal.get("/api/portal/relay/status")
+    assert [f["target"] for f in response.json()["flows"]] == ["mine.example:443"]
+    assert "dave" not in response.text and "earlier.example" not in response.text
+    assert portal.get("/api/clients/alice/relay-flows").status_code == 403

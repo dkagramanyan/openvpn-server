@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import datetime
 import hashlib
 import hmac
 import html
@@ -16,16 +17,16 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 from urllib.parse import urlsplit, parse_qs
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.exception_handlers import request_validation_exception_handler, http_exception_handler
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import __version__, auth, backup, pki, relay, relay_services, relay_history, watchdog, network, network_discovery
+from . import __version__, auth, backup, guest_check, pki, relay, relay_services, relay_history, watchdog, network, network_discovery
 from .collector import Collector, Maintenance
-from .db import Database
+from .db import Database, HOUR_RETENTION, MINUTE_RETENTION, RELAY_FLOW_RETENTION, empty_point
 from .mgmt import Management, ManagementError
 from .pki import PkiError
 from .portal_boundary import PortalBoundary
@@ -41,7 +42,10 @@ BACKUP_WARN_DAYS = 3
 STARTED = time.time()
 IP_ATTEMPTS = 20        # failed logins from one address, whatever the user name, before it has to wait
 SESSION_RECHECK = 60    # seconds between two looks at the session of an open live stream
-RANGES = {"today": None, "24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400, "90d": 90 * 86400, "all": None}
+# Calendar periods in the browser's time zone; "custom" takes from/to dates. The rolling
+# periods of earlier releases are still accepted.
+PERIODS = ("today", "yesterday", "week", "month", "last_month", "all", "custom")
+ROLLING = {"24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400, "90d": 90 * 86400}
 
 db = Database(settings.database_url, schema=settings.database_schema)
 _mgmt_host, _mgmt_port, _ = settings.management_endpoint()
@@ -49,7 +53,7 @@ mgmt = Management(_mgmt_host, _mgmt_port, settings.management_password)
 collector = Collector(db, mgmt, settings.poll_interval, settings.status_file,
                       (settings.log_dir / "openvpn.log", settings.log_dir / "oath.log"))
 maintenance = Maintenance(db, [lambda: pki.ensure_crl_fresh(), backup.ensure_recent])
-relay_collector = relay_history.RelayCollector(db)
+relay_collector = relay_history.RelayCollector(db, collector.set_relay)
 limiter = auth.LoginLimiter()
 
 
@@ -99,6 +103,9 @@ def migrate() -> None:
             if start and db.archive_client_history(name, before=start):
                 log.info("history of an earlier '%s' archived", name)
         db.set_setting("migration:identities", "1")
+    booked = relay_history.backfill_traffic(db)
+    if booked:
+        log.info("traffic of %d earlier relay sessions added to the statistics", booked)
     grouped = db.group_sessions()
     if grouped:
         log.info("%d earlier sessions merged into visits", grouped)
@@ -345,21 +352,68 @@ class RemoteBody(BaseModel):
 
 
 # -- helpers --------------------------------------------------------------------
-def range_bounds(name: str, tz: int) -> tuple[int, int]:
-    now = int(time.time())
-    if name not in RANGES:
+def range_bounds(name: str, tz: int, date_from: str | None = None, date_to: str | None = None,
+                 now: int | None = None) -> tuple[int, int]:
+    """[start, end) of a period, in seconds. tz is the browser's offset east of UTC: days, weeks
+    (from Monday) and months begin at its local midnight."""
+    now = int(time.time()) if now is None else now
+    if name in ROLLING:
+        return now - ROLLING[name], now + 1
+    if name not in PERIODS or abs(tz) > 14 * 3600:
         raise HTTPException(400, "Unknown range")
+    utc = datetime.timezone.utc
+    local = datetime.datetime.fromtimestamp(now + tz, utc)      # wall-clock time of the browser
+    stamp = lambda d: int(datetime.datetime(d.year, d.month, d.day, tzinfo=utc).timestamp()) - tz
+    today = local.date()
     if name == "today":
-        start = ((now + tz) // 86400) * 86400 - tz
-    elif name == "all":
-        start = db.first_traffic_ts() or now - 86400
-    else:
-        start = now - int(RANGES[name] or 0)
-    return start, now + 1
+        return stamp(today), now + 1
+    if name == "yesterday":
+        return stamp(today - datetime.timedelta(days=1)), stamp(today)
+    if name == "week":
+        return stamp(today - datetime.timedelta(days=today.weekday())), now + 1
+    if name == "month":
+        return stamp(today.replace(day=1)), now + 1
+    if name == "last_month":
+        first = today.replace(day=1)
+        return stamp((first - datetime.timedelta(days=1)).replace(day=1)), stamp(first)
+    if name == "all":
+        return db.first_traffic_ts() or now - 86400, now + 1
+    try:
+        first, last = datetime.date.fromisoformat(date_from or ""), datetime.date.fromisoformat(date_to or "")
+    except ValueError:
+        raise HTTPException(400, "A custom period needs from and to dates (YYYY-MM-DD)") from None
+    start, end = stamp(first), min(stamp(last + datetime.timedelta(days=1)), now + 1)
+    if first > last or start >= end:
+        raise HTTPException(400, "The period must start before it ends, and not in the future")
+    return start, end
 
 
-def bucket_for(name: str) -> int:
-    return {"today": 600, "24h": 600, "7d": 3600}.get(name, 86400)
+def bucket_for(start: int, end: int, now: int | None = None) -> int:
+    """Chart step for a period: ten minutes up to two days, an hour up to two weeks, else a day;
+    never finer than the stored data (minutes for two days, hours for 90)."""
+    now = int(time.time()) if now is None else now
+    span = end - start
+    bucket = 600 if span <= 2 * 86400 + 1 else 3600 if span <= 14 * 86400 + 1 else 86400
+    if start < now - HOUR_RETENTION:
+        return 86400
+    if start < now - MINUTE_RETENTION:
+        return max(bucket, 3600)
+    return bucket
+
+
+class Period:
+    def __init__(self, range: str = "today", tz: int = 0, date_from: str | None = Query(None, alias="from"),
+                 date_to: str | None = Query(None, alias="to")) -> None:
+        self.name, self.tz = range, tz
+        self.start, self.end = range_bounds(range, tz, date_from, date_to)
+        self.bucket = 86400 if range == "all" else bucket_for(self.start, self.end)
+
+    def info(self) -> dict[str, Any]:
+        return {"range": self.name, "start": self.start, "end": self.end, "bucket": self.bucket}
+
+    def series(self, client: str | None = None) -> list[dict[str, int]]:
+        return fill_series(db.series(self.start, self.end, self.bucket, client, self.tz),
+                           self.start, self.end, self.bucket, self.tz)
 
 
 def hidden_serials() -> set[str]:
@@ -368,18 +422,24 @@ def hidden_serials() -> set[str]:
 
 def fill_series(points: list[dict[str, int]], start: int, end: int, bucket: int, tz: int = 0) -> list[dict[str, int]]:
     by_ts = {p["ts"]: p for p in points}
-    first = ((start + tz) // bucket) * bucket - tz
+    t = ((start + tz) // bucket) * bucket - tz
     out = []
-    t = first
     while t < end:
-        p = by_ts.get(t)
-        out.append({"ts": t, "bytes_in": p["bytes_in"] if p else 0, "bytes_out": p["bytes_out"] if p else 0})
+        out.append(by_ts.get(t) or empty_point(t))
         t += bucket
     return out
 
 
-def clients_payload(range_name: str, tz: int) -> list[dict[str, Any]]:
-    start, end = range_bounds(range_name, tz)
+def split(by_source: dict[str, tuple[int, int]]) -> dict[str, Any]:
+    """Traffic of one client or period: the total and its OpenVPN and relay parts."""
+    parts = {source: {"bytes_in": by_source.get(source, (0, 0))[0], "bytes_out": by_source.get(source, (0, 0))[1]}
+             for source in ("vpn", "relay")}
+    return {"bytes_in": sum(p["bytes_in"] for p in parts.values()),
+            "bytes_out": sum(p["bytes_out"] for p in parts.values()), **parts}
+
+
+def clients_payload(period: Period | None = None) -> list[dict[str, Any]]:
+    period = period or Period("today", 0, None, None)
     certs = pki.list_clients(hidden_serials())
     statics = pki.static_ips()
     guests = pki.guests()
@@ -389,15 +449,19 @@ def clients_payload(range_name: str, tz: int) -> list[dict[str, Any]]:
     online: dict[str, list[dict[str, Any]]] = {}
     for c in live["clients"]:
         online.setdefault(c["cn"], []).append(c)
-    period = db.totals_by_client(start, end)
+    relay_live = {c["client"]: c for c in live.get("relay", [])}
+    traffic = db.traffic_by_client(period.start, period.end)
     totals = db.session_stats_by_client()
+    relay_totals = relay_history.stats_by_client(db)
     notes = {r["name"]: r["note"] for r in db.query("SELECT name, note FROM clients")}
     now = int(time.time())
     rows = []
     for name, c in certs.items():
         cert = c["cert"]
-        p_in, p_out = period.get(name, (0, 0))
-        t = totals.get(name, {})
+        t, r = totals.get(name, {}), relay_totals.get(name, {})
+        via = [source for source, on in (("vpn", name in online), ("relay", name in relay_live)) if on]
+        seen = [x for x in (t.get("last_seen"), r.get("last_seen")) if x]
+        first = [x for x in (t.get("first_seen"), r.get("first_seen")) if x]
         rows.append({
             "name": name,
             "state": cert["state"],
@@ -410,12 +474,20 @@ def clients_payload(range_name: str, tz: int) -> list[dict[str, Any]]:
             "guest": name in guests,
             "relay_available": relay_enabled and cert["state"] == "valid",
             "tfa": name in tfa,
-            "online": bool(online.get(name)),
+            # Online = an OpenVPN connection or an open relay connection.
+            "online": bool(via),
+            "online_via": via,
             "sessions_live": online.get(name, []),
-            "traffic": {"bytes_in": p_in, "bytes_out": p_out},
-            "total": {"bytes_in": t.get("bytes_in", 0), "bytes_out": t.get("bytes_out", 0),
-                      "sessions": t.get("sessions", 0), "last_seen": t.get("last_seen"),
-                      "first_seen": t.get("first_seen"), "online_seconds": t.get("online_seconds", 0)},
+            "relay_live": relay_live.get(name),
+            "traffic": split(traffic.get(name, {})),
+            # All time. "sessions" = OpenVPN visits (reconnects merged) + relay sessions.
+            "total": {**split({"vpn": (t.get("bytes_in", 0), t.get("bytes_out", 0)),
+                               "relay": (r.get("bytes_in", 0), r.get("bytes_out", 0))}),
+                      "sessions": t.get("visits", 0) + r.get("sessions", 0),
+                      "vpn_visits": t.get("visits", 0), "vpn_connections": t.get("sessions", 0),
+                      "relay_sessions": r.get("sessions", 0),
+                      "last_seen": max(seen) if seen else None, "first_seen": min(first) if first else None,
+                      "online_seconds": t.get("online_seconds", 0)},
             "note": notes.get(name, ""),
         })
     order = {"valid": 0, "expired": 1, "revoked": 2}
@@ -425,7 +497,7 @@ def clients_payload(range_name: str, tz: int) -> list[dict[str, Any]]:
 
 def find_client(name: str) -> dict[str, Any]:
     pki.validate_name(name)
-    for row in clients_payload("today", 0):
+    for row in clients_payload():
         if row["name"] == name:
             return row
     raise HTTPException(404, "Client not found")
@@ -583,6 +655,7 @@ def own_relay_status(user: dict[str, Any] = SignedIn):
     # the client query. Never send another client's destinations to this login.
     return {"ready": bool(status.get("ready")), "policy_ready": status.get("policy_ready", False),
             "sessions": relay_history.sessions(db, client=name, credential=relay.credential_id(db, name)),
+            "flows": relay_history.flows(db, name, credential=relay.credential_id(db, name), limit=100)[1],
             **{key: [row for row in status.get(key, []) if row.get("client") == name]
                for key in ("clients", "active", "events")}}
 
@@ -605,15 +678,17 @@ def own_relay_profile(user: dict[str, Any] = SignedIn):
 
 # -- overview / live --------------------------------------------------------------
 @app.get("/api/overview")
-def overview(range: str = "today", tz: int = 0, user: dict[str, Any] = Authed):
-    start, end = range_bounds(range, tz)
+def overview(period: Period = Depends(), user: dict[str, Any] = Authed):
+    start, end = period.start, period.end
     now = int(time.time())
     live = collector.snapshot()
-    total_in, total_out = db.totals(start, end)
-    by_client = db.totals_by_client(start, end)
-    top = sorted(by_client.items(), key=lambda kv: kv[1][0] + kv[1][1], reverse=True)[:8]
-    sess = db.one("SELECT COUNT(*) AS n, COUNT(DISTINCT client_name) AS c FROM vpn_sessions "
-                  "WHERE last_seen >= ? AND connected_at < ?", (start, end))
+    by_client = db.traffic_by_client(start, end)
+    by_source = {source: (sum(v.get(source, (0, 0))[0] for v in by_client.values()),
+                          sum(v.get(source, (0, 0))[1] for v in by_client.values())) for source in ("vpn", "relay")}
+    top = sorted(by_client.items(), key=lambda kv: sum(a + b for a, b in kv[1].values()), reverse=True)[:8]
+    # Visits (reconnects of one client from one address merged) that overlap the period.
+    visits = db.one("SELECT COUNT(DISTINCT grp) AS n, COUNT(*) AS c FROM vpn_sessions "
+                    "WHERE last_seen >= ? AND connected_at < ?", (start, end))
     hour_start = now - 3600
     certs = pki.list_clients(hidden_serials())
     counts = {"valid": 0, "expiring": 0, "expired": 0, "revoked": 0}
@@ -664,15 +739,18 @@ def overview(range: str = "today", tz: int = 0, user: dict[str, Any] = Authed):
             warnings.append(f"2FA is enforced but {len(missing)} client(s) have no TOTP secret: "
                             + ", ".join(sorted(missing)[:5]) + ("..." if len(missing) > 5 else ""))
     return {
-        "range": range,
+        **period.info(),
         "live": live,
-        "totals": {"bytes_in": total_in, "bytes_out": total_out,
-                   "sessions": int(sess["n"]) if sess else 0, "clients": int(sess["c"]) if sess else 0},
-        "top": [{"name": n, "bytes_in": v[0], "bytes_out": v[1]} for n, v in top],
+        # "clients": active users, the clients with traffic in the period over OpenVPN or the relay.
+        "totals": {**split(by_source), "clients": len(by_client),
+                   "vpn_clients": sum(1 for v in by_client.values() if "vpn" in v),
+                   "relay_clients": sum(1 for v in by_client.values() if "relay" in v),
+                   "vpn_visits": int(visits["n"]) if visits else 0,
+                   "vpn_connections": int(visits["c"]) if visits else 0,
+                   "relay_sessions": relay_history.count_between(db, start, end)},
+        "top": [{"name": n, **split(v)} for n, v in top],
         "hour": fill_series(db.series(hour_start, now + 60, 60), hour_start, now + 60, 60),
-        "series": fill_series(db.series(start, end, bucket_for(range), tz_offset=tz), start, end,
-                              bucket_for(range), tz),
-        "bucket": bucket_for(range),
+        "series": period.series(),
         "counts": counts,
         "warnings": warnings,
         "tfa_enforced": pki.tfa_enforced(),
@@ -711,8 +789,8 @@ async def stream(request: Request, user: dict[str, Any] = Authed):
 
 # -- clients ----------------------------------------------------------------------
 @app.get("/api/clients")
-def list_clients(range: str = "today", tz: int = 0, user: dict[str, Any] = Authed):
-    return {"range": range, "clients": clients_payload(range, tz)}
+def list_clients(period: Period = Depends(), user: dict[str, Any] = Authed):
+    return {**period.info(), "clients": clients_payload(period)}
 
 
 @app.post("/api/clients", status_code=201, dependencies=[Csrf])
@@ -750,16 +828,68 @@ def _create_client(body: NewClientBody, user: dict[str, Any]) -> dict[str, Any]:
     return {"client": find_client(name), "tfa_uri": tfa_uri}
 
 
+def relay_visit(row: dict[str, Any]) -> dict[str, Any]:
+    """A relay session in the shape of an OpenVPN visit (relay up = bytes_in, down = bytes_out)."""
+    return {"via": "relay", "id": row["id"], "client_name": row["client"], "connected_at": row["started_at"],
+            "disconnected_at": row["ended_at"], "last_seen": row["last_seen"], "state": row["state"],
+            "open": int(row["active"] or 0), "connections": int(row["accepted"] or 0),
+            "denied": int(row["denied"] or 0), "failed": int(row["failed"] or 0),
+            "bytes_in": int(row["bytes_up"] or 0), "bytes_out": int(row["bytes_down"] or 0),
+            "transport": row.get("transport") or ""}
+
+
+def merged_sessions(name: str | None, via: str, limit: int, offset: int, active: bool = False,
+                    merge: bool = True) -> tuple[int, list[dict[str, Any]]]:
+    """OpenVPN visits (or single connections) and relay sessions in one list, newest first."""
+    if via not in ("all", "vpn", "relay"):
+        raise HTTPException(400, "Unknown connection type")
+    total, rows = 0, []
+    reach = limit + offset if via == "all" else limit       # a merged page may come from either source
+    skip = 0 if via == "all" else offset
+    if via in ("all", "vpn"):
+        where, params = (["client_name = ?"], [name]) if name else ([], [])
+        if merge:
+            n, found = db.visits(" WHERE " + " AND ".join(where) if where else "", params, reach, skip, active)
+        else:
+            if active:
+                where.append("disconnected_at IS NULL")
+            sql = "SELECT * FROM vpn_sessions" + (" WHERE " + " AND ".join(where) if where else "")
+            n = int(db.one(f"SELECT COUNT(*) AS n FROM ({sql})", params)["n"])
+            found = [dict(r) for r in db.query(sql + " ORDER BY connected_at DESC, id DESC LIMIT ? OFFSET ?",
+                                               params + [reach, skip])]
+        total += n
+        rows += [{"via": "vpn", **r} for r in found]
+    if via in ("all", "relay"):
+        n, found = relay_history.visits(db, client=name, active=active, limit=reach, offset=skip)
+        total += n
+        rows += [relay_visit(r) for r in found]
+    if via == "all":
+        rows.sort(key=lambda r: r["connected_at"], reverse=True)
+        rows = rows[offset:offset + limit]
+    return total, rows
+
+
 @app.get("/api/clients/{name}")
 def client_detail(name: str, tz: int = 0, user: dict[str, Any] = Authed):
     row = find_client(name)
     now = int(time.time())
     start = now - 30 * 86400
-    row["sessions"] = db.visits(" WHERE client_name = ?", [name], 100)[1]
+    row["sessions"] = merged_sessions(name, "all", 100, 0)[1]
     row["daily"] = fill_series(db.series(start, now + 1, 86400, name, tz), start, now + 1, 86400, tz)
     row["tfa_uri"] = pki.tfa_uri(name) if row["tfa"] else None
     row["rejections"] = db.rejections(now - 30 * 86400, name)
     return row
+
+
+@app.get("/api/clients/{name}/relay-flows")
+def client_relay_flows(name: str, limit: int = 100, offset: int = 0, q: str = "", user: dict[str, Any] = Authed):
+    """The client's saved relay connections (kept 7 days), newest first, and the open ones."""
+    pki.validate_name(name)
+    total, rows = relay_history.flows(db, name, q=q.strip()[:253], limit=max(1, min(limit, 500)), offset=max(0, offset))
+    status = relay_services.runtime_status(client=name)
+    return {"total": total, "flows": rows, "retention_days": RELAY_FLOW_RETENTION // 86400,
+            "ready": bool(status.get("ready")),
+            "active": [f for f in status.get("active", []) if f.get("client") == name]}
 
 
 @app.get("/api/clients/{name}/ovpn")
@@ -1034,42 +1164,27 @@ def set_note(name: str, body: NoteBody, user: dict[str, Any] = Authed):
 # -- sessions / traffic -----------------------------------------------------------
 @app.get("/api/sessions")
 def sessions(name: str | None = None, limit: int = 100, offset: int = 0, active: bool = False,
-             merge: bool = False, user: dict[str, Any] = Authed):
-    """Sessions, newest first; merge=true folds the reconnects of one client from one address into visits."""
-    limit = max(1, min(limit, 500))
-    where, params = [], []
+             merge: bool = False, via: str = "vpn", user: dict[str, Any] = Authed):
+    """Sessions, newest first. via: "vpn", "relay" or "all" (both in one list); merge=true folds the
+    OpenVPN reconnects of one client from one address into visits."""
     if name:
         pki.validate_name(name)
-        where.append("client_name = ?")
-        params.append(name)
-    if merge:
-        total, rows = db.visits(" WHERE " + " AND ".join(where) if where else "", params, limit, max(0, offset), active)
-        return {"total": total, "sessions": rows}
-    if active:
-        where.append("disconnected_at IS NULL")
-    sql = "SELECT * FROM vpn_sessions" + (" WHERE " + " AND ".join(where) if where else "")
-    total = db.one(f"SELECT COUNT(*) AS n FROM ({sql})", params)
-    rows = db.query(sql + " ORDER BY connected_at DESC LIMIT ? OFFSET ?", params + [limit, max(0, offset)])
-    return {"total": int(total["n"]) if total else 0, "sessions": [dict(r) for r in rows]}
+    total, rows = merged_sessions(name or None, via, max(1, min(limit, 500)), max(0, offset), active, merge)
+    return {"total": total, "sessions": rows}
 
 
 @app.get("/api/connections")
-def connections(range: str = "today", tz: int = 0, user: dict[str, Any] = Authed):
-    """How the sessions of each client went in a period: count, length, endings, share over TCP."""
-    start, end = range_bounds(range, tz)
-    return {"range": range, "clients": db.connection_stats(start, end)}
+def connections(period: Period = Depends(), user: dict[str, Any] = Authed):
+    """How the OpenVPN sessions of each client went in a period: count, length, endings, share over TCP."""
+    return {**period.info(), "clients": db.connection_stats(period.start, period.end)}
 
 
 @app.get("/api/traffic")
-def traffic(range: str = "7d", name: str | None = None, tz: int = 0, user: dict[str, Any] = Authed):
+def traffic(name: str | None = None, period: Period = Depends(), user: dict[str, Any] = Authed):
     if name:
         pki.validate_name(name)
-    start, end = range_bounds(range, tz)
-    bucket = bucket_for(range)
-    total_in, total_out = db.totals(start, end, name)
-    return {"range": range, "bucket": bucket,
-            "series": fill_series(db.series(start, end, bucket, name, tz), start, end, bucket, tz),
-            "totals": {"bytes_in": total_in, "bytes_out": total_out}}
+    by_source = {source: db.totals(period.start, period.end, name, source) for source in ("vpn", "relay")}
+    return {**period.info(), "series": period.series(name), "totals": split(by_source)}
 
 
 # -- server ---------------------------------------------------------------------
@@ -1213,6 +1328,12 @@ def put_network_settings(body: NetworkUpdate, user: dict[str, Any] = Authed):
         result["remote"] = pki.get_remote()
     event("network_settings_changed", user)  # Never put network values in audit events.
     return result
+
+
+@app.post("/api/network/guest-check", dependencies=[Csrf])
+def check_guest_access(user: dict[str, Any] = Authed):
+    """Read-only: whether guests reach the saved portal and guest links through the gateway."""
+    return JSONResponse(guest_check.check(db), headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/network/traefik.json")

@@ -9,15 +9,15 @@
 # F554A3687412CFFEBDEFE0A312F5F7B42F2B01E7, easy-rsa maintainer key
 # 6F4056821152F03B6B24F2FCF8489F839D7367F3).
 
-ARG ALPINE_VERSION=3.24.2
+ARG ALPINE_VERSION=3.24.4
 
 # --------------------------------------------------------------------------
 # Build stage: compile OpenVPN, unpack easy-rsa
 # --------------------------------------------------------------------------
 FROM alpine:${ALPINE_VERSION} AS build
 
-ARG OPENVPN_VERSION=2.7.7
-ARG OPENVPN_SHA256=3ab8f48fd6c26d49ba2333a092433949afdb5c85c0e6a1ff265784fbc04a2463
+ARG OPENVPN_VERSION=2.7.9
+ARG OPENVPN_SHA256=c42a6ed892ddfe2d6e3317a5040f19bec5827564affb2fe3f2b3904a94daacb1
 ARG EASYRSA_VERSION=3.2.7
 ARG EASYRSA_SHA256=308743bc9fe871b902d47dbe98d749daff3a05b27531684f02625ce7208d4598
 

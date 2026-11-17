@@ -56,7 +56,9 @@ func serveHTTP2(listener net.Listener, handler http.Handler, trusted []netip.Pre
 func serveHTTP2Context(ctx context.Context, listener net.Listener, handler http.Handler, trusted []netip.Prefix) error {
 	server := &http2.Server{MaxConcurrentStreams: 256, IdleTimeout: 90 * time.Second,
 		ReadIdleTimeout: 10 * time.Second, PingTimeout: 5 * time.Second, WriteByteTimeout: 15 * time.Second,
-		MaxUploadBufferPerConnection: 4 << 20, MaxUploadBufferPerStream: 256 << 10}
+		// An upload cannot go faster than its stream window per round trip:
+		// 256 KB capped a phone at ~20 Mbit/s on a 100 ms path.
+		MaxUploadBufferPerConnection: 8 << 20, MaxUploadBufferPerStream: 2 << 20}
 	protocolLogs := &transportLog{}
 	maxConnections := 128
 	if relay, ok := handler.(*relayServer); ok {
@@ -222,6 +224,8 @@ func (s *relayServer) proxyHTTP2TCP(w http.ResponseWriter, r *http.Request, conn
 
 const maxUDPPayload = 65507
 
+var udpBuffers = sync.Pool{New: func() any { return make([]byte, 1+maxUDPPayload+1) }}
+
 // HTTP/2 carries RFC 9297 DATAGRAM capsules, including RFC 9298 context ID 0.
 // Unknown capsules/contexts and oversized UDP datagrams are discarded without
 // allocating according to an untrusted capsule length.
@@ -262,7 +266,7 @@ func countedCapsulesToUDP(reader io.Reader, conn *net.UDPConn, flow *flowLog) er
 		if err != nil {
 			return err
 		}
-		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Minute))
+		_ = conn.SetReadDeadline(time.Now().Add(udpIdle))
 	}
 }
 
@@ -283,28 +287,57 @@ func (s *relayServer) proxyHTTP2UDP(w http.ResponseWriter, r *http.Request, conn
 		_ = countedCapsulesToUDP(r.Body, conn, flowFrom(r.Context()))
 		conn.Close()
 	}()
-	buffer := make([]byte, 65536)
-	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Minute))
+	// A burst (a QUIC download) arrives faster than one capsule per flush can
+	// leave: read ahead into a small queue and flush once it is empty.
+	_ = conn.SetReadBuffer(1 << 20)
+	_ = conn.SetReadDeadline(time.Now().Add(udpIdle))
+	datagrams := make(chan []byte, 64)
+	go func() {
+		defer close(datagrams)
+		for {
+			buffer := udpBuffers.Get().([]byte)
+			n, err := conn.Read(buffer[1:])
+			if err != nil {
+				return
+			}
+			if n > maxUDPPayload {
+				continue
+			}
+			_ = conn.SetReadDeadline(time.Now().Add(udpIdle))
+			datagrams <- buffer[:n+1]
+		}
+	}()
 	writer := quicvarint.NewWriter(w)
-	for {
-		n, err := conn.Read(buffer[1:])
-		if err != nil {
+	send := func(datagram []byte) error {
+		datagram[0] = 0 // context ID 0
+		err := http3.WriteCapsule(writer, 0, datagram)
+		flowFrom(r.Context()).add(0, int64(len(datagram)-1))
+		udpBuffers.Put(datagram[:cap(datagram)])
+		return err
+	}
+relay:
+	for datagram := range datagrams {
+		if send(datagram) != nil {
 			break
 		}
-		if n > maxUDPPayload {
-			continue
-		}
-		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Minute))
-		if err := http3.WriteCapsule(writer, 0, buffer[:n+1]); err != nil {
-			break
+		for more := true; more; {
+			select {
+			case next, ok := <-datagrams:
+				if !ok || send(next) != nil {
+					break relay
+				}
+			default:
+				more = false
+			}
 		}
 		if rc.Flush() != nil {
 			break
 		}
-		flowFrom(r.Context()).add(0, int64(n))
 	}
 	r.Body.Close()
 	conn.Close()
+	for range datagrams {
+	}
 	<-done
 }
 

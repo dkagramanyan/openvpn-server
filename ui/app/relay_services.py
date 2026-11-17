@@ -124,13 +124,17 @@ def signing_status(db=None):
         return {**base, "ready": False, "message": str(exc) if isinstance(exc, PkiError) else "Invalid signer status"}
 
 
-def runtime_status(client=None):
+STATUS_LIMIT = 8 * 1024 * 1024
+
+
+def runtime_status(client=None, since=None):
     # Deliberately fixed to host loopback: never let an API parameter choose a URL.
-    endpoint = "http://127.0.0.1:8446/status" + ("?" + urlencode({"client": client}) if client else "")
+    query = {key: value for key, value in (("client", client), ("since", since)) if value not in (None, "")}
+    endpoint = "http://127.0.0.1:8446/status" + ("?" + urlencode(query) if query else "")
     try:
         with build_opener(ProxyHandler({})).open(endpoint, timeout=2) as response:
-            content = response.read(2 * 1024 * 1024 + 1)
-            if len(content) > 2 * 1024 * 1024: raise ValueError("Oversized relay status")
+            content = response.read(STATUS_LIMIT + 1)
+            if len(content) > STATUS_LIMIT: raise ValueError("Oversized relay status")
             return json.loads(content)
     except (OSError, ValueError, URLError):
         return {"ready": False, "message": "Relay backend is unreachable on this host", "events": [], "active": [], "clients": []}

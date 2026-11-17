@@ -19,7 +19,15 @@ log = logging.getLogger("relay-policy")
 
 
 class ReadOnlySettings:
-    """The policy login can select only the filtered policy settings view."""
+    """The policy login can select only the filtered policy settings view.
+
+    Connections are kept between checks: a new PostgreSQL login for every
+    check delayed the first connection a phone opened in any second.
+    """
+    _idle: list = []
+    _lock = threading.Lock()
+    KEEP = 8
+
     def __init__(self, connection):
         self.connection = connection
 
@@ -28,12 +36,49 @@ class ReadOnlySettings:
         return row[0] if row else default
 
     @classmethod
+    def _connect(cls):
+        connection = psycopg.connect(**{"connect_timeout": 2, **connection_parameters(settings.database_url)},
+                                     autocommit=True)
+        connection.execute("SET default_transaction_read_only = on")
+        connection.execute(pgsql.SQL("SET search_path TO {}").format(pgsql.Identifier(settings.database_schema)))
+        return connection
+
+    @classmethod
+    def discard_idle(cls):
+        with cls._lock:
+            idle, cls._idle = cls._idle, []
+        for connection in idle:
+            connection.close()
+
+    @classmethod
     @contextmanager
     def open(cls):
-        with psycopg.connect(**{"connect_timeout": 2, **connection_parameters(settings.database_url)}) as connection:
-            connection.read_only = True
-            connection.execute(pgsql.SQL("SET LOCAL search_path TO {}").format(pgsql.Identifier(settings.database_schema)))
+        with cls._lock:
+            connection = cls._idle.pop() if cls._idle else None
+        if connection is None:
+            connection = cls._connect()
+        try:
             yield cls(connection)
+        except BaseException:
+            connection.close()
+            raise
+        with cls._lock:
+            if len(cls._idle) < cls.KEEP:
+                cls._idle.append(connection)
+                return
+        connection.close()
+
+
+def with_settings(function):
+    """Run function(db). A kept connection that died (PostgreSQL restarted) is
+    replaced once; a database that is really down still fails the check."""
+    try:
+        with ReadOnlySettings.open() as db:
+            return function(db)
+    except psycopg.OperationalError:
+        ReadOnlySettings.discard_idle()
+        with ReadOnlySettings.open() as db:
+            return function(db)
 
 
 def check_metadata():
@@ -58,6 +103,8 @@ class PolicyHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
+        if self.close_connection:
+            self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(data)
 
@@ -66,9 +113,7 @@ class PolicyHandler(BaseHTTPRequestHandler):
             self.reply(404, {"detail": "Not found"})
             return
         try:
-            with ReadOnlySettings.open() as db:
-                db.get_setting("apple_relay")
-                check_metadata()
+            with_settings(lambda db: (db.get_setting("apple_relay"), check_metadata()))
             self.reply(200, {"ok": True})
         except (OSError, psycopg.Error, ValueError):
             self.reply(503, {"ok": False, "detail": "Policy state unavailable"})
@@ -77,13 +122,18 @@ class PolicyHandler(BaseHTTPRequestHandler):
         if self.path != "/api/relay/authorize":
             self.reply(404, {"detail": "Not found"})
             return
-        # Authorization has no request body. Close instead of reading unbounded
-        # uploads or allowing unread bytes to become a second HTTP request.
-        self.close_connection = True
+        # Authorization has no request body. The relay's own requests are kept
+        # alive; anything that announces a body is answered and closed, so
+        # unread bytes can never become a second HTTP request.
+        if self.headers.get("Content-Length", "0").strip() != "0" or self.headers.get("Transfer-Encoding"):
+            self.close_connection = True
+        authorization = self.headers.get("Authorization", "")
+
+        def check(db):
+            check_metadata()
+            return relay.authorize(db, authorization, strict_state=True)
         try:
-            with ReadOnlySettings.open() as db:
-                check_metadata()
-                policy = relay.authorize(db, self.headers.get("Authorization", ""), strict_state=True)
+            policy = with_settings(check)
             self.reply(200 if policy is not None else 403, policy or {"detail": "Relay access denied"})
         except (OSError, psycopg.Error, ValueError, KeyError, TypeError):
             self.reply(503, {"detail": "Policy state unavailable"})
@@ -118,7 +168,7 @@ class PolicyServer(ThreadingHTTPServer):
 
     def get_request(self):
         connection, address = super().get_request()
-        connection.settimeout(4)
+        connection.settimeout(30)   # the relay keeps its connections for reuse
         return connection, address
 
 

@@ -24,6 +24,13 @@ function networkSettingsCard(saved, relay, general) {
   });
   const relayEnabled = h('input', { type: 'checkbox', checked: relay.enabled });
   const relayURL = text(relay.url || gw.relay_public_url);
+  const relayHTTP3 = h('input', { type: 'checkbox', checked: !!relay.http3 });
+  const relayHTTP3State = h('span', null, 'Checking whether the relay accepts HTTP/3…');
+  api('/api/relay/status').then(status => {
+    const open = status.transports ? status.transports.http3 : status.transport === 'http3';
+    relayHTTP3State.textContent = !status.ready ? 'The relay is not reachable now, so its HTTP/3 listener cannot be checked.'
+      : open ? 'The relay reports its HTTP/3 listener open.' : 'The relay reports NO HTTP/3 listener: profiles with HTTP/3 would only add a delay before falling back.';
+  }, () => { relayHTTP3State.textContent = ''; });
   const backend = text(gw.openvpn_backend, { placeholder: 'http://192.0.2.20:8080' });
   const relayBackend = text(gw.relay_backend);
   const proxies = text(listText(saved.proxy_cidrs));
@@ -35,7 +42,7 @@ function networkSettingsCard(saved, relay, general) {
     dns_servers: text(listText(saved.dns_servers)), routes: text(listText(saved.routes)),
   };
   const services = serviceEditor(gw);
-  const links = guestLinkEditor(gw.guest_links || []);
+  const links = guestLinkEditor(gw.guest_links || [], () => showGuestBlock());
 
   // An empty field means "the usual value", shown as its placeholder.
   const defaults = () => {
@@ -57,6 +64,41 @@ function networkSettingsCard(saved, relay, general) {
   };
   [domain, website, backend].forEach(input => input.addEventListener('input', refresh));
 
+  /* -- guests: the gateway file's guest entries, and a check of what guests reach -- */
+  // The same entries as network.export_gateway() writes (link_rule: host, and path "/" for the whole site).
+  const guestBlock = h('pre', { class: 'log mono' });
+  const guestText = () => {
+    const rules = links.collect().map(link => {
+      try { const url = new URL(link.url); return { host: url.hostname, path: link.whole_site ? '/' : url.pathname || '/' }; } catch (_) { return null; }
+    }).filter(Boolean);
+    return `"portal_listener": ${JSON.stringify(portal.value.trim())},\n"guest_links": ` +
+      (rules.length ? '[\n' + rules.map(rule => '  ' + JSON.stringify(rule)).join(',\n') + '\n]' : '[]');
+  };
+  const showGuestBlock = () => { guestBlock.textContent = guestText(); };
+  portal.addEventListener('input', showGuestBlock);
+  const copyGuestBlock = () => navigator.clipboard.writeText(guestBlock.textContent)
+    .then(() => toast('Copied', 'ok'), () => toast('Copying needs HTTPS - select the text instead', 'err'));
+
+  let savedGuests = guestText();   // the check uses the saved settings
+  const guestCheck = h('div', { class: 'detection-status', role: 'status', hidden: true });
+  const checkGuests = async event => {
+    const button = event.currentTarget;
+    guestCheck.hidden = false;
+    if (guestText() !== savedGuests) { guestCheck.textContent = 'Save first: the check uses the saved guest settings.'; return; }
+    button.disabled = true;
+    guestCheck.textContent = 'Checking from this server, the way guest connections go…';
+    try {
+      const result = await api('/api/network/guest-check', { method: 'POST' });
+      guestCheck.replaceChildren(h('ul', { class: 'guest-check' }, result.targets.map(target =>
+        h('li', { class: target.ok ? 'ok' : 'fail' },
+          h('strong', null, (target.ok ? 'Guests can open ' : 'Guests cannot open ') + target.url + (target.portal ? ' (personal portal)' : '')),
+          h('div', { class: 'small' }, 'Gateway: ' + target.http.message),
+          h('div', { class: 'small' }, 'DNS: ' + target.dns.message)))));
+    } catch (error) {
+      guestCheck.textContent = error.message;
+    } finally { button.disabled = false; }
+  };
+
   /* -- the request body ---------------------------------------------------- */
   const collect = () => {
     const d = defaults();
@@ -72,7 +114,7 @@ function networkSettingsCard(saved, relay, general) {
         portal_listener: portal.value.trim(), trusted_cidrs: parseList(trusted.value), guest_links: links.collect(),
         ...services.collect(),
       },
-      relay: { enabled: relayEnabled.checked, url: relayOrigin },
+      relay: { enabled: relayEnabled.checked, url: relayOrigin, http3: relayHTTP3.checked },
       remote: profileHost ? { host: profileHost, ports: Object.fromEntries(vpnPorts.map(p => [p.proto, Number(p.input.value)])) } : null,
     };
   };
@@ -106,7 +148,11 @@ function networkSettingsCard(saved, relay, general) {
   /* -- actions -------------------------------------------------------------- */
   const message = h('div', { class: 'notice', role: 'status', hidden: true });
   const say = (text, kind = 'status') => { message.hidden = false; message.textContent = text; message.setAttribute('role', kind); };
-  const save = () => api('/api/network/settings', { method: 'PUT', body: collect() });
+  const save = async () => {
+    const guests = guestText();
+    await api('/api/network/settings', { method: 'PUT', body: collect() });
+    savedGuests = guests;
+  };
   const action = (label, primary, run) => h('button', { class: 'btn' + (primary ? ' primary' : ''), onClick: async event => {
     const button = event.currentTarget;
     button.disabled = true; message.hidden = true;
@@ -133,13 +179,25 @@ function networkSettingsCard(saved, relay, general) {
         field('VPN address in profiles', vpnHost),
         h('div', { class: 'form cols' }, ...vpnPorts.map(portField)),
         field('Apple relay URL', relayURL, 'Clients connect here; the gateway forwards it to this server.'),
-        h('label', { class: 'check' }, relayEnabled, 'Offer Apple relay profiles'))),
+        h('label', { class: 'check' }, relayEnabled, 'Offer Apple relay profiles'),
+        h('div', { class: 'full field' }, h('label', { class: 'check' }, relayHTTP3, 'Add HTTP/3 to new Apple relay profiles'),
+        h('div', { class: 'help' }, 'New profiles then carry the relay address for HTTP/3 (UDP, straight to this server) next to HTTP/2, which stays as the fallback. It needs the relay\'s UDP port forwarded from the router to this server and the relay hostname\'s certificate on this server. Installed profiles are not changed and keep working over HTTP/2. Try a new profile on one device first. ', relayHTTP3State)))),
     section('Guests', null,
       h('p', null, 'Guests of OpenVPN and the Apple relay get the internet through your network (with its filtering) but no LAN access. Of your websites they can open only their personal portal, ',
         portalPage, ', to change their password and download their profiles, and the guest links below.'),
       field('Guest portal listener on the gateway', portal,
         'The gateway’s LAN address and its portal port (9443). A guest’s HTTPS connections to the gateway go there. Empty: guests cannot open the portal.'),
-      links.element),
+      links.element,
+      h('div', { class: 'form' },
+        h('strong', null, 'For network.private.json on the gateway'),
+        h('p', { class: 'small muted' }, 'Replace these two entries in the gateway’s network.private.json and keep the rest, then run ',
+          h('code', null, './manage setup --network-file ./network.private.json'), ' and ', h('code', null, 'sudo docker compose up -d'),
+          '. Each link’s hostname must already be a website on the gateway. Save and download gateway file gives the whole file instead.'),
+        guestBlock,
+        h('div', { class: 'row' },
+          h('button', { class: 'btn', type: 'button', onClick: copyGuestBlock }, 'Copy'),
+          h('button', { class: 'btn', type: 'button', onClick: checkGuests }, 'Check guest access'))),
+      guestCheck),
     section('Gateway', 'How the Traefik gateway reaches this server, and which of its addresses this server trusts.',
       h('div', { class: 'form cols' },
         field('This server’s web address', backend, 'As the gateway reaches the web UI, including the port.'),
@@ -175,13 +233,14 @@ function networkSettingsCard(saved, relay, general) {
           h('code', null, 'sudo docker compose up -d'), '.'),
         h('li', null, 'Back here, use Save and restart VPN.'))));
   refresh();
+  showGuestBlock();
   detect();
   return card('Network', root);
 }
 
 // Extra pages guests may open: websites under your domain, served by the gateway.
 // Each link allows its own path and below, or its whole website.
-function guestLinkEditor(saved) {
+function guestLinkEditor(saved, onChange) {
   const list = h('div', { class: 'stack' });
   const rows = [];
   const add = (link = { url: '', whole_site: false }) => {
@@ -192,7 +251,9 @@ function guestLinkEditor(saved) {
     };
     row.scope.value = link.whole_site ? 'site' : 'path';
     row.element = h('div', { class: 'guest-link' }, row.url, row.scope,
-      h('button', { class: 'btn', type: 'button', onClick: () => { rows.splice(rows.indexOf(row), 1); row.element.remove(); } }, 'Remove'));
+      h('button', { class: 'btn', type: 'button', onClick: () => { rows.splice(rows.indexOf(row), 1); row.element.remove(); onChange(); } }, 'Remove'));
+    row.url.addEventListener('input', onChange);
+    row.scope.addEventListener('change', onChange);
     rows.push(row);
     list.append(row.element);
   };

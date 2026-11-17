@@ -10,20 +10,22 @@ services:
     depends_on:
       relay-policy: {condition: service_healthy}
     environment:
-      RELAY_TRANSPORT: ${APPLE_RELAY_TRANSPORT:-http2}
+      # HTTP/2 always serves (through the gateway); HTTP/3 starts by itself
+      # once relay-tls/ holds the certificate. Old values http2 / http3 still work.
+      RELAY_TRANSPORT: ${APPLE_RELAY_TRANSPORT:-http2+http3}
       RELAY_HTTP2_BIND: ${APPLE_RELAY_HTTP2_BIND:-:8444}
       RELAY_TRUSTED_PROXIES: ${APPLE_RELAY_TRUSTED_PROXIES:-127.0.0.1/32 ::1/128}
       RELAY_BIND: ${APPLE_RELAY_BIND:-:8443}
-      RELAY_MAX_FLOWS: ${APPLE_RELAY_MAX_FLOWS:-256}
-      RELAY_MAX_FLOWS_PER_CLIENT: ${APPLE_RELAY_MAX_FLOWS_PER_CLIENT:-64}
+      RELAY_MAX_FLOWS: ${APPLE_RELAY_MAX_FLOWS:-2048}
+      RELAY_MAX_FLOWS_PER_CLIENT: ${APPLE_RELAY_MAX_FLOWS_PER_CLIENT:-512}
       RELAY_MAX_AUTH_CHECKS: ${APPLE_RELAY_MAX_AUTH_CHECKS:-64}
       RELAY_MAX_H2_CONNECTIONS: ${APPLE_RELAY_MAX_H2_CONNECTIONS:-128}
       RELAY_H2_READ_IDLE: ${APPLE_RELAY_H2_READ_IDLE:-10s}
       RELAY_H2_PING_TIMEOUT: ${APPLE_RELAY_H2_PING_TIMEOUT:-5s}
-      RELAY_MAX_H2_STREAMS: ${APPLE_RELAY_MAX_H2_STREAMS:-256}
+      RELAY_MAX_H2_STREAMS: ${APPLE_RELAY_MAX_H2_STREAMS:-512}
       RELAY_NETWORK_CONFIG: /etc/relay-network/proxies.conf
       RELAY_AUTH_URL: ${APPLE_RELAY_AUTH_URL:-http://127.0.0.1:8447/api/relay/authorize}
-    # Only used in optional direct HTTP/3 mode; HTTP/2 needs no certificate here.
+    # The certificate is for direct HTTP/3 only; HTTP/2 needs none here.
     volumes:
       - ${APPLE_RELAY_TLS_DIR:-./relay-tls}:/tls:ro
       - ./config/network:/etc/relay-network:ro
@@ -87,7 +89,7 @@ services:
       FORWARDED_ALLOW_IPS: ${OVPN_UI_TRUSTED_PROXIES:-127.0.0.1} # proxies whose X-Forwarded-For is believed
       OVPN_PROFILE_BASE_URL: ${OVPN_PROFILE_BASE_URL:-}     # public base of one-time profile links (/p/...)
       OVPN_BACKUP_RECIPIENT: ${OVPN_BACKUP_RECIPIENT:-}     # age public key: backup archives are encrypted to it
-      OVPN_RELAY_TRANSPORT: ${APPLE_RELAY_TRANSPORT:-http2}
+      OVPN_RELAY_TRANSPORT: ${APPLE_RELAY_TRANSPORT:-http2+http3}
       OVPN_RELAY_REQUIRE_SIGNED: ${OVPN_RELAY_REQUIRE_SIGNED:-true}
       OVPN_RELAY_SIGNER_URL: ${OVPN_RELAY_SIGNER_URL:-}
       RELAY_PROFILE_SIGNING_TOKEN: ${RELAY_PROFILE_SIGNING_TOKEN:-}
@@ -143,7 +145,7 @@ services:
     restart: unless-stopped
 
   postgres:
-    image: postgres:18.6-alpine
+    image: postgres:18.7-alpine
     environment:
       POSTGRES_DB: openvpn
       POSTGRES_USER: postgres

@@ -20,31 +20,31 @@ function relaySessionList(rows, detail = null, expanded = new Set()) {
   }));
 }
 
+// The relay service itself. Each client's sessions, traffic and connection log are on the
+// Clients and Sessions pages, next to its OpenVPN ones.
 function relayView(el) {
-  const summary = h('div', { class: 'grid two' });
-  const active = h('div'), events = h('div'), sessions = h('div');
-  const sessionExpanded = new Set();
+  const summary = h('div', { class: 'grid kpi' });
+  const active = h('div'), events = h('div');
   const activeExpanded = new Set(), historyExpanded = new Set();
   const filter = h('input', { class: 'input', placeholder: 'Filter by client or destination', 'aria-label': 'Filter relay activity', onInput: () => draw() });
   let info = null, loading = false;
   const signingSetup = relaySigningCard();
-  el.append(topbar('Apple Network Relay', 'Access follows each client’s OpenVPN guest or full-access role',
+  el.append(topbar('Apple Network Relay', 'The relay service: state, limits, diagnostics and profile signing',
     h('button', { class: 'btn', onClick: () => { load(); loadSigning(); } }, icon('refresh'), 'Refresh')),
-    h('div', { class: 'stack' }, summary, card('Relay sessions', h('div', { class: 'stack' }, filter, sessions,
-      h('p', { class: 'small muted' }, 'Short connections from the same profile form one session. A new session starts after five minutes without an open connection. The latest 200 sessions are shown; history is kept for one year across restarts. Devices sharing a profile share its session. Expand a session for recent connection details.'))),
-      h('details', { class: 'settings-details' }, h('summary', null, 'Individual connections and diagnostics'), card('Active connections', active), card('Recent activity', events),
-        h('p', { class: 'small muted' }, 'Individual details cover the latest 500 events and reset when the relay restarts. Session totals are saved every five seconds.')), signingSetup.card));
+    h('div', { class: 'stack' }, summary,
+      h('p', { class: 'small muted', style: 'margin:0' }, 'Each client\'s relay sessions, traffic and connection log are on its page under ', h('a', { href: '#/clients' }, 'Clients'), '; every session is under ', h('a', { href: '#/sessions' }, 'Sessions'), '.'),
+      h('details', { class: 'settings-details' }, h('summary', null, 'Live connections and diagnostics'), h('div', { class: 'stack' }, filter, card('Open connections', active), card('Recent activity', events),
+        h('p', { class: 'small muted' }, 'The relay\'s own view: the latest 500 events since it started, including requests without a valid credential.'))), signingSetup.card));
   const reason = value => (value || '').replace(/_/g, ' ');
   function table(rows, current) {
     const text = filter.value.toLowerCase();
     rows = rows.filter(r => `${r.client} ${r.target} ${r.reason}`.toLowerCase().includes(text));
     if (!rows.length) return h('div', { class: 'empty' }, current ? 'No active relay connections' : 'No matching relay activity');
     return h('div', { class: 'table-wrap' }, h('table', { class: 'tbl' },
-      h('thead', null, h('tr', null, ['Time', 'Client', 'Access', 'Protocol', 'Destination', 'Result', 'Duration', 'Download', 'Upload'].map(t => h('th', null, t)))),
+      h('thead', null, h('tr', null, ['Time', 'Protocol', 'Destination', 'Result', 'Duration', 'Download', 'Upload'].map(t => h('th', null, t)))),
       h('tbody', null, rows.map(r => h('tr', null,
         h('td', { class: 'nowrap' }, fmtDateTime(r.ts)),
-        h('td', null, r.client ? h('a', { href: '#/clients/' + encodeURIComponent(r.client) }, r.client) : 'unknown'),
-        h('td', null, r.client ? (r.guest ? 'Guest' : 'Full access') : '—'), h('td', null, r.protocol || '—'),
+        h('td', null, r.protocol || '—', r.transport ? h('span', { class: 'muted small' }, ' · ' + ({ http2: 'h2', http3: 'h3' }[r.transport] || r.transport)) : null),
         h('td', { class: 'mono small' }, r.target || '—'), h('td', null, r.status ? `${r.status} · ${r.kind}` : r.kind, h('div', { class: 'small muted' }, reason(r.reason)), r.upstream_error ? h('div', { class: 'small muted' }, reason(r.upstream_error)) : null),
         h('td', null, fmtDur(r.duration_ms / 1000)), h('td', { class: 'r num' }, r.bytes_counted ? fmtBytes(r.bytes_down) : '—'),
         h('td', { class: 'r num' }, r.bytes_counted ? fmtBytes(r.bytes_up) : '—'))))));
@@ -61,11 +61,11 @@ function relayView(el) {
         if (!e.currentTarget.isConnected) return;
         if (e.currentTarget.open) expanded.add(c.client); else expanded.delete(c.client);
       } }, h('summary', { class: 'row', style: 'cursor:pointer;padding:8px 0;flex-wrap:wrap' },
-        h('span', { class: 'relay-toggle', 'aria-hidden': 'true' }, '›'), h('strong', null, c.client || 'Unauthenticated requests'),
+        h('span', { class: 'relay-toggle', 'aria-hidden': 'true' }, '›'), c.client ? h('a', { href: '#/clients/' + encodeURIComponent(c.client) }, h('strong', null, c.client)) : h('strong', null, 'Unauthenticated requests'),
         c.client ? h('span', { class: 'pill' }, c.guest ? 'Guest' : 'Full access') : null,
         h('span', { class: 'small' }, current ? `${fmtNum(c.active)} connections · ${c.tcp} TCP / ${c.udp} UDP · ${c.destinations} destinations` : `${fmtNum(c.accepted)} accepted · ${fmtNum(c.failed)} failed · ${fmtNum(c.denied)} denied`),
         h('span', { class: 'small muted' }, `↓ ${fmtBytes(c.bytes_down)} · ↑ ${fmtBytes(c.bytes_up)}`)),
-        h('div', { class: 'stack', style: 'gap:8px' }, c.uncounted_flows ? h('span', { class: 'small muted' }, `${c.uncounted_flows} HTTP/3 UDP flows have uncounted payload bytes`) : null, c.last_error ? h('div', { class: 'small muted' }, `Last issue: ${reason(c.last_error)} · ${fmtDateTime(c.last_error_at)}`) : null,
+        h('div', { class: 'stack', style: 'gap:8px' }, c.uncounted_flows ? h('span', { class: 'small muted' }, `${c.uncounted_flows} flows have uncounted payload bytes`) : null, c.last_error ? h('div', { class: 'small muted' }, `Last issue: ${reason(c.last_error)} · ${fmtDateTime(c.last_error_at)}`) : null,
           table(rows.filter(r => r.client === c.client), current)));
       details.open = expanded.has(c.client);
       return details;
@@ -73,15 +73,16 @@ function relayView(el) {
   }
   function draw() {
     if (!info) return;
-    summary.replaceChildren(tile('Relay backend', !info.ready ? 'Unavailable' : info.policy_ready === false ? 'Policy unavailable' : 'Running', info.ready ? `${info.transport.toUpperCase()} · started ${fmtDateTime(info.started_at)}` : info.message),
-      tile('Connections', info.active.length, `${fmtNum(info.total || 0)} accepted · ${fmtNum(info.failed || 0)} failed · ${fmtNum(info.denied || 0)} denied since startup${info.limits ? ` · limit ${info.limits.flows} total / ${info.limits.per_client} per client` : ''}`));
+    // Older relays report one "transport" and no "transports".
+    const open = info.transports || { http2: info.transport === 'http2', http3: info.transport === 'http3' };
+    const limits = info.limits;
+    summary.replaceChildren(
+      tile('Relay backend', !info.ready ? 'Unavailable' : info.policy_ready === false ? 'Policy unavailable' : 'Running', info.ready ? `started ${fmtDateTime(info.started_at)}` : info.message),
+      tile('Listening', !info.ready ? '—' : [open.http2 ? 'HTTP/2' : null, open.http3 ? 'HTTP/3' : null].filter(Boolean).join(' + ') || 'nothing', !info.ready ? '' : `HTTP/2 through the gateway: ${open.http2 ? 'open' : 'closed'} · HTTP/3 direct (UDP): ${open.http3 ? 'open' : 'closed'}`),
+      tile('Open connections', info.ready ? fmtNum(info.active.length) : '—', limits ? `limit ${fmtNum(limits.flows)} in total · ${fmtNum(limits.per_client)} per client` : ''),
+      tile('Since it started', info.ready ? fmtNum(info.total || 0) : '—', `accepted · ${fmtNum(info.failed || 0)} failed · ${fmtNum(info.denied || 0)} denied`));
     active.replaceChildren(groups(true));
     events.replaceChildren(groups(false));
-    const needle = filter.value.toLowerCase();
-    const flowRows = [...info.active, ...[...info.events].reverse().filter(row => row.kind !== 'connected')];
-    const members = row => new Set(row.member_ids || [row.id]);
-    sessions.replaceChildren(relaySessionList((info.sessions || []).filter(row => row.client.toLowerCase().includes(needle) || flowRows.some(flow => members(row).has(flow.session_id) && `${flow.target} ${flow.reason}`.toLowerCase().includes(needle))),
-      row => table(flowRows.filter(flow => members(row).has(flow.session_id)), false), sessionExpanded));
   }
   async function load() {
     if (loading) return;

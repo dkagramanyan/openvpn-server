@@ -67,6 +67,9 @@ func (a *activityLog) sessionLocked(f *flowLog, now int64) *relaySession {
 		a.currentSessions[key] = current.ID
 	}
 	f.event.SessionID = current.ID
+	if f.event.Transport != "" {
+		current.Transport = f.event.Transport
+	}
 	current.LastSeen = max(current.LastSeen, now)
 	return current
 }

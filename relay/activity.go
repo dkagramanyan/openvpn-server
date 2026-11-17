@@ -8,6 +8,8 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -29,8 +31,10 @@ type activityLog struct {
 	runtime         *relayMetrics
 	limits          map[string]int
 	readiness       func(context.Context) error
+	listening       func() map[string]bool // which client listeners are open
 	clients         map[string]*clientActivity
 	sequence        uint64
+	recorded        uint64
 	events          []flowEvent
 	next            int
 	active          map[uint64]*flowLog
@@ -45,6 +49,7 @@ type activityLog struct {
 type flowEvent struct {
 	SessionID     string `json:"session_id,omitempty"`
 	ID            uint64 `json:"id"`
+	Seq           uint64 `json:"seq"` // position in the event log; ?since= continues after it
 	Method        string `json:"method"`
 	Status        int    `json:"status"`
 	UpstreamError string `json:"upstream_error,omitempty"`
@@ -53,6 +58,7 @@ type flowEvent struct {
 	Client        string `json:"client"`
 	Guest         bool   `json:"guest"`
 	Protocol      string `json:"protocol"`
+	Transport     string `json:"transport,omitempty"` // http2 or http3
 	Target        string `json:"target"`
 	Reason        string `json:"reason"`
 	Duration      int64  `json:"duration_ms"`
@@ -72,6 +78,10 @@ type flowLog struct {
 	up       atomic.Int64
 	down     atomic.Int64
 }
+
+// The UI saves finished flows from this ring every few seconds (?since=<id>);
+// the page itself shows the latest statusEvents.
+const eventRing, statusEvents = 4096, 500
 
 type flowKey struct{}
 
@@ -149,11 +159,13 @@ func (f *flowLog) snapshot(kind string) flowEvent {
 
 func (a *activityLog) record(e flowEvent) {
 	a.mu.Lock()
-	if len(a.events) < 500 {
+	a.recorded++
+	e.Seq = a.recorded
+	if len(a.events) < eventRing {
 		a.events = append(a.events, e)
 	} else {
 		a.events[a.next] = e
-		a.next = (a.next + 1) % 500
+		a.next = (a.next + 1) % eventRing
 	}
 	// Keep every event in the bounded UI ring, but cap repeated failure logs.
 	second := time.Now().Unix()
@@ -283,6 +295,13 @@ func (a *activityLog) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	a.mu.Lock()
 	events := append([]flowEvent{}, a.events[a.next:]...)
 	events = append(events, a.events[:a.next]...)
+	if value := r.URL.Query().Get("since"); value != "" {
+		since, _ := strconv.ParseUint(value, 10, 64)
+		first := sort.Search(len(events), func(i int) bool { return events[i].Seq > since })
+		events = events[first:]
+	} else if len(events) > statusEvents {
+		events = events[len(events)-statusEvents:]
+	}
 	if selected != "" {
 		filtered := make([]flowEvent, 0)
 		for _, e := range events {
@@ -313,7 +332,11 @@ func (a *activityLog) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	a.mu.Unlock()
 	clients := summarizeClients(history, active)
-	json.NewEncoder(w).Encode(map[string]any{"ready": true, "transport": a.transport, "started_at": a.started,
+	transports := map[string]bool{}
+	if a.listening != nil {
+		transports = a.listening()
+	}
+	json.NewEncoder(w).Encode(map[string]any{"ready": true, "transport": a.transport, "transports": transports, "started_at": a.started,
 		"total": total, "denied": denied, "failed": failed, "logs_suppressed": suppressed, "clients": clients, "active": active, "events": events, "sessions": sessionSnapshot(sessions, active, time.Now().Unix()), "session_idle_seconds": relaySessionIdleSeconds, "instance": a.instance, "policy_ready": policyReady, "limits": a.limits, "metrics": a.runtime.snapshot()})
 }
 

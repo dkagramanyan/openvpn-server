@@ -1,6 +1,75 @@
 <!-- Network addresses in examples are synthetic; deployment-specific notes are omitted. -->
 # Changelog
 
+## 2.3.0 - 2026-11-18
+
+Installed OpenVPN and Apple relay profiles keep working; no profile has to be
+handed out again. Upgrade with `git pull` and `docker compose up -d --build`.
+
+### Apple relay: speed
+* **HTTP/3 next to HTTP/2.** The relay serves both at once
+  (`APPLE_RELAY_TRANSPORT=http2+http3`, now the default). HTTP/3 starts when
+  `relay-tls/` holds the certificate and reloads a renewed one without a
+  restart; without the files only HTTP/2 serves, as before. With **Add
+  HTTP/3 to new Apple relay profiles** (Settings → Network, off by default) a profile
+  carries the address for both. Needs UDP 8443 forwarded to this server; see
+  the README.
+* Uploads over HTTP/2 were capped by a 256 KB stream window: about 40 Mbit/s
+  at 50 ms round trip and 20 Mbit/s at 100 ms. The window is 2 MB now (measured
+  21 → 159 Mbit/s at 100 ms in the benchmark).
+* Limits raised from 256 flows (64 per client) to 2048 (512 per client), and
+  from 256 to 512 streams per HTTP/2 connection. A profile sends every
+  connection of a device through the relay and a client's devices share the
+  limit; above it connections are refused with 503
+  (`relay_flow_endings_total{reason="client_capacity_reached"}` in `/metrics`
+  shows whether that happened).
+* UDP over HTTP/2 (QUIC to websites) is forwarded in bursts instead of one
+  flush per datagram (about twice the throughput in the benchmark).
+* The policy service keeps its HTTP and PostgreSQL connections instead of a new
+  database login for every check; DNS answers are shared between simultaneous
+  connections and reused for 20 seconds.
+* HTTP/3 UDP traffic is counted (it was shown as "uncounted").
+
+### Clients, sessions and traffic: OpenVPN and relay together
+* The **Clients** and **Sessions** pages and the dashboard cover both: traffic
+  per client and source, one session list, "online" and "last seen" from
+  either. The Relay page keeps the service matters (state, listeners, limits,
+  live connections, profile signing).
+* **Relay connections** on the client page: every finished relay connection
+  of the last 7 days (time, destination host and port, result, duration,
+  bytes), kept in the database and deleted after 7 days. Clients see their own
+  in the portal.
+* Relay traffic is in the traffic charts and totals; relay sessions recorded
+  before the upgrade are added once, at the time of their last activity.
+* **Periods** are calendar ones: today, yesterday, this week, this month, last
+  month, all, or two dates; the exact bounds are shown. The API still accepts
+  `24h`, `7d`, `30d`, `90d`.
+* Counters corrected: "online" counted OpenVPN connections, so a certificate
+  on two devices counted twice and relay users not at all; the dashboard's
+  session and client numbers counted raw OpenVPN connections (every phone
+  reconnect). They now count clients, and visits plus relay sessions.
+* API: traffic objects gain `vpn` and `relay` parts; `/api/overview` `totals`
+  has `clients`, `vpn_clients`, `relay_clients`, `vpn_visits`,
+  `vpn_connections`, `relay_sessions` (`totals.sessions` is gone);
+  `/api/sessions` takes `via=vpn|relay|all`; new
+  `/api/clients/{name}/relay-flows`.
+
+### Guests
+* Settings → Network → Guests shows the gateway file's `portal_listener` and
+  `guest_links` entries to copy, and **Check guest access** tests the portal
+  and each link from this server through the portal listener (404 = the
+  gateway file is not applied yet).
+
+### Versions
+* OpenVPN 2.7.9 (signature verified), Alpine 3.24.4, PostgreSQL 18.7, Go
+  1.26.11, quic-go 0.64.1, golang.org/x/net 0.63, FastAPI 0.163.2, psycopg
+  3.3.9, CI Traefik 3.7.19.
+* Not taken: Go 1.27 (its HTTP/2 server closes connections on shutdown without
+  GOAWAY and two relay tests fail), quic-go 0.65 (masque-go 0.6.0 does not
+  build against it) and Python 3.15 (not tried; the images stay on 3.14).
+* The speed figures are from a local benchmark with an emulated round trip;
+  HTTP/3 was tested with a Go client, not on an Apple device.
+
 ## 2.2.0 - 2026-11-04
 
 * **Guests get the internet again**, through this server and therefore through

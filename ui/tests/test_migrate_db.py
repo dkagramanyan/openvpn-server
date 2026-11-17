@@ -42,13 +42,15 @@ def test_import_preserves_every_table_accounts_credentials_history_and_source(tm
     before = hashlib.sha256(path.read_bytes()).digest()
     db = Database()
     result = import_sqlite(path, db)
-    legacy_tables = set(TABLES) - {'relay_sessions'}
+    legacy_tables = set(TABLES) - {'relay_sessions', 'relay_flows'}
     assert result['verified'] and set(result['imported']) == legacy_tables
     assert db.query('SELECT * FROM relay_sessions') == []
     with sqlite3.connect(path) as source:
         source.row_factory = sqlite3.Row
         for table in legacy_tables:
             rows = [dict(row) for row in source.execute(f'SELECT * FROM {table}')]
+            if table.startswith('traffic_'):        # legacy traffic is OpenVPN traffic
+                rows = [{**row, 'source': 'vpn'} for row in rows]
             assert result['imported'][table] == len(rows)
             actual = db.query(f'SELECT * FROM {table}' + (" WHERE key NOT LIKE 'migration:%'" if table == 'settings' else ''))
             assert sorted(actual, key=str) == sorted(rows, key=str)

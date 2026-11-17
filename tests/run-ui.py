@@ -18,7 +18,7 @@ try:
     run("docker", "build", "-f", "ui/Dockerfile", "-t", "openvpn-ui:unit-test", str(ROOT), cwd=ROOT)
     run("docker", "network", "create", network, stdout=subprocess.DEVNULL)
     run("docker", "run", "-d", "--name", name, "--network", network, "--network-alias", "postgres",
-        "-e", "POSTGRES_PASSWORD=" + password, "postgres:18.6-alpine", stdout=subprocess.DEVNULL)
+        "-e", "POSTGRES_PASSWORD=" + password, "postgres:18.7-alpine", stdout=subprocess.DEVNULL)
     for _ in range(60):
         if subprocess.run(["docker", "exec", name, "pg_isready", "-h", "127.0.0.1", "-U", "postgres"], capture_output=True).returncode == 0: break
         time.sleep(1)

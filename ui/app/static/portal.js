@@ -78,6 +78,12 @@ function relayActivityPanel() {
       activity.replaceChildren(
         h('strong', null, running ? `${fmtNum(own.active || 0)} open connections` : 'The relay is temporarily unavailable'),
         relaySessionList(status.sessions || []),
+        (status.flows || []).length ? h('div', { class: 'stack' }, h('strong', null, 'My recent connections'),
+          h('div', { class: 'table-wrap' }, h('table', { class: 'tbl' },
+            h('thead', null, h('tr', null, ['Ended', 'Destination', 'Result'].map(t => h('th', null, t)), h('th', { class: 'r' }, 'Download'), h('th', { class: 'r' }, 'Upload'))),
+            h('tbody', null, status.flows.slice(0, 30).map(f => h('tr', null, h('td', { class: 'nowrap' }, fmtDateTime(f.ts)), h('td', { class: 'mono small' }, f.target || '—'),
+              h('td', { class: 'small' }, f.kind === 'closed' ? 'ok' : `${f.kind} · ${(f.reason || '').replace(/_/g, ' ')}`),
+              h('td', { class: 'r num' }, fmtBytes(f.bytes_down)), h('td', { class: 'r num' }, fmtBytes(f.bytes_up)))))))) : null,
         h('p', { class: 'small muted' }, 'An idle device may show no connections. There is no need to download the profile again after a server restart.'));
     } catch (error) {
       activity.replaceChildren(h('p', null, 'Your connection activity cannot be loaded right now. Try again in a moment.'),

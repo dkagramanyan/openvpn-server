@@ -24,6 +24,8 @@ from .relay_services import sign_profile
 class RelaySettings(BaseModel):
     enabled: bool = False
     url: str = Field(default="", max_length=2048)
+    # New profiles also carry the HTTP/3 address of the same origin (HTTP/2 stays as fallback).
+    http3: bool = False
 
 
 def get_settings(db) -> dict:
@@ -131,9 +133,16 @@ def profile(db, name: str) -> bytes:
 
     title = ("Guest Relay · " if guest else "Full Access Relay · ") + name
     relay = payload("com.apple.relay.managed", ".relay", title)
-    url_key = "HTTP2RelayURL" if config["transport"] == "http2" else "HTTP3RelayURL"
-    relay.update({"Relays": [{url_key: config["url"] + "/.well-known/masque/udp/{target_host}/{target_port}/",
-                              "AdditionalHTTPHeaderFields": {"Authorization": "Bearer " + token}}],
+    template = config["url"] + "/.well-known/masque/udp/{target_host}/{target_port}/"
+    # A service that speaks only HTTP/3 keeps its HTTP/3-only profiles. Otherwise HTTP/2 is the
+    # address every installed profile uses; "http3" adds the same origin over HTTP/3 next to it.
+    if config["transport"] == "http3":
+        urls = {"HTTP3RelayURL": template}
+    elif config.get("http3"):
+        urls = {"HTTP3RelayURL": template, "HTTP2RelayURL": template}
+    else:
+        urls = {"HTTP2RelayURL": template}
+    relay.update({"Relays": [{**urls, "AdditionalHTTPHeaderFields": {"Authorization": "Bearer " + token}}],
                   "MatchDomains": []})   # everything goes through the relay
     result = payload("Configuration", "", title)
     result.update({"PayloadContent": [relay], "PayloadDescription":

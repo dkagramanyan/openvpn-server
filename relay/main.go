@@ -4,7 +4,6 @@ package main
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
 	"io"
 	"log"
@@ -80,6 +79,10 @@ func (s *relayServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer flow.finish()
 	r = r.WithContext(context.WithValue(r.Context(), flowKey{}, flow))
 	if flow != nil {
+		flow.event.Transport = "http3"
+		if r.ProtoMajor == 2 {
+			flow.event.Transport = "http2"
+		}
 		flow.event.Method = r.Method
 		if len(flow.event.Method) > 32 {
 			flow.event.Method = "OTHER"
@@ -159,7 +162,7 @@ func (s *relayServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if host, port, err := net.SplitHostPort(target); err == nil && len(host) <= 253 && len(port) <= 5 {
 			flow.event.Target = net.JoinHostPort(host, port)
 		}
-		flow.event.Counted = udpReq == nil || r.ProtoMajor == 2
+		flow.event.Counted = true
 	}
 	resolved := time.Now()
 	ctx, addresses, err := s.resolveDestination(ctx, target, p, udpReq == nil)
@@ -197,12 +200,7 @@ func (s *relayServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			s.proxyHTTP2UDP(w, r, conn, token, addr.Addr(), p.URL)
 			return
 		}
-		proxy := &masque.Proxy{}
-		var once sync.Once
-		closeProxy := func() { once.Do(func() { proxy.Close() }) }
-		defer closeProxy()
-		go s.watch(ctx, token, addr.Addr(), p.URL, closeProxy)
-		_ = proxy.ProxyConnectedSocket(w, udpReq, conn)
+		s.proxyHTTP3UDP(ctx, w, conn, token, addr.Addr(), p.URL)
 		return
 	}
 	dialStarted := time.Now()
@@ -260,11 +258,11 @@ func env(key, fallback string) string {
 }
 
 func main() {
-	maximum, err := limitEnv("RELAY_MAX_FLOWS", 256, 65536)
+	maximum, err := limitEnv("RELAY_MAX_FLOWS", 2048, 65536)
 	if err != nil {
 		log.Fatal(err)
 	}
-	perClient, err := limitEnv("RELAY_MAX_FLOWS_PER_CLIENT", 64, maximum)
+	perClient, err := limitEnv("RELAY_MAX_FLOWS_PER_CLIENT", min(512, maximum), maximum)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -276,7 +274,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	h2Streams, err := limitEnv("RELAY_MAX_H2_STREAMS", 256, 65536)
+	h2Streams, err := limitEnv("RELAY_MAX_H2_STREAMS", 512, 65536)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -297,22 +295,31 @@ func main() {
 		quota: &flowQuota{maximum: perClient}, authSlots: make(chan struct{}, authChecks), metrics: &relayMetrics{},
 		maxH2Connections: h2Connections, maxH2Streams: h2Streams, h2ReadIdle: readIdle, h2PingTimeout: pingTimeout,
 	}
+	// "http2+http3" serves both at once: profiles that carry both URLs use
+	// HTTP/3 and fall back to HTTP/2, and HTTP/2-only profiles keep working.
 	mode := env("RELAY_TRANSPORT", "http2")
-	if mode != "http2" && mode != "http3" {
-		log.Fatal("RELAY_TRANSPORT must be http2 or http3")
+	if mode == "both" {
+		mode = "http2+http3"
 	}
+	if mode != "http2" && mode != "http3" && mode != "http2+http3" {
+		log.Fatal("RELAY_TRANSPORT must be http2, http3 or http2+http3")
+	}
+	useHTTP2, useHTTP3 := mode != "http3", mode != "http2"
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	handler.activity = newActivity(mode)
 	handler.activity.runtime = handler.metrics
 	handler.activity.limits = map[string]int{"flows": maximum, "per_client": perClient, "auth_checks": authChecks, "h2_connections": h2Connections, "h2_streams": h2Streams}
-	// Ready = the policy answers AND the client listener is open. /readyz
-	// opens before the listener, and waitForPolicy polls only once a second,
+	// Ready = the policy answers AND a client listener is open. /readyz
+	// opens before the listeners, and waitForPolicy polls only once a second,
 	// so without the second condition a check could pass before the relay
 	// accepts connections.
-	var serving atomic.Bool
+	var http2Up, http3Up atomic.Bool
+	handler.activity.listening = func() map[string]bool {
+		return map[string]bool{"http2": http2Up.Load(), "http3": http3Up.Load()}
+	}
 	handler.activity.readiness = func(ctx context.Context) error {
-		if !serving.Load() {
+		if !http2Up.Load() && !http3Up.Load() {
 			return errAuthUnavailable
 		}
 		return handler.checkReadiness(ctx)
@@ -328,7 +335,39 @@ func main() {
 	if err := handler.waitForPolicy(ctx); err != nil {
 		return
 	}
-	if mode == "http2" {
+	failed := make(chan error, 2)
+	var listeners sync.WaitGroup
+	if useHTTP3 {
+		files := &certificateFiles{chain: "/tls/fullchain.pem", key: "/tls/privkey.pem"}
+		if mode == "http3" {
+			if _, err := files.get(); err != nil {
+				log.Fatalf("HTTP/3 TLS setup required: put fullchain.pem and privkey.pem in APPLE_RELAY_TLS_DIR, readable by UID 65532: %v", err)
+			}
+		}
+		listeners.Add(1)
+		go func() {
+			defer listeners.Done()
+			for {
+				err := handler.serveHTTP3(ctx, env("RELAY_BIND", ":8443"), files, http3Up.Store)
+				if ctx.Err() != nil {
+					return
+				}
+				if !useHTTP2 {
+					failed <- err
+					return
+				}
+				// Installed profiles use HTTP/2: an HTTP/3 fault (a busy UDP
+				// port, for example) must not take that down with it.
+				log.Printf("HTTP/3 listener stopped, retrying in 30 s: %v", err)
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(30 * time.Second):
+				}
+			}
+		}()
+	}
+	if useHTTP2 {
 		if !strings.Contains(os.Getenv("GODEBUG"), "http2xconnect=1") {
 			log.Fatal("HTTP/2 relay requires GODEBUG=http2xconnect=1 (set by the Docker image)")
 		}
@@ -340,31 +379,20 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		serving.Store(true)
+		http2Up.Store(true)
 		log.Printf("Apple Network Relay HTTP/2 backend listening on %s; TLS terminates at the trusted proxy", listener.Addr())
-		if err := serveHTTP2Context(ctx, listener, handler, trusted); err != nil && ctx.Err() == nil {
-			log.Fatal(err)
-		}
-		return
+		listeners.Add(1)
+		go func() {
+			defer listeners.Done()
+			if err := serveHTTP2Context(ctx, listener, handler, trusted); err != nil && ctx.Err() == nil {
+				failed <- err
+			}
+		}()
 	}
-	// Direct HTTP/3 retains its existing process signal handling after the
-	// startup gate; the HTTP/2 shutdown above handles planned proxy restarts.
-	stop()
-	cert, err := tls.LoadX509KeyPair("/tls/fullchain.pem", "/tls/privkey.pem")
-	if err != nil {
-		log.Fatalf("HTTP/3 TLS setup required: put fullchain.pem and privkey.pem in APPLE_RELAY_TLS_DIR, readable by UID 65532: %v", err)
-	}
-	server := &http3.Server{
-		Addr: env("RELAY_BIND", ":8443"), Handler: handler, EnableDatagrams: true,
-		TLSConfig:      http3.ConfigureTLSConfig(&tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS13}),
-		MaxHeaderBytes: 8192,
-		QUICConfig:     &quic.Config{KeepAlivePeriod: 20 * time.Second, MaxIdleTimeout: 90 * time.Second},
-	}
-	udp, err := net.ListenPacket("udp", server.Addr)
-	if err != nil {
+	select {
+	case err := <-failed:
 		log.Fatal(err)
+	case <-ctx.Done():
 	}
-	serving.Store(true)
-	log.Printf("Apple Network Relay listening on %s/udp", server.Addr)
-	log.Fatal(server.Serve(udp))
+	listeners.Wait()
 }

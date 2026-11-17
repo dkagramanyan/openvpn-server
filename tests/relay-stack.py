@@ -46,7 +46,7 @@ def check_browser(api_url, portal_url, admin_password, folder):
         admin.get_by_role("button", name="Sign in", exact=True).click()
         admin.get_by_role("link", name="Relay", exact=True).click()
         admin.get_by_text("Signed downloads enabled", exact=True).wait_for()
-        admin.get_by_role("heading", name="Relay sessions", exact=True).wait_for()
+        admin.get_by_text("Live connections and diagnostics", exact=True).click()
         assert admin.get_by_label("Shared signing token", exact=True).input_value() == ""
         admin.get_by_role("button", name="Save signing settings", exact=True).click()
         admin.get_by_text("Signing settings saved", exact=True).wait_for()
@@ -136,7 +136,7 @@ def main():
         postgres = run("postgres", "-p", "127.0.0.1::5432", "-e", "POSTGRES_PASSWORD=" + pg_password,
                        "-e", "POSTGRES_DB=openvpn", "-e", "OPENVPN_DB_PASSWORD=" + app_password,
                        "-e", "RELAY_POLICY_DB_PASSWORD=" + policy_password,
-                       "-v", f"{ROOT}/postgres/00-roles.sh:/docker-entrypoint-initdb.d/00-roles.sh:ro", "postgres:18.6-alpine")
+                       "-v", f"{ROOT}/postgres/00-roles.sh:/docker-entrypoint-initdb.d/00-roles.sh:ro", "postgres:18.7-alpine")
         for _ in range(60):
             if subprocess.run(["docker", "exec", postgres, "pg_isready", "-h", "127.0.0.1", "-U", "postgres", "-d", "openvpn"], capture_output=True).returncode == 0:
                 break
@@ -208,7 +208,7 @@ tls:
     - certFile: /fixture/identity/fullchain.pem
       keyFile: /fixture/identity/key.pem
 ''')
-        proxy = run("traefik", "-p", "127.0.0.1::8443", "-p", "127.0.0.1::443", "-v", f"{folder}:/fixture:ro", "traefik:v3.7.15",
+        proxy = run("traefik", "-p", "127.0.0.1::8443", "-p", "127.0.0.1::443", "-v", f"{folder}:/fixture:ro", "traefik:v3.7.19",
                     "--entrypoints.relay.address=:8443", "--entrypoints.websecure.address=:443", "--entrypoints.portal.address=:9443",
                     "--providers.file.filename=/fixture/dynamic.yml", "--log.level=ERROR")
         origin = "https://localhost:" + published(proxy, 8443)
@@ -304,6 +304,24 @@ tls:
                 time.sleep(0.5)
             raise AssertionError('Relay session collector did not persist connection totals')
         first_session = saved_session(1)
+        # The united pages read what the real relay reports: listeners, the event
+        # log position, and per-client relay traffic and connections.
+        relay_state = json.loads(api("/api/relay/status"))
+        assert relay_state["transports"] == {"http2": True, "http3": False}, relay_state.get("transports")
+        assert all(e["seq"] and e["transport"] == "http2" for e in relay_state["events"]), relay_state["events"][:2]
+        for _ in range(30):
+            saved = json.loads(api("/api/clients/alice/relay-flows"))
+            if saved["total"]: break
+            time.sleep(0.5)
+        else: raise AssertionError("Relay connections were not saved")
+        assert saved["flows"][0]["target"].endswith(":8080") and saved["flows"][0]["bytes_down"] > 0, saved["flows"][0]
+        row = next(c for c in json.loads(api("/api/clients?range=today"))["clients"] if c["name"] == "alice")
+        assert row["traffic"]["relay"]["bytes_out"] > 0 and row["traffic"]["vpn"]["bytes_out"] == 0, row["traffic"]
+        assert row["total"]["relay_sessions"] >= 1, row["total"]
+        totals = json.loads(api("/api/overview?range=today"))["totals"]
+        assert totals["relay_clients"] >= 1 and totals["bytes_out"] >= row["traffic"]["relay"]["bytes_out"], totals
+        merged = json.loads(api("/api/sessions?via=all&merge=true"))["sessions"]
+        assert any(s["via"] == "relay" and s["client_name"] == "alice" for s in merged), merged[:2]
         # Reboot-style startup: policy/UI/relay come up before PostgreSQL. Use
         # only the already downloaded profile, never issue a replacement grant.
         original_grant = fixture.db.get_setting("relay_client:alice")

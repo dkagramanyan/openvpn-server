@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/netip"
 	"strconv"
+	"sync"
 	"time"
 )
 
@@ -106,6 +107,76 @@ func (p policy) allows(addr netip.Addr) bool {
 	return false
 }
 
+// A page opens many connections to the same few names at once: share one
+// lookup between them and keep the answer briefly. Go's resolver exposes no
+// TTL, so the lifetime is short; failures are never kept. The policy is
+// applied to the cached addresses on every flow.
+type dnsCache struct {
+	mu      sync.Mutex
+	entries map[string]*dnsEntry
+	query   func(ctx context.Context, host string) ([]netip.Addr, error)
+}
+
+type dnsEntry struct {
+	ready   chan struct{}
+	addrs   []netip.Addr
+	err     error
+	expires time.Time
+}
+
+const dnsLifetime, dnsEntries = 20 * time.Second, 4096
+
+var lookup = &dnsCache{query: func(ctx context.Context, host string) ([]netip.Addr, error) {
+	return net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+}}
+
+func (c *dnsCache) resolve(ctx context.Context, host string) ([]netip.Addr, error) {
+	if addr, err := netip.ParseAddr(host); err == nil {
+		return []netip.Addr{addr}, nil
+	}
+	key := normalHost(host)
+	c.mu.Lock()
+	entry := c.entries[key]
+	if entry == nil || (!entry.expires.IsZero() && time.Now().After(entry.expires)) {
+		if c.entries == nil {
+			c.entries = make(map[string]*dnsEntry)
+		}
+		if len(c.entries) >= dnsEntries {
+			for name, old := range c.entries {
+				if !old.expires.IsZero() && time.Now().After(old.expires) {
+					delete(c.entries, name)
+				}
+			}
+			if len(c.entries) >= dnsEntries {
+				c.mu.Unlock()
+				return c.query(ctx, host)
+			}
+		}
+		entry = &dnsEntry{ready: make(chan struct{})}
+		c.entries[key] = entry
+		// The lookup belongs to every flow waiting for it, not to the first caller.
+		go func() {
+			lookupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancel()
+			addrs, err := c.query(lookupCtx, host)
+			c.mu.Lock()
+			entry.addrs, entry.err, entry.expires = addrs, err, time.Now().Add(dnsLifetime)
+			if err != nil && c.entries[key] == entry {
+				delete(c.entries, key)
+			}
+			c.mu.Unlock()
+			close(entry.ready)
+		}()
+	}
+	c.mu.Unlock()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-entry.ready:
+		return entry.addrs, entry.err
+	}
+}
+
 func resolveAll(ctx context.Context, target string, p policy) ([]netip.AddrPort, error) {
 	host, portText, err := net.SplitHostPort(target)
 	if err != nil {
@@ -117,7 +188,7 @@ func resolveAll(ctx context.Context, target string, p policy) ([]netip.AddrPort,
 	}
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	addrs, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+	addrs, err := lookup.resolve(ctx, host)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", errDNSFailed, err)
 	}

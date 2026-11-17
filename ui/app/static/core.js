@@ -190,13 +190,31 @@ function field(label, input, help) {
 const state = {
   user: null,
   route: { name: 'dashboard', param: null },
-  range: localStorage.getItem('range') || 'today',
+  range: 'today',
+  custom: { from: '', to: '' },     // dates of the "custom" period, YYYY-MM-DD
   live: null,
   stream: null,
   view: null,
   timers: [],
 };
-const RANGES = [['today', 'Today'], ['24h', '24 h'], ['7d', '7 days'], ['30d', '30 days'], ['90d', '90 days'], ['all', 'All']];
+// Calendar periods in this browser's time zone; weeks start on Monday.
+const RANGES = [['today', 'Today'], ['yesterday', 'Yesterday'], ['week', 'This week'], ['month', 'This month'], ['last_month', 'Last month'], ['all', 'All'], ['custom', 'Custom']];
+try {
+  // A period saved by an earlier release ("24h", "7d", …) falls back to today.
+  const saved = localStorage.getItem('range');
+  if (RANGES.some(r => r[0] === saved)) state.range = saved;
+  const custom = JSON.parse(localStorage.getItem('range-custom') || 'null');
+  if (custom && /^\d{4}-\d\d-\d\d$/.test(custom.from) && /^\d{4}-\d\d-\d\d$/.test(custom.to)) state.custom = custom;
+  else if (state.range === 'custom') state.range = 'today';
+} catch (_) { /* storage unavailable */ }
+// The clients that are online now: an OpenVPN connection, an open relay connection, or both.
+function onlineClients(live) {
+  const map = new Map();
+  for (const c of (live && live.clients) || []) map.set(c.cn, { vpn: true, relay: false });
+  for (const c of (live && live.relay) || []) map.set(c.client, { vpn: (map.get(c.client) || {}).vpn || false, relay: true });
+  return map;
+}
+function viaLabel(via) { return via.vpn && via.relay ? 'OpenVPN + relay' : via.relay ? 'relay' : 'OpenVPN'; }
 
 function applyTheme() {
   const t = localStorage.getItem('theme') || 'system';
@@ -229,7 +247,8 @@ function signOut() { state.user = null; closeStream(); render(); }
 function onLive() {
   const live = state.live;
   const pill = $('#online-pill');
-  if (pill) { pill.textContent = live.connected ? String(live.clients.length) : '!'; pill.className = 'pill' + (live.connected ? '' : ' off'); }
+  // Distinct clients, over OpenVPN or the relay; "!" only when neither service answers.
+  if (pill) { const up = live.connected || live.relay_ready; pill.textContent = up ? String(onlineClients(live).size) : '!'; pill.className = 'pill' + (up ? '' : ' off'); pill.title = 'Clients online now over OpenVPN or the Apple relay'; }
   const dot = $('#mgmt-dot');
   if (dot) dot.className = 'status-dot' + (live.connected ? ' on' : '');
   const txt = $('#mgmt-text');
@@ -264,7 +283,7 @@ function sidebar() {
     h('div', { class: 'brand' }, h('div', { class: 'logo' }, svg('svg', { viewBox: '0 0 24 24' }, svg('path', { d: 'M12 2a7 7 0 0 0-3.5 13.06V20h7v-4.94A7 7 0 0 0 12 2z' }))), 'OpenVPN'),
     h('nav', { class: 'nav' },
       link('dashboard', 'Dashboard', 'dash'),
-      link('clients', 'Clients', 'users', h('span', { class: 'pill', id: 'online-pill' }, live && live.connected ? live.clients.length : '…')),
+      link('clients', 'Clients', 'users', h('span', { class: 'pill', id: 'online-pill' }, live && (live.connected || live.relay_ready) ? onlineClients(live).size : '…')),
       link('sessions', 'Sessions', 'sessions'),
       link('relay', 'Relay', 'lock'),
       link('server', 'Server', 'server'),
@@ -289,14 +308,48 @@ function renderView() {
 function topbar(title, sub, ...right) {
   return h('div', { class: 'topbar' }, h('div', null, h('h1', null, title), sub ? h('div', { class: 'sub' }, sub) : null), h('div', { class: 'spacer' }), ...right);
 }
-function rangeControl(onChange) {
-  const seg = h('div', { class: 'seg', role: 'group', 'aria-label': 'Time range' });
-  for (const [v, label] of RANGES) {
-    seg.append(h('button', { class: state.range === v ? 'active' : '', onClick: () => { state.range = v; localStorage.setItem('range', v); seg.querySelectorAll('button').forEach(b => b.classList.toggle('active', b.textContent === label)); onChange(v); } }, label));
-  }
-  return seg;
+function rangeQuery() {
+  return `range=${state.range}&tz=${TZ}` + (state.range === 'custom' ? `&from=${state.custom.from}&to=${state.custom.to}` : '');
 }
-function rangeLabel(r) { return (RANGES.find(x => x[0] === r) || ['', r])[1].toLowerCase(); }
+function isoDate(d) { return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; }
+// Period buttons, the two dates of a custom period, and the exact bounds the server used.
+function rangeControl(onChange) {
+  const seg = h('div', { class: 'seg', role: 'group', 'aria-label': 'Period' });
+  const today = isoDate(new Date());
+  const from = h('input', { class: 'input', type: 'date', 'aria-label': 'From', max: today, value: state.custom.from });
+  const to = h('input', { class: 'input', type: 'date', 'aria-label': 'To', max: today, value: state.custom.to });
+  const dates = h('div', { class: 'row period-dates', hidden: state.range !== 'custom' }, from, h('span', { class: 'muted' }, '–'), to);
+  const applyDates = () => {
+    if (!from.value || !to.value) return;
+    if (from.value > to.value) { toast('The period must start before it ends', 'err'); return; }
+    state.custom = { from: from.value, to: to.value };
+    localStorage.setItem('range-custom', JSON.stringify(state.custom));
+    onChange('custom');
+  };
+  from.addEventListener('change', applyDates); to.addEventListener('change', applyDates);
+  for (const [v, label] of RANGES) {
+    seg.append(h('button', { class: state.range === v ? 'active' : '', onClick: () => {
+      state.range = v; localStorage.setItem('range', v);
+      seg.querySelectorAll('button').forEach(b => b.classList.toggle('active', b.textContent === label));
+      dates.hidden = v !== 'custom';
+      if (v !== 'custom') { onChange(v); return; }
+      if (!from.value || !to.value) { to.value = today; from.value = isoDate(new Date(Date.now() - 6 * 86400e3)); }
+      applyDates();
+    } }, label));
+  }
+  return h('div', { class: 'period' }, h('div', { class: 'row', style: 'gap:8px;flex-wrap:wrap;justify-content:flex-end' }, seg, dates),
+    h('div', { class: 'period-bounds small muted', title: 'The period shown, in this browser\'s time zone' }));
+}
+// Every answer for a period carries its bounds: show them under the period buttons.
+function showPeriod(data) {
+  if (!data || !data.start) return;
+  const text = `${fmtDateTime(data.start)} – ${fmtDateTime(data.end - 1)}`;
+  document.querySelectorAll('.period-bounds').forEach(el => { el.textContent = text; });
+}
+function rangeLabel(r) {
+  if (r === 'custom') return state.custom.from === state.custom.to ? state.custom.from : `${state.custom.from} – ${state.custom.to}`;
+  return (RANGES.find(x => x[0] === r) || ['', r])[1].toLowerCase();
+}
 function card(title, body, ...actions) {
   return h('section', { class: 'card' }, title ? h('div', { class: 'card-h' }, h('h2', null, title), ...actions) : null, h('div', { class: 'card-b' }, body));
 }
@@ -305,7 +358,11 @@ function warnings(list, cls) {
   return h('div', { class: 'warnings' }, list.map(w => h('div', { class: 'warn ' + (cls || '') }, icon('warn'), h('span', null, w))));
 }
 function stateBadge(c) {
-  if (c.online) return h('span', { class: 'badge online' }, 'online');
+  if (c.online) {
+    const via = c.online_via || ['vpn'];
+    return h('span', { class: 'badge online', title: 'Connected now over ' + viaLabel({ vpn: via.includes('vpn'), relay: via.includes('relay') }) },
+      'online', h('span', { class: 'via' }, via.length > 1 ? 'VPN + relay' : via[0] === 'relay' ? 'relay' : 'VPN'));
+  }
   if (c.state === 'valid' && c.days_left !== null && c.days_left < 30) return h('span', { class: 'badge expiring' }, 'expiring');
   return h('span', { class: 'badge ' + c.state }, c.state);
 }

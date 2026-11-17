@@ -41,8 +41,8 @@ class Settings:
         self.tfa_issuer = _env("OVPN_TFA_ISSUER", "OpenVPN").strip() or "OpenVPN"
         self._guest_sub = _env("GUEST_SUB", "").strip()
         self.relay_transport = _env("OVPN_RELAY_TRANSPORT", "http2").strip().lower()
-        if self.relay_transport not in ("http2", "http3"):
-            raise ValueError("OVPN_RELAY_TRANSPORT must be http2 or http3")
+        if self.relay_transport not in ("http2", "http3", "http2+http3"):
+            raise ValueError("OVPN_RELAY_TRANSPORT must be http2, http3 or http2+http3")
         self.relay_signer_url = _env("OVPN_RELAY_SIGNER_URL", "").strip()
         self.relay_signing_required = _env("OVPN_RELAY_REQUIRE_SIGNED", "true").lower() not in ("0", "false")
         self.relay_signer_token = _env("RELAY_PROFILE_SIGNING_TOKEN", "").strip()

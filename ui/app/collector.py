@@ -108,6 +108,9 @@ class Collector(threading.Thread):
             "stats": {},
             "rate_in": 0.0,
             "rate_out": 0.0,
+            # Clients with open Apple relay connections (set by the relay collector).
+            "relay": [],
+            "relay_ready": False,
         }
 
     # -- pub/sub -------------------------------------------------------------
@@ -126,6 +129,13 @@ class Collector(threading.Thread):
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             return copy.deepcopy(self.live)
+
+    def set_relay(self, clients: list[dict[str, Any]], ready: bool) -> None:
+        with self._lock:
+            changed = self.live["relay"] != clients or self.live["relay_ready"] != ready
+            self.live.update(relay=clients, relay_ready=ready)
+        if changed:
+            self._publish()
 
     def _publish(self) -> None:
         with self._lock:

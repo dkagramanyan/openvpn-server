@@ -24,75 +24,128 @@ async function portalAccessDialog(name) {
 
 
 /* ------------------------------------------------------------ dashboard */
+// Traffic comes over OpenVPN and over the Apple relay; "bytes_*" is their sum.
+const SOURCES = [['all', 'All'], ['vpn', 'OpenVPN'], ['relay', 'Apple relay']];
+// A value of a traffic object ({bytes_in, bytes_out, vpn: {...}, relay: {...}}) or of a chart
+// point ({bytes_in, vpn_in, relay_in, ...}) for one source. dir: "in" = upload, "out" = download.
+function trafficOf(t, dir, src) {
+  if (!t) return 0;
+  if (!src || src === 'all') return t['bytes_' + dir] || 0;
+  return (t[src] ? t[src]['bytes_' + dir] : t[`${src}_${dir}`]) || 0;
+}
+function splitText(t, dir) {
+  return `OpenVPN ${fmtBytes(trafficOf(t, dir, 'vpn'))} · relay ${fmtBytes(trafficOf(t, dir, 'relay'))}`;
+}
+// "12.3 GB" with the OpenVPN / relay parts in small print when the relay carried some of it.
+function trafficCell(t, dir) {
+  return h('td', { class: 'r num', title: splitText(t, dir) }, fmtBytes(trafficOf(t, dir)),
+    trafficOf(t, dir, 'relay') ? h('span', { class: 'split' }, `relay ${fmtBytes(trafficOf(t, dir, 'relay'))}`) : null);
+}
+function viaTag(s) {
+  if (s.via !== 'relay') return h('span', { class: 'via-tag', title: s.proto === 'tcp' ? 'OpenVPN over the TCP fallback' : 'OpenVPN' }, 'OpenVPN' + (s.proto ? ' ' + s.proto : ''));
+  const t = { http2: 'h2', http3: 'h3', 'http2+http3': 'h2 + h3' }[s.transport] || '';
+  return h('span', { class: 'via-tag relay', title: 'Apple relay' + (t ? ' over ' + s.transport.replace(/http/g, 'HTTP/').replace('+', ' and ') : '') }, 'Relay' + (t ? ' ' + t : ''));
+}
+
 function dashboardView(el) {
-  let data = null;
+  let data = null, src = 'all';
   const sub = h('span', null, 'loading…');
   const body = h('div', { class: 'stack' });
   el.append(topbar('Dashboard', sub, rangeControl(load)), body);
   const liveTable = h('div');
-  const throughputTile = h('div', { style: 'display:grid' });
+  const throughputTile = h('div', { style: 'display:grid' }), onlineTile = h('div', { style: 'display:grid' });
+  const sourceSeg = h('div', { class: 'seg', role: 'group', 'aria-label': 'Traffic source' }, SOURCES.map(([v, label]) =>
+    h('button', { class: v === src ? 'active' : '', onClick: e => { src = v; sourceSeg.querySelectorAll('button').forEach(b => b.classList.toggle('active', b === e.currentTarget)); draw(); } }, label)));
   let hourChart, rangeChart;
 
   function renderLiveTable(live) {
-    const cls = live.clients;
-    if (!live.connected) { liveTable.replaceChildren(h('div', { class: 'empty' }, 'OpenVPN is not reachable: ', live.error || '')); return; }
-    if (!cls.length) { liveTable.replaceChildren(h('div', { class: 'empty' }, 'No clients connected')); return; }
+    const rows = [...live.clients.map(c => ({ via: 'vpn', name: c.cn, c })), ...(live.relay || []).map(c => ({ via: 'relay', name: c.client, c }))]
+      .sort((a, b) => a.name.localeCompare(b.name) || a.via.localeCompare(b.via));
+    if (!rows.length) {
+      liveTable.replaceChildren(h('div', { class: 'empty' }, live.connected ? 'No clients connected' : ['OpenVPN is not reachable: ', live.error || '']));
+      return;
+    }
     const now = live.server_time || Math.floor(Date.now() / 1000);
-    liveTable.replaceChildren(h('div', { class: 'table-wrap' }, h('table', { class: 'tbl' },
-      h('thead', null, h('tr', null, h('th', null, 'Client'), h('th', null, 'From'), h('th', null, 'VPN IP'), h('th', null, 'Connected'), h('th', { class: 'r' }, 'Download'), h('th', { class: 'r' }, 'Upload'), h('th', { class: 'r' }, 'Rate ↓ / ↑'), h('th', null, 'Cipher'), h('th', null))),
-      h('tbody', null, cls.map(c => h('tr', null,
-        h('td', { class: 'name-cell' }, h('a', { href: '#/clients/' + encodeURIComponent(c.cn) }, h('span', { class: 'dot-live' }), c.cn)),
+    liveTable.replaceChildren(
+      live.connected ? null : warnings(['OpenVPN is not reachable: ' + (live.error || 'not connected')]),
+      h('div', { class: 'table-wrap' }, h('table', { class: 'tbl' },
+      h('thead', null, h('tr', null, h('th', null, 'Client'), h('th', null, 'Via'), h('th', null, 'From'), h('th', null, 'VPN IP'), h('th', null, 'Connected'), h('th', { class: 'r' }, 'Download'), h('th', { class: 'r' }, 'Upload'), h('th', { class: 'r' }, 'Rate ↓ / ↑'), h('th', null))),
+      h('tbody', null, rows.map(({ via, name, c }) => via === 'vpn' ? h('tr', null,
+        h('td', { class: 'name-cell' }, h('a', { href: '#/clients/' + encodeURIComponent(name) }, h('span', { class: 'dot-live' }), name)),
+        h('td', null, viaTag({ via: 'vpn', proto: addrParts(c.real_address)[1] })),
         fromCell(c),
         h('td', { class: 'mono small' }, c.vpn_ip || '—'),
         h('td', null, fmtDur(now - c.connected_since), h('span', { class: 'muted small' }, ' · ' + fmtTime(c.connected_since))),
         h('td', { class: 'r num' }, fmtBytes(c.bytes_out)), h('td', { class: 'r num' }, fmtBytes(c.bytes_in)),
         h('td', { class: 'r num small' }, fmtBits(c.rate_out) + ' / ' + fmtBits(c.rate_in)),
-        h('td', { class: 'small muted' }, c.cipher),
-        h('td', { class: 'actions' }, h('button', { class: 'btn sm', onClick: async () => { if (await confirmDialog('Disconnect client', `Disconnect ${c.cn}? The client will most likely reconnect automatically.`, 'Disconnect', true)) await withToast(api(`/api/clients/${encodeURIComponent(c.cn)}/disconnect`, { method: 'POST', body: { cid: c.cid } }), 'Disconnect signal sent'); } }, 'Disconnect'))))))));
+        h('td', { class: 'actions' }, h('button', { class: 'btn sm', onClick: async () => { if (await confirmDialog('Disconnect client', `Disconnect ${name}? The client will most likely reconnect automatically.`, 'Disconnect', true)) await withToast(api(`/api/clients/${encodeURIComponent(name)}/disconnect`, { method: 'POST', body: { cid: c.cid } }), 'Disconnect signal sent'); } }, 'Disconnect')))
+        : h('tr', null,
+        h('td', { class: 'name-cell' }, h('a', { href: '#/clients/' + encodeURIComponent(name) }, h('span', { class: 'dot-live' }), name)),
+        h('td', null, viaTag({ via: 'relay' })),
+        h('td', { class: 'small muted', colSpan: 3 }, `${fmtNum(c.active)} open connection${c.active === 1 ? '' : 's'} · ${c.tcp} TCP / ${c.udp} UDP · ${c.destinations} destination${c.destinations === 1 ? '' : 's'}`),
+        h('td', { class: 'r num', title: 'Since the relay started' }, fmtBytes(c.bytes_down)), h('td', { class: 'r num', title: 'Since the relay started' }, fmtBytes(c.bytes_up)),
+        h('td', { class: 'r num small' }, fmtBits(c.rate_down) + ' / ' + fmtBits(c.rate_up)),
+        h('td', null)))))));
   }
-  function renderThroughput(live) {
-    throughputTile.replaceChildren(tile('Current throughput', [fmtBits(live.rate_out), h('small', null, '↓')], `↑ ${fmtBits(live.rate_in)} · ${live.connected ? live.clients.length + ' connected' : 'offline'}`));
+  function renderLive(live) {
+    const relay = live.relay || [], on = onlineClients(live);
+    const down = live.rate_out + relay.reduce((n, c) => n + c.rate_down, 0), up = live.rate_in + relay.reduce((n, c) => n + c.rate_up, 0);
+    throughputTile.replaceChildren(tile('Current throughput', [fmtBits(down), h('small', null, '↓')], `↑ ${fmtBits(up)} · OpenVPN and relay`));
+    const vpn = [...on.values()].filter(v => v.vpn).length, rel = [...on.values()].filter(v => v.relay).length;
+    onlineTile.replaceChildren(tile('Online now', [live.connected || live.relay_ready ? on.size : '—', data ? h('small', null, `of ${data.counts.valid}`) : null],
+      `${vpn} OpenVPN${live.connected ? '' : ' (unreachable)'} · ${rel} relay${live.relay_ready ? '' : ' (unreachable)'}`));
+    sub.textContent = (live.connected ? shortVer(live.version) || 'OpenVPN' : 'OpenVPN unreachable') + (data ? ` · ${data.counts.valid} valid client${data.counts.valid === 1 ? '' : 's'}` : '');
+    renderLiveTable(live);
   }
-
-  async function load() {
-    body.classList.add('loading');
-    try {
-      data = await api(`/api/overview?range=${state.range}&tz=${TZ}`);
-    } catch (e) { toast(e.message, 'err'); body.classList.remove('loading'); return; }
-    const live = data.live; state.live = live;
-    sub.textContent = live.connected ? `${shortVer(live.version) || 'OpenVPN'} · ${data.counts.valid} active client${data.counts.valid === 1 ? '' : 's'}` : 'OpenVPN unreachable';
-    const t = data.totals, rl = rangeLabel(state.range);
-    const dl = data.series.map(p => p.bytes_out), ul = data.series.map(p => p.bytes_in);
-    renderThroughput(live);
-    const hourOpts = { ts: data.hour.map(p => p.ts), series: [{ label: 'Download', cls: 's1', values: data.hour.map(p => p.bytes_out / 60) }, { label: 'Upload', cls: 's2', values: data.hour.map(p => p.bytes_in / 60) }], fmtY: fmtBits, fmtX: fmtTime, fmtXFull: ts => fmtTime(ts), height: 200, aria: 'Throughput in the last hour' };
+  function draw() {
+    if (!data) return;
+    const t = data.totals, rl = rangeLabel(state.range), pick = (p, dir) => trafficOf(p, dir, src);
+    const what = src === 'all' ? '' : ' · ' + SOURCES.find(x => x[0] === src)[1];
+    const dl = data.series.map(p => pick(p, 'out')), ul = data.series.map(p => pick(p, 'in'));
+    const hourOpts = { ts: data.hour.map(p => p.ts), series: [{ label: 'Download', cls: 's1', values: data.hour.map(p => pick(p, 'out') / 60) }, { label: 'Upload', cls: 's2', values: data.hour.map(p => pick(p, 'in') / 60) }], fmtY: fmtBits, fmtX: fmtTime, fmtXFull: ts => fmtTime(ts), height: 200, aria: 'Throughput in the last hour' };
     const bucket = data.bucket;
-    const fmtX = bucket >= 86400 ? fmtDate : (state.range === '7d' ? ts => new Date(ts * 1000).toLocaleString([], { weekday: 'short', hour: '2-digit' }) : fmtTime);
+    const fmtX = bucket >= 86400 ? fmtDate : bucket >= 3600 ? ts => new Date(ts * 1000).toLocaleString([], { weekday: 'short', hour: '2-digit' }) : fmtTime;
     const rangeOpts = { ts: data.series.map(p => p.ts), series: [{ label: 'Download', cls: 's1', values: dl }, { label: 'Upload', cls: 's2', values: ul }], fmtY: v => fmtBytes(v, 0), fmtX, fmtXFull: bucket >= 86400 ? fmtDate : fmtDateTime, height: 220, aria: 'Traffic per ' + (bucket >= 86400 ? 'day' : bucket >= 3600 ? 'hour' : '10 minutes') };
     if (!body.children.length) {
       const hourEl = h('div'), rangeEl = h('div');
       body.append(
         h('div', { id: 'warnings' }),
         h('div', { class: 'grid kpi', id: 'kpi' }),
-        h('div', { class: 'grid two' }, card('Throughput · last 60 minutes', hourEl), card('Top clients · ' + rl, h('div', { id: 'top' }))),
-        card('Traffic · ' + rl, rangeEl),
+        h('div', { class: 'row', style: 'justify-content:space-between;flex-wrap:wrap' }, h('span', { class: 'small muted' }, 'Charts and top clients show'), sourceSeg),
+        h('div', { class: 'grid two' }, h('section', { class: 'card' }, h('div', { class: 'card-h' }, h('h2', { id: 'hour-title' })), h('div', { class: 'card-b' }, hourEl)), h('section', { class: 'card' }, h('div', { class: 'card-h' }, h('h2', { id: 'top-title' })), h('div', { class: 'card-b', id: 'top' }))),
+        h('section', { class: 'card' }, h('div', { class: 'card-h' }, h('h2', { id: 'range-title' })), h('div', { class: 'card-b' }, rangeEl)),
         card('Connected clients', liveTable),
         h('div', { id: 'rej' }));
       hourChart = lineChart(hourEl, hourOpts); rangeChart = lineChart(rangeEl, rangeOpts);
-    } else { hourChart.update(hourOpts); rangeChart.update(rangeOpts); body.querySelectorAll('.card-h h2').forEach(x => { if (x.textContent.startsWith('Top clients')) x.textContent = 'Top clients · ' + rl; if (x.textContent.startsWith('Traffic ·')) x.textContent = 'Traffic · ' + rl; }); }
+    } else { hourChart.update(hourOpts); rangeChart.update(rangeOpts); }
+    $('#hour-title', body).textContent = 'Throughput · last 60 minutes' + what;
+    $('#top-title', body).textContent = 'Top clients · ' + rl + what;
+    $('#range-title', body).textContent = 'Traffic · ' + rl + what;
     $('#warnings', body).replaceChildren(warnings(data.warnings) || '');
+    const plural = (n, word) => `${fmtNum(n)} ${word}${n === 1 ? '' : 's'}`;
     $('#kpi', body).replaceChildren(
-      tile('Online now', [live.connected ? live.clients.length : '—', h('small', null, `of ${data.counts.valid}`)], data.counts.expiring ? `${data.counts.expiring} expiring soon` : `${data.counts.revoked} revoked`),
-      tile('Download · ' + rl, fmtBytes(t.bytes_out), `${fmtNum(t.sessions)} session${t.sessions === 1 ? '' : 's'} · ${t.clients} client${t.clients === 1 ? '' : 's'}`, sparkline(dl.slice(-24))),
-      tile('Upload · ' + rl, fmtBytes(t.bytes_in), 'from clients to the server', sparkline(ul.slice(-24))),
+      onlineTile,
+      tile('Active users · ' + rl, t.clients, `with traffic: ${t.vpn_clients} over OpenVPN, ${t.relay_clients} over the relay · ${plural(t.vpn_visits, 'OpenVPN visit')}, ${plural(t.relay_sessions, 'relay session')}`),
+      tile('Download · ' + rl, fmtBytes(t.bytes_out), splitText(t, 'out'), sparkline(data.series.map(p => p.bytes_out).slice(-24))),
+      tile('Upload · ' + rl, fmtBytes(t.bytes_in), splitText(t, 'in'), sparkline(data.series.map(p => p.bytes_in).slice(-24))),
       throughputTile);
-    $('#top', body).replaceChildren(bars(data.top.map(c => ({ label: clientLabel(c.name), value: c.bytes_in + c.bytes_out, href: c.name.includes('#') ? null : '#/clients/' + encodeURIComponent(c.name), title: `↓ ${fmtBytes(c.bytes_out)} · ↑ ${fmtBytes(c.bytes_in)}` }))));
-    renderLiveTable(live);
-    $('#rej', body).replaceChildren(data.rejections.length ? card('Rejected connection attempts · last 24 h', rejectionsTable(data.rejections, true)) : '');
+    $('#top', body).replaceChildren(bars(data.top.map(c => ({ label: clientLabel(c.name), value: pick(c, 'in') + pick(c, 'out'), href: c.name.includes('#') ? null : '#/clients/' + encodeURIComponent(c.name), title: `↓ ${fmtBytes(pick(c, 'out'))} · ↑ ${fmtBytes(pick(c, 'in'))}` + (src === 'all' ? ` · of it relay ↓ ${fmtBytes(trafficOf(c, 'out', 'relay'))} ↑ ${fmtBytes(trafficOf(c, 'in', 'relay'))}` : '') })).filter(r => r.value > 0).sort((a, b) => b.value - a.value)));
+    $('#rej', body).replaceChildren(data.rejections.length ? card('Rejected OpenVPN connection attempts · last 24 h', rejectionsTable(data.rejections, true)) : '');
+  }
+  async function load() {
+    body.classList.add('loading');
+    try {
+      data = await api(`/api/overview?${rangeQuery()}`);
+    } catch (e) { toast(e.message, 'err'); body.classList.remove('loading'); return; }
+    state.live = data.live;
+    showPeriod(data);
+    draw();
+    renderLive(data.live);
     body.classList.remove('loading');
   }
   load();
   every(60000, load);
-  return { onLive: live => { renderLiveTable(live); renderThroughput(live); if (data) sub.textContent = live.connected ? `${shortVer(live.version) || 'OpenVPN'} · ${data.counts.valid} active client${data.counts.valid === 1 ? '' : 's'}` : 'OpenVPN unreachable'; } };
+  return { onLive: live => { if (data) renderLive(live); } };
 }
 
 /* -------------------------------------------------------------- clients */
@@ -102,16 +155,18 @@ function clientsView(el) {
   const count = h('span');
   const searchIn = h('input', { class: 'input search', placeholder: 'Search clients…', onInput: e => { search = e.target.value.toLowerCase(); draw(); } });
   const filters = h('div', { class: 'seg' });
-  for (const [k, l] of [['all', 'All'], ['online', 'Online'], ['valid', 'Valid'], ['expiring', 'Expiring'], ['revoked', 'Revoked']]) {
+  for (const [k, l] of [['all', 'All'], ['online', 'Online'], ['vpn', 'On OpenVPN'], ['relay', 'On relay'], ['valid', 'Valid'], ['expiring', 'Expiring'], ['revoked', 'Revoked']]) {
     filters.append(h('button', { class: k === filter ? 'active' : '', onClick: e => { filter = k; filters.querySelectorAll('button').forEach(b => b.classList.toggle('active', b === e.currentTarget)); draw(); } }, l));
   }
   el.append(topbar('Clients', count, searchIn, rangeControl(load), h('button', { class: 'btn primary', onClick: () => newClientDialog(load) }, icon('plus'), 'New client')),
     h('div', { class: 'row', style: 'margin-bottom:12px' }, filters), h('section', { class: 'card' }, table));
 
   function draw() {
+    const rl = rangeLabel(state.range);
     let list = rows.filter(c => {
       if (search && !(c.name.toLowerCase().includes(search) || (c.note || '').toLowerCase().includes(search) || (c.static_ip || '').includes(search))) return false;
       if (filter === 'online') return c.online;
+      if (filter === 'vpn' || filter === 'relay') return (c.online_via || []).includes(filter);
       if (filter === 'valid') return c.state === 'valid';
       if (filter === 'expiring') return c.state === 'valid' && c.days_left !== null && c.days_left < 30;
       if (filter === 'revoked') return c.state === 'revoked' || c.state === 'expired';
@@ -119,29 +174,36 @@ function clientsView(el) {
     });
     const key = { name: c => c.name.toLowerCase(), expires: c => c.expires || 0, seen: c => c.total.last_seen || 0, dl: c => c.traffic.bytes_out, ul: c => c.traffic.bytes_in, sessions: c => c.total.sessions }[sort.key];
     if (key) list = list.slice().sort((a, b) => (key(a) > key(b) ? 1 : key(a) < key(b) ? -1 : 0) * (sort.asc ? 1 : -1));
-    count.textContent = `${rows.filter(c => c.state === 'valid').length} active · ${rows.filter(c => c.online).length} online · ${rows.length} total`;
+    count.textContent = `${rows.filter(c => c.state === 'valid').length} valid · ${rows.filter(c => c.online).length} online · ${rows.filter(c => c.traffic.bytes_in + c.traffic.bytes_out > 0).length} with traffic ${rl === 'all' ? 'ever' : rl} · ${rows.length} total`;
     const th = (label, k, cls) => h('th', { class: (cls || '') + (k ? ' sortable' : '') + (sort.key === k ? ' sorted' + (sort.asc ? ' asc' : '') : ''), onClick: k ? () => { sort = { key: k, asc: sort.key === k ? !sort.asc : k === 'name' }; draw(); } : null }, label);
     if (!list.length) { table.replaceChildren(h('div', { class: 'empty' }, rows.length ? 'No clients match' : 'No clients yet - create the first one')); return; }
     table.replaceChildren(h('div', { class: 'table-wrap' }, h('table', { class: 'tbl' },
-      h('thead', null, h('tr', null, th('Name', 'name'), th('Status'), th('Expires', 'expires'), th('Last seen', 'seen'), th('Download', 'dl', 'r'), th('Upload', 'ul', 'r'), th('Sessions', 'sessions', 'r'), h('th', null))),
+      h('thead', null, h('tr', null, th('Name', 'name'), th('Status'), th('Expires', 'expires'), th('Last seen', 'seen'), th('Download · ' + rl, 'dl', 'r'), th('Upload · ' + rl, 'ul', 'r'), th('Sessions', 'sessions', 'r'), h('th', null))),
       h('tbody', null, list.map(c => h('tr', { class: 'clickable', onClick: e => { if (!e.target.closest('button,a')) go('#/clients/' + encodeURIComponent(c.name)); } },
         h('td', { class: 'name-cell' }, c.name, c.note ? h('span', { class: 'sub' }, c.note) : null),
         h('td', null, h('div', { class: 'row', style: 'gap:6px' }, stateBadge(c), c.tfa ? h('span', { class: 'badge plain', title: 'Two-factor authentication enabled' }, '2FA') : null, c.guest ? h('span', { class: 'subnet', title: 'Guest: internet and the personal portal, no LAN' }, 'guest') : c.static_ip ? h('span', { class: 'subnet', title: 'Static IP' }, c.static_ip) : null, c.previous ? h('span', { class: 'badge plain expiring', title: 'Previous certificate still valid' }, 'renewed') : null)),
         h('td', { class: 'num' }, c.expires ? [fmtDate(c.expires), h('span', { class: 'muted small' }, ' · ' + fmtDays(c.days_left))] : '—'),
         h('td', null, c.online ? h('span', { class: 'ink2' }, 'now') : fmtAgo(c.total.last_seen)),
-        h('td', { class: 'r num' }, fmtBytes(c.traffic.bytes_out)), h('td', { class: 'r num' }, fmtBytes(c.traffic.bytes_in)),
-        h('td', { class: 'r num' }, fmtNum(c.total.sessions)),
+        trafficCell(c.traffic, 'out'), trafficCell(c.traffic, 'in'),
+        h('td', { class: 'r num', title: `All time: ${fmtNum(c.total.vpn_visits)} OpenVPN visits (${fmtNum(c.total.vpn_connections)} connections) · ${fmtNum(c.total.relay_sessions)} relay sessions` }, fmtNum(c.total.sessions)),
         h('td', { class: 'actions' }, c.state === 'valid' ? h('a', { class: 'btn sm', href: `/api/clients/${encodeURIComponent(c.name)}/ovpn`, download: c.name + '.ovpn', title: 'Download OpenVPN config' }, icon('download'), 'OpenVPN') : null,
           c.state === 'valid' ? relayButton(c, true) : null)))))));
   }
   async function load() {
     table.classList.add('loading');
-    try { rows = (await api(`/api/clients?range=${state.range}&tz=${TZ}`)).clients; draw(); } catch (e) { toast(e.message, 'err'); }
+    try { const r = await api(`/api/clients?${rangeQuery()}`); rows = r.clients; showPeriod(r); draw(); } catch (e) { toast(e.message, 'err'); }
     table.classList.remove('loading');
   }
   load();
   every(30000, load);
-  return { onLive: live => { const on = new Set(live.clients.map(c => c.cn)); let changed = false; rows.forEach(r => { const o = on.has(r.name); if (o !== r.online) { r.online = o; changed = true; } }); if (changed) draw(); } };
+  return { onLive: live => {
+    const on = onlineClients(live); let changed = false;
+    rows.forEach(r => {
+      const v = on.get(r.name), via = v ? ['vpn', 'relay'].filter(k => v[k]) : [];
+      if (via.join() !== (r.online_via || []).join()) { r.online = via.length > 0; r.online_via = via; changed = true; }
+    });
+    if (changed) draw();
+  } };
 }
 
 function newClientDialog(after) {
@@ -200,6 +262,10 @@ function clientDetailView(el) {
   el.append(h('div', { class: 'topbar' }, h('a', { class: 'btn ghost sm', href: '#/clients', title: 'Back' }, icon('back')), h('div', null, title, badges), h('div', { class: 'spacer' }), actions), body);
   const enc = encodeURIComponent(name);
   const act = (label, fn, cls) => h('button', { class: 'btn ' + (cls || ''), onClick: fn }, label);
+  let src = 'all', dailyChart = null, redrawDaily = () => {};
+  const sourceSeg = h('div', { class: 'seg', role: 'group', 'aria-label': 'Traffic source' }, SOURCES.map(([v, label]) =>
+    h('button', { class: v === src ? 'active' : '', onClick: e => { src = v; sourceSeg.querySelectorAll('button').forEach(b => b.classList.toggle('active', b === e.currentTarget)); redrawDaily(); } }, label)));
+  const flowsCard = relayFlowsCard(name);
 
   async function load() {
     body.classList.add('loading');
@@ -234,14 +300,16 @@ function clientDetailView(el) {
         } } }, label)));
     const kv = (pairs) => h('dl', { class: 'kv' }, pairs.map(([k, v]) => [h('dt', null, k), h('dd', null, v)]));
     const dailyEl = h('div');
+    sourceSeg.querySelectorAll('button').forEach((b, i) => b.classList.toggle('active', SOURCES[i][0] === src));
     const noteIn = h('textarea', { class: 'input', style: 'min-height:60px', placeholder: 'Notes about this client…' }, c.note || '');
     body.replaceChildren(
       h('div', { class: 'grid kpi' },
-        tile('Download · total', fmtBytes(t.bytes_out), 'server → client'), tile('Upload · total', fmtBytes(t.bytes_in), 'client → server'),
-        tile('Sessions', fmtNum(t.sessions), t.first_seen ? 'first seen ' + fmtDate(t.first_seen) : 'never connected'),
-        tile('Time online', fmtDur(t.online_seconds), c.online ? 'connected now' : 'last seen ' + fmtAgo(t.last_seen))),
+        tile('Download · total', fmtBytes(t.bytes_out), splitText(t, 'out')), tile('Upload · total', fmtBytes(t.bytes_in), splitText(t, 'in')),
+        tile('Sessions', fmtNum(t.sessions), `${fmtNum(t.vpn_visits)} OpenVPN visits (${fmtNum(t.vpn_connections)} connections) · ${fmtNum(t.relay_sessions)} relay sessions`),
+        tile(c.online ? 'Online now' : 'Last seen', c.online ? viaLabel({ vpn: c.online_via.includes('vpn'), relay: c.online_via.includes('relay') }) : fmtAgo(t.last_seen),
+          (t.first_seen ? 'first seen ' + fmtDate(t.first_seen) : 'never connected') + (t.online_seconds ? ` · ${fmtDur(t.online_seconds)} on OpenVPN` : ''))),
       h('div', { class: 'grid two' },
-        card('Traffic · last 30 days', dailyEl),
+        h('section', { class: 'card' }, h('div', { class: 'card-h' }, h('h2', null, 'Traffic · last 30 days'), sourceSeg), h('div', { class: 'card-b' }, dailyEl)),
         h('div', { class: 'stack' },
           card('Certificate', kv([
             ['Status', h('span', null, h('span', { class: 'badge ' + cert.state }, cert.state), cert.reason ? ' · ' + cert.reason : '')],
@@ -257,13 +325,51 @@ function clientDetailView(el) {
             ['2FA', c.tfa ? 'enabled' : 'off'],
           ].filter(Boolean))),
           card('Note', h('div', { class: 'stack', style: 'gap:8px' }, noteIn, h('div', null, h('button', { class: 'btn sm', onClick: () => withToast(api(`/api/clients/${enc}/note`, { method: 'PUT', body: { note: noteIn.value } }), 'Note saved') }, 'Save note')))))),
-      c.rejections.length ? card('Rejected connection attempts · last 30 days', rejectionsTable(c.rejections, false)) : '',
-      card('Visits · last 100', sessionsTable(c.sessions, false), h('a', { class: 'btn sm', href: '#/sessions/' + enc }, 'Every session')));
-    lineChart(dailyEl, { ts: c.daily.map(p => p.ts), series: [{ label: 'Download', cls: 's1', values: c.daily.map(p => p.bytes_out) }, { label: 'Upload', cls: 's2', values: c.daily.map(p => p.bytes_in) }], fmtY: v => fmtBytes(v, 0), fmtX: fmtDate, fmtXFull: fmtDate, height: 220, aria: 'Daily traffic' });
+      c.rejections.length ? card('Rejected OpenVPN connection attempts · last 30 days', rejectionsTable(c.rejections, false)) : '',
+      card('Sessions · last 100', sessionsTable(c.sessions, false), h('a', { class: 'btn sm', href: '#/sessions/' + enc }, 'Every session')),
+      flowsCard);
+    const dailyOpts = () => ({ ts: c.daily.map(p => p.ts), series: [{ label: 'Download', cls: 's1', values: c.daily.map(p => trafficOf(p, 'out', src)) }, { label: 'Upload', cls: 's2', values: c.daily.map(p => trafficOf(p, 'in', src)) }], fmtY: v => fmtBytes(v, 0), fmtX: fmtDate, fmtXFull: fmtDate, height: 220, aria: 'Daily traffic' });
+    dailyChart = lineChart(dailyEl, dailyOpts());
+    redrawDaily = () => dailyChart.update(dailyOpts());
     body.classList.remove('loading');
   }
   load();
-  return { onLive: live => { if (!c) return; const on = live.clients.some(x => x.cn === name); if (on !== c.online) load(); } };
+  return { onLive: live => { if (!c) return; const v = onlineClients(live).get(name), via = v ? ['vpn', 'relay'].filter(k => v[k]) : []; if (via.join() !== (c.online_via || []).join()) load(); } };
+}
+// The client's Apple relay connections: the open ones, then the saved log with its destinations.
+function relayFlowsCard(name) {
+  const LIMIT = 25;
+  let offset = 0, q = '', loading = false;
+  const live = h('div'), table = h('div'), pager = h('div', { class: 'row', style: 'justify-content:flex-end;padding-top:10px' });
+  const note = h('p', { class: 'small muted', style: 'margin:10px 0 0' });
+  const search = h('input', { class: 'input search', placeholder: 'Filter by destination', 'aria-label': 'Filter relay connections by destination', onChange: e => { q = e.target.value.trim(); offset = 0; load(); } });
+  const reason = value => (value || '').replace(/_/g, ' ');
+  const rowsTable = (rows, open) => h('div', { class: 'table-wrap' }, h('table', { class: 'tbl' },
+    h('thead', null, h('tr', null, [open ? 'Opened' : 'Ended', 'Protocol', 'Destination', 'Result', 'Duration'].map(t => h('th', null, t)), h('th', { class: 'r' }, 'Download'), h('th', { class: 'r' }, 'Upload'))),
+    h('tbody', null, rows.map(r => h('tr', null,
+      h('td', { class: 'num nowrap' }, fmtDateTime(r.ts)),
+      h('td', { class: 'small' }, r.protocol || '—', r.transport ? h('span', { class: 'muted' }, ' · ' + ({ http2: 'h2', http3: 'h3' }[r.transport] || r.transport)) : null),
+      h('td', { class: 'mono small' }, r.target || '—'),
+      h('td', { class: 'small' }, open ? h('span', { class: 'ink2' }, h('span', { class: 'dot-live' }), 'open') : r.kind === 'closed' && r.reason === 'connection_closed' ? 'ok' : [r.kind === 'closed' ? 'ended' : r.kind, h('span', { class: 'muted' }, ' · ' + reason(r.reason) + (r.upstream_error ? ' · ' + reason(r.upstream_error) : ''))]),
+      h('td', null, fmtDur(r.duration_ms / 1000)),
+      h('td', { class: 'r num' }, fmtBytes(r.bytes_down)), h('td', { class: 'r num' }, fmtBytes(r.bytes_up)))))));
+  async function load() {
+    if (loading) return;
+    loading = true;
+    try {
+      const r = await api(`/api/clients/${encodeURIComponent(name)}/relay-flows?limit=${LIMIT}&offset=${offset}&q=${encodeURIComponent(q)}`);
+      const text = q.toLowerCase(), open = r.active.filter(f => !text || (f.target || '').toLowerCase().includes(text)).sort((a, b) => b.ts - a.ts);
+      live.replaceChildren(open.length ? h('div', { class: 'stack', style: 'gap:6px;margin-bottom:14px' }, h('strong', null, `${fmtNum(open.length)} open now`), rowsTable(open, true)) : '');
+      table.replaceChildren(r.flows.length ? rowsTable(r.flows, false) : h('div', { class: 'empty' }, q ? 'No saved connection matches' : 'No relay connections in the last ' + r.retention_days + ' days'));
+      pager.replaceChildren(h('span', { class: 'muted small' }, r.total ? `${offset + 1}–${Math.min(offset + LIMIT, r.total)} of ${fmtNum(r.total)}` : ''),
+        h('button', { class: 'btn sm', disabled: offset === 0, onClick: () => { offset = Math.max(0, offset - LIMIT); load(); } }, 'Newer'),
+        h('button', { class: 'btn sm', disabled: offset + LIMIT >= r.total, onClick: () => { offset += LIMIT; load(); } }, 'Older'));
+      note.textContent = `Finished connections are kept for ${r.retention_days} days` + (r.ready ? '.' : '. The relay is not reachable now, so open connections are not shown.');
+    } catch (e) { table.replaceChildren(h('div', { class: 'empty' }, e.message)); }
+    finally { loading = false; }
+  }
+  load(); every(15000, () => { if (offset === 0) load(); });
+  return card('Relay connections · last 7 days', h('div', null, live, table, pager, note), search, h('button', { class: 'btn sm', title: 'Refresh', onClick: load }, icon('refresh')));
 }
 // History of an earlier certificate with the same name is stored as "name#time".
 function clientLabel(key) { return key.includes('#') ? key.split('#')[0] + ' (earlier)' : key; }
@@ -299,39 +405,50 @@ function staticIpDialog(c, after) {
 }
 function sessionsTable(list, withName) {
   if (!list.length) return h('div', { class: 'empty' }, 'No sessions recorded');
+  const nameCell = s => h('td', { class: 'name-cell' }, s.client_name.includes('#') ? h('span', { class: 'muted', title: 'An earlier certificate with this name' }, clientLabel(s.client_name)) : h('a', { href: '#/clients/' + encodeURIComponent(s.client_name) }, s.client_name));
+  const open = s => s.via === 'relay' ? s.state !== 'ended' : !s.disconnected_at;
   return h('div', { class: 'table-wrap' }, h('table', { class: 'tbl' },
-    h('thead', null, h('tr', null, withName ? h('th', null, 'Client') : null, h('th', null, 'Connected'), h('th', null, 'Duration'), h('th', null, 'From'), h('th', null, 'VPN IP'), h('th', null, 'Device'), h('th', { class: 'r' }, 'Download'), h('th', { class: 'r' }, 'Upload'), h('th', null, 'Cipher'))),
-    h('tbody', null, list.map(s => h('tr', null,
-      withName ? h('td', { class: 'name-cell' }, s.client_name.includes('#') ? h('span', { class: 'muted', title: 'An earlier certificate with this name' }, clientLabel(s.client_name)) : h('a', { href: '#/clients/' + encodeURIComponent(s.client_name) }, s.client_name)) : null,
+    h('thead', null, h('tr', null, withName ? h('th', null, 'Client') : null, h('th', null, 'Via'), h('th', null, 'Connected'), h('th', null, 'Duration'), h('th', null, 'From'), h('th', null, 'VPN IP'), h('th', null, 'Device'), h('th', { class: 'r' }, 'Download'), h('th', { class: 'r' }, 'Upload'))),
+    h('tbody', null, list.map(s => s.via === 'relay' ? h('tr', null,
+      withName ? nameCell(s) : null, h('td', null, viaTag(s)),
       h('td', { class: 'num' }, fmtDateTime(s.connected_at)),
-      h('td', null, s.disconnected_at ? fmtDur(s.disconnected_at - s.connected_at) : h('span', { class: 'ink2' }, h('span', { class: 'dot-live' }), fmtDur(Date.now() / 1000 - s.connected_at)),
+      h('td', null, s.state === 'active' ? h('span', { class: 'ink2' }, h('span', { class: 'dot-live' }), fmtDur(Date.now() / 1000 - s.connected_at)) : fmtDur(s.last_seen - s.connected_at),
+        s.state === 'idle' ? h('span', { class: 'muted small', title: 'No open connection; a new session starts after five minutes without one' }, ' · idle') : null),
+      // The relay sits behind the gateway: it sees no client address and no device.
+      h('td', { class: 'small muted', colSpan: 3 }, `${fmtNum(s.connections)} connection${s.connections === 1 ? '' : 's'}${s.open ? ` · ${fmtNum(s.open)} open` : ''}${s.denied || s.failed ? ` · ${fmtNum(s.denied)} blocked, ${fmtNum(s.failed)} failed` : ''}`),
+      h('td', { class: 'r num' }, fmtBytes(s.bytes_out)), h('td', { class: 'r num' }, fmtBytes(s.bytes_in)))
+      : h('tr', null,
+      withName ? nameCell(s) : null, h('td', null, viaTag(s)),
+      h('td', { class: 'num' }, fmtDateTime(s.connected_at)),
+      h('td', null, !open(s) ? fmtDur(s.disconnected_at - s.connected_at) : h('span', { class: 'ink2' }, h('span', { class: 'dot-live' }), fmtDur(Date.now() / 1000 - s.connected_at)),
         // a visit: several connections of one client from one address, merged
         s.connections > 1 ? h('span', { class: 'muted small', title: 'Reconnects from the same address, at most 15 minutes apart' }, ` · ${fmtNum(s.connections)} connections, ${fmtDur(s.online_seconds)} online`) : null,
         s.disconnected_at && s.end_reason ? h('span', { class: 'muted small' }, ' · ' + s.end_reason) : null),
-      fromCell(s), h('td', { class: 'mono small' }, s.vpn_ip || '—'), deviceCell(s),
-      h('td', { class: 'r num' }, fmtBytes(s.bytes_out)), h('td', { class: 'r num' }, fmtBytes(s.bytes_in)),
-      h('td', { class: 'small muted' }, s.cipher || ''))))));
+      fromCell({ ...s, proto: null }), h('td', { class: 'mono small' }, s.vpn_ip || '—'), deviceCell(s),
+      h('td', { class: 'r num' }, fmtBytes(s.bytes_out)), h('td', { class: 'r num' }, fmtBytes(s.bytes_in)))))));
 }
 
 /* ------------------------------------------------------------- sessions */
 function sessionsView(el) {
-  let offset = 0, total = 0, name = state.route.param || '', active = false, merge = !name;
+  let offset = 0, total = 0, name = state.route.param || '', active = false, merge = !name, via = 'all';
   const LIMIT = 100;
   const table = h('div');
   const pager = h('div', { class: 'row', style: 'justify-content:flex-end;padding:10px 16px' });
   const nameIn = h('input', { class: 'input search', value: name, placeholder: 'Filter by client name', onChange: e => { name = e.target.value.trim(); offset = 0; load(); } });
   const activeIn = h('label', { class: 'check' }, h('input', { type: 'checkbox', onChange: e => { active = e.target.checked; offset = 0; load(); } }), 'Active only');
-  const mergeIn = h('label', { class: 'check', title: 'Show the reconnects of one client from one address, at most 15 minutes apart, as one visit' }, h('input', { type: 'checkbox', checked: merge, onChange: e => { merge = e.target.checked; offset = 0; load(); } }), 'Merge reconnects');
+  const mergeIn = h('label', { class: 'check', title: 'Show the OpenVPN reconnects of one client from one address, at most 15 minutes apart, as one visit' }, h('input', { type: 'checkbox', checked: merge, onChange: e => { merge = e.target.checked; offset = 0; load(); } }), 'Merge reconnects');
+  const viaSeg = h('div', { class: 'seg', role: 'group', 'aria-label': 'Connection type' }, [['all', 'All'], ['vpn', 'OpenVPN'], ['relay', 'Apple relay']].map(([v, label]) =>
+    h('button', { class: v === via ? 'active' : '', onClick: e => { via = v; offset = 0; viaSeg.querySelectorAll('button').forEach(b => b.classList.toggle('active', b === e.currentTarget)); load(); } }, label)));
   const count = h('span');
   const quality = h('div');
-  const qualityTitle = h('h2', null, 'Connection quality');
-  el.append(topbar('Sessions', count, nameIn, activeIn, mergeIn, h('button', { class: 'btn', onClick: () => { load(); loadQuality(); } }, icon('refresh'), 'Refresh')),
-    h('div', { class: 'stack' }, h('section', { class: 'card' }, h('div', { class: 'card-h' }, qualityTitle, rangeControl(loadQuality)), h('div', { class: 'card-b' }, quality)), h('section', { class: 'card' }, table, pager)));
+  const qualityTitle = h('h2', null, 'OpenVPN connection quality');
+  el.append(topbar('Sessions', count, nameIn, viaSeg, activeIn, mergeIn, h('button', { class: 'btn', onClick: () => { load(); loadQuality(); } }, icon('refresh'), 'Refresh')),
+    h('div', { class: 'stack' }, h('section', { class: 'card' }, table, pager), h('section', { class: 'card' }, h('div', { class: 'card-h' }, qualityTitle, rangeControl(loadQuality)), h('div', { class: 'card-b' }, quality))));
   async function loadQuality() {
-    qualityTitle.textContent = 'Connection quality · ' + rangeLabel(state.range);
+    qualityTitle.textContent = 'OpenVPN connection quality · ' + rangeLabel(state.range);
     let rows;
-    try { rows = (await api(`/api/connections?range=${state.range}&tz=${TZ}`)).clients; } catch (e) { toast(e.message, 'err'); return; }
-    if (!rows.length) { quality.replaceChildren(h('div', { class: 'empty' }, 'No sessions in this period')); return; }
+    try { const r = await api(`/api/connections?${rangeQuery()}`); rows = r.clients; showPeriod(r); } catch (e) { toast(e.message, 'err'); return; }
+    if (!rows.length) { quality.replaceChildren(h('div', { class: 'empty' }, 'No OpenVPN sessions in this period')); return; }
     const n = (v, of) => h('td', { class: 'r num' }, v ? fmtNum(v) : h('span', { class: 'muted' }, '0'), v && of ? h('span', { class: 'muted small' }, ` ${Math.round(v / of * 100)}%`) : null);
     quality.replaceChildren(h('div', { class: 'table-wrap' }, h('table', { class: 'tbl' },
       h('thead', null, h('tr', null, h('th', null, 'Client'), h('th', null, 'Device'), h('th', { class: 'r' }, 'Sessions'), h('th', { class: 'r', title: 'Half of the sessions were shorter than this' }, 'Median'), h('th', { class: 'r' }, 'Under 1 min'),
@@ -341,13 +458,13 @@ function sessionsView(el) {
         h('td', { class: 'name-cell' }, r.name.includes('#') ? h('span', { class: 'muted' }, clientLabel(r.name)) : h('a', { href: '#/clients/' + encodeURIComponent(r.name) }, r.name)),
         deviceCell(r), h('td', { class: 'r num' }, fmtNum(r.sessions)), h('td', { class: 'r num' }, r.median_seconds === null ? '—' : fmtDur(r.median_seconds)),
         n(r.short, r.sessions), n(r.left), n(r.timed_out), n(r.closed), n(r.other), n(r.tcp, r.sessions)))))),
-      h('p', { class: 'small muted', style: 'margin:10px 0 0' }, 'Many short sessions that end with "left" are normal for phones: OpenVPN Connect drops the tunnel when the phone sleeps and reconnects when it wakes. Timeouts and sessions over TCP point at the network between the client and this server.'));
+      h('p', { class: 'small muted', style: 'margin:10px 0 0' }, 'Sessions that started in the period. Many short sessions that end with "left" are normal for phones: OpenVPN Connect drops the tunnel when the phone sleeps and reconnects when it wakes. Timeouts and sessions over TCP point at the network between the client and this server.'));
   }
   async function load() {
     table.classList.add('loading');
     try {
-      const r = await api(`/api/sessions?limit=${LIMIT}&offset=${offset}&active=${active}&merge=${merge}${name ? '&name=' + encodeURIComponent(name) : ''}`);
-      const what = merge ? 'visit' : 'session';
+      const r = await api(`/api/sessions?limit=${LIMIT}&offset=${offset}&active=${active}&merge=${merge}&via=${via}${name ? '&name=' + encodeURIComponent(name) : ''}`);
+      const what = via === 'relay' ? 'relay session' : merge && via === 'vpn' ? 'visit' : 'session';
       total = r.total; count.textContent = `${fmtNum(total)} ${what}${total === 1 ? '' : 's'}`;
       table.replaceChildren(sessionsTable(r.sessions, true));
       pager.replaceChildren(h('span', { class: 'muted small' }, total ? `${offset + 1}–${Math.min(offset + LIMIT, total)} of ${fmtNum(total)}` : ''),

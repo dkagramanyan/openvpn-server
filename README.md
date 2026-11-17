@@ -3,7 +3,7 @@
 OpenVPN server and Apple Network Relay in Docker, with a web UI for clients,
 live status, traffic statistics and a personal portal for every client.
 
-* **OpenVPN 2.7.7** and **easy-rsa 3.2.7**, built from the signed upstream
+* **OpenVPN 2.7.9** and **easy-rsa 3.2.7**, built from the signed upstream
   release tarballs on Alpine 3.24.
 * **Apple Network Relay** (`relay/`): the relay built into iOS/iPadOS 17+ and
   macOS 14+, as a per-client `.mobileconfig` profile next to the `.ovpn` one.
@@ -127,6 +127,13 @@ it on the gateway; the relay picks it up within seconds, guest relay profiles
 does not need a new profile. A page that loads scripts or images from elsewhere on its
 website may need the whole website.
 
+Below the links, the section shows the `portal_listener` and `guest_links`
+entries of the gateway file, to paste over the same entries in the gateway's
+`network.private.json`. **Check guest access** opens the saved portal and each
+saved link from this server through the portal listener, as a guest's
+connection goes, and asks the pushed DNS servers whether the hostname points at
+the listener's address. A 404 there means the gateway file is not applied yet.
+
 Without a portal listener in Settings, guests get the internet but not their
 portal. Changing a client between guest and full access applies to OpenVPN on
 the next connection and to the relay within seconds; the relay profile stays
@@ -203,18 +210,23 @@ How it behaves:
   change, revocation or relay switch-off takes effect within about 9 seconds.
   Authorization results are cached for at most 1 second; when the policy
   service is unreachable, new requests get a retryable 503 and nothing fails open.
-* **Limits** - 256 flows in total, 64 per client, 128 HTTP/2 connections with
-  256 streams each (`APPLE_RELAY_*` in `.env.example`). HTTP/2 pings an idle
-  connection after 10 s and drops it 5 s later without an answer.
+* **Limits** - 2048 flows in total, 512 per client (a profile sends every
+  connection of the device through the relay, and a client's devices share the
+  limit), 128 HTTP/2 connections with 512 streams each (`APPLE_RELAY_*` in
+  `.env.example`; a value set in your `.env` wins over a new default). HTTP/2
+  pings an idle connection after 10 s and drops it 5 s later without an answer.
+* **Names** are resolved by the relay with this server's DNS; one answer is
+  shared by the connections that ask for it at once and reused for 20 seconds.
 * **The relay is a proxy, not an IP VPN**: TCP and UDP to named destinations,
-  no ping, no Bonjour, no VPN address. OpenVPN statistics do not include relay traffic.
+  no ping, no Bonjour, no VPN address.
 
-The **Relay** page lists sessions (connections from one profile, merged until
-five minutes pass without one), live connections per client and recent events
-with the reason of every refusal or failure (policy, DNS, refused, timeout).
-Session totals are saved every 5 seconds and kept for a year. The relay's own
-status endpoint (`127.0.0.1:8446`: `/readyz`, `/metrics`, `/status`) stays on
-loopback; never publish it.
+Relay sessions (connections from one profile, merged until five minutes pass
+without one), relay traffic and the relay's connection log are on the
+**Clients** and **Sessions** pages, next to the OpenVPN ones (see *Web UI*).
+The **Relay** page shows the service: state, open listeners, limits, live
+connections with the reason of every refusal or failure, and profile signing.
+The relay's own status endpoint (`127.0.0.1:8446`: `/readyz`, `/metrics`,
+`/status`) stays on loopback; never publish it.
 
 If a profile installs but nothing connects:
 
@@ -224,10 +236,38 @@ docker compose logs --tail=50 apple-relay relay-policy
 docker compose exec -T apple-relay wget -qO- http://127.0.0.1:8446/readyz
 ```
 
-**Direct HTTP/3** (optional): `APPLE_RELAY_TRANSPORT=http3`, a certificate in
-`relay-tls/` (`fullchain.pem`, `privkey.pem`, readable by UID 65532; see
-`bin/export-relay-cert.py`), UDP 8443 forwarded to this server, then
-`docker compose up -d --build` and new profiles.
+### HTTP/3 next to HTTP/2
+
+Over HTTP/2 every connection of a device shares one TCP connection that goes
+through the gateway (TLS there, then the LAN). Over HTTP/3 the device talks
+QUIC to this server directly, as OpenVPN does over UDP. The relay serves both
+at once (`APPLE_RELAY_TRANSPORT=http2+http3`, the default); HTTP/3 needs three
+things from you:
+
+1. **The certificate of the relay hostname on this server**, in `relay-tls/`
+   (`fullchain.pem`, `privkey.pem`). Copy `bin/export-relay-cert.py` from this
+   repository to the gateway and run it there: `sudo python3
+   export-relay-cert.py --acme letsencrypt/acme.json --hostname <relay host>
+   --output relay-tls`, then copy the two files into `relay-tls/` here and make
+   them readable by the relay's user: `sudo chown 65532 relay-tls/*.pem` (the
+   export writes them with mode 0600). The relay starts HTTP/3 when the files
+   appear and loads a renewed pair within 30 seconds, without a restart;
+   repeat the export after each renewal (a cron job on the gateway). An
+   HTTP/3 fault never stops HTTP/2.
+2. **UDP 8443 forwarded from the router to this server** (TCP 8443 stays on
+   the gateway). The relay URL does not change.
+3. **Settings → Network → Add HTTP/3 to new Apple relay profiles.** A profile then
+   carries the same address twice, for HTTP/3 and HTTP/2. Try one device first:
+   that a device prefers HTTP/3 and falls back to HTTP/2 is how Apple
+   describes relays, but it was not tested here on a device.
+
+Profiles installed before keep working over HTTP/2 unchanged; a device gets
+HTTP/3 when its profile is downloaded again. The Relay page shows which
+listeners are open, and every relay session shows `h2` or `h3`.
+QUIC wants larger socket buffers than Linux allows by default; on this host:
+`sysctl -w net.core.rmem_max=7500000 net.core.wmem_max=7500000` (and the same
+two lines in `/etc/sysctl.d/`).
+`APPLE_RELAY_TRANSPORT=http2` or `http3` alone still work as before.
 
 ## Sign-in and the personal portal
 
@@ -245,6 +285,22 @@ Who reaches the portal: guests through the portal listener (above); full-access
 clients and trusted LAN networks through the gateway's regular HTTPS listener.
 From the open internet it is not reachable, so a first profile has to be handed
 over privately or on the LAN.
+
+## Upgrading to 2.3
+
+```shell
+cd ~/openvpn-server &&
+git pull --ff-only &&
+sudo docker compose up -d --build          # all images change; OpenVPN clients reconnect once
+```
+
+The database is upgraded on the first start (traffic gets a source, relay
+sessions recorded so far are added to the traffic charts). Installed OpenVPN
+and relay profiles keep working. If your `.env` was copied from an older
+`.env.example`, delete its `APPLE_RELAY_MAX_FLOWS`, `..._PER_CLIENT`,
+`..._MAX_H2_STREAMS` and `APPLE_RELAY_TRANSPORT` lines to get the new defaults.
+The gateway needs no change. HTTP/3 is optional, see
+[HTTP/3 next to HTTP/2](#http3-next-to-http2).
 
 ## Upgrading to 2.0
 
@@ -404,19 +460,33 @@ Environment variables of the `openvpn-ui` service for backups:
 
 ## Web UI
 
-* **Dashboard** - online clients with live download/upload rates, throughput
-  for the last hour, traffic over the selected range (today, 24 h, 7/30/90
-  days, all), top clients, rejected connection attempts of the last 24 h,
-  warnings (unreachable server, expiring certificates/CRL, 2FA enforced
-  without secrets).
-* **Clients** - state (online, valid, expiring, expired, revoked), expiry,
-  last seen, traffic in the selected range, session count. Create clients with
+OpenVPN and the Apple relay are two ways in for the same clients, and the
+pages count them together: traffic, sessions, "online" and "last seen" cover
+both, with the split shown next to each number.
+
+* **Periods** - today, yesterday, this week (from Monday), this month, last
+  month, all, or two dates of your choice, in the browser's time zone. The
+  exact start and end are printed under the buttons.
+* **Dashboard** - *online now*: clients (not connections) with an OpenVPN
+  connection or an open relay connection; *active users*: clients with
+  traffic in the period over either; download, upload, throughput for the
+  last hour, traffic over the period and top clients, for both or one of the
+  two; the connected clients of both; rejected connection attempts of the
+  last 24 h; warnings (unreachable server, expiring certificates/CRL, 2FA
+  enforced without secrets).
+* **Clients** - state (online and over what, valid, expiring, expired,
+  revoked), expiry, last seen, traffic in the period, session count. A client's
+  page has its traffic, one list of its OpenVPN visits and relay sessions, and
+  **Relay connections**: every finished relay connection of the last 7 days
+  with time, destination, result, duration and bytes, with a destination
+  filter. Create clients with
   full access or guest, optional validity, static IP, key passphrase, note and
   2FA. Download the `.ovpn` profile (always regenerated from the current
   template) or share it with a one-time link and QR code, switch between full
   access and guest, show the 2FA QR code and rejected connection attempts,
   disconnect, renew, revoke, delete.
-* **Sessions** - every connection with duration, source address, protocol
+* **Sessions** - OpenVPN and relay sessions in one list (filter by either);
+  for OpenVPN every connection with duration, source address, protocol
   (UDP or the TCP fallback), device (platform and client version), VPN IP,
   bytes and how it ended: *left* (the client said goodbye), *timed out* (it
   vanished), *closed* (a TCP connection ended). Reconnects of one client from
@@ -436,7 +506,11 @@ Environment variables of the `openvpn-ui` service for backups:
 
 Traffic is read every 5 s from the status file OpenVPN writes (`status ... 5`,
 `status-version 3`; a management `status` command would be logged on every
-poll), falling back to the management interface when there is none. It is stored per minute for two days, per hour for 90 days and per day forever.
+poll), falling back to the management interface when there is none. Relay
+traffic is read every 5 s from the relay's status. Both are stored per client
+and source, per minute for two days, per hour for 90 days and per day forever.
+The relay's connection log names the destinations a client opened (host and
+port, never content) and is deleted after 7 days; tell your users.
 Bytes are counted from the client's point of view: *download* is what the
 server sent to the client.
 
