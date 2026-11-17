@@ -216,7 +216,9 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: 13.5px; }
 .tbl tr.clickable { cursor: pointer; }
 .tbl tr.clickable:hover td { background: var(--surface-2); }
 .tbl tr:last-child td { border-bottom: 0; }
-.tbl .actions { display: flex; gap: 4px; justify-content: flex-end; }
+/* The cell itself stays a table cell (a flex cell loses the row's height, border and hover). */
+.tbl td.actions { text-align: right; white-space: nowrap; }
+.tbl td.actions > * + * { margin-left: 4px; }
 .empty { padding: 28px 16px; color: var(--muted); text-align: center; }
 .name-cell { font-weight: 600; }
 .name-cell .sub { display: block; font-weight: 400; font-size: 12px; color: var(--muted); }
