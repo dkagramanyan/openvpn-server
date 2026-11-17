@@ -16,7 +16,10 @@ The Apple relay without the gateway in its path.
   provider and the same service account as the gateway's Traefik
   (`RELAY_CERT_DOMAIN`, `ACME_EMAIL`, `ACME_DNS_PROVIDER`, `SELECTELV2_*` in
   `.env`), checks twice a day, and hands a renewed certificate to the relay,
-  which loads it within 30 s. No more copying from the gateway.
+  which loads it within 30 s. No more copying from the gateway. The TXT
+  record stands for `ACME_DNS_WAIT` (120 s) before Let's Encrypt checks it:
+  its checks from several places otherwise met resolvers still holding the
+  name's previous answer.
 * The Relay page shows the certificate (names, issuer, days left) and whether
   HTTP/2 is served directly or through the gateway.
 * **Settings, redone.** Sections in a side list (a menu on a phone) with

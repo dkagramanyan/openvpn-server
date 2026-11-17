@@ -52,6 +52,9 @@ if [ -z "$DOMAIN" ] || [ -z "${ACME_EMAIL:-}" ]; then
 fi
 export DOMAIN
 provider=${ACME_DNS_PROVIDER:-selectelv2}
+# Let's Encrypt checks the TXT record from several places at once, some through
+# resolvers that still hold the name's previous answer (left-over challenge
+# records, TTL 60 s at Selectel): wait longer than that before it looks.
 log "certificate for $DOMAIN from ${ACME_CA_SERVER:-Let's Encrypt}, DNS challenge at $provider"
 while :; do
     publish
@@ -59,6 +62,7 @@ while :; do
     # lifetime left, or as the CA's renewal info says); otherwise it changes nothing.
     if "$LEGO" run --path "$DATA" --log.format text --accept-tos --email "$ACME_EMAIL" --domains "$DOMAIN" \
             --dns "$provider" ${ACME_DNS_RESOLVERS:+--dns.resolvers "$ACME_DNS_RESOLVERS"} \
+            --dns.propagation.wait "${ACME_DNS_WAIT:-120s}" \
             ${ACME_CA_SERVER:+--server "$ACME_CA_SERVER"} \
             --deploy-hook /app/relay-cert.sh; then
         publish
