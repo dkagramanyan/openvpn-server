@@ -20,7 +20,7 @@ def flow_line(ts, src, dst, up, down, proto="tcp"):
 
 def test_parse_flow_takes_both_directions_and_rejects_noise():
     f = sections.parse_flow(LINE)
-    assert f == {"ts": 1794948045, "proto": "tcp", "src": "10.0.70.135", "dst": "95.213.56.4", "dport": 443,
+    assert f == {"ts": 1794948045, "start": None, "proto": "tcp", "src": "10.0.70.135", "dst": "95.213.56.4", "dport": 443,
                  "bytes_in": 3760, "bytes_out": 7852}
     # Without accounting the counters are missing: no bytes, not an error.
     bare = sections.parse_flow("[1794948045.1]\t[DESTROY] udp      17 src=10.0.70.2 dst=170.134.51.1 sport=1 dport=53 "
@@ -311,3 +311,40 @@ def test_the_router_is_checked_without_traffic_and_its_silence_is_an_event(tmp_p
     c.poll(now=T + 900)
     assert c.status["error"] is None and c.status["last_ok"] == T + 900
     assert kinds() == ["router_sections_down", "router_sections_up"]
+
+
+def test_a_connection_belongs_to_the_client_that_had_the_address_when_it_began(tmp_path):
+    """Guests get the lowest free address, so it changes hands at once; the kernel can forget a
+    connection of the one who left minutes later. delta-time (nf_conntrack_timestamp) tells them apart."""
+    f = sections.parse_flow(LINE + " delta-time=600")
+    assert f["start"] == f["ts"] - 600 and sections.parse_flow(LINE)["start"] is None
+    router = Router()
+    db, c = setup(router, tmp_path)
+    with db.tx() as conn:
+        conn.execute("DELETE FROM vpn_sessions")
+        for name, start, end in (("gone", T, T + 300), ("newcomer", T + 310, None)):
+            conn.execute("INSERT INTO vpn_sessions (client_name, cid, real_address, vpn_ip, connected_at, disconnected_at, "
+                         "last_seen) VALUES (?, 1, '203.0.113.5:1', '10.0.70.130', ?, ?, ?)", (name, start, end, end or T + 900))
+    with db.tx() as conn:
+        # ended at T+800, began at T+100: gone's connection, though newcomer holds the address now
+        assert c.client_at(conn, "10.0.70.130", T + 800, T + 100) == "gone"
+        assert c.client_at(conn, "10.0.70.130", T + 800, T + 400) == "newcomer"
+        assert c.client_at(conn, "10.0.70.130", T + 800) == "newcomer"        # no start known: as before
+
+
+def test_lines_written_before_a_rotation_are_read_from_the_copy(tmp_path):
+    router = Router(subnets=["149.154.160.0/20"])
+    db, c = setup(router, tmp_path)
+    log = tmp_path / "flows.log"
+    first = flow_line(T + 10, "10.0.70.2", "95.213.56.4", 1, 10) + flow_line(T + 11, "10.0.70.2", "95.213.56.4", 16, 160)
+    log.write_text(first)
+    c.poll(now=T + 100)
+    # two more lines, then the entrypoint's copy-and-truncate, then one new line
+    late = flow_line(T + 20, "10.0.70.2", "95.213.56.4", 2, 20) + flow_line(T + 30, "10.0.70.2", "95.213.56.4", 4, 40)
+    (tmp_path / "flows.log.1").write_text(first + late)
+    log.write_text(flow_line(T + 40, "10.0.70.2", "95.213.56.4", 8, 80))
+    c.poll(now=T + 200)
+    row = db.query("SELECT SUM(bytes_in) AS i, SUM(bytes_out) AS o, SUM(flows) AS n FROM section_traffic")[0]
+    assert (int(row["i"]), int(row["o"]), int(row["n"])) == (31, 310, 5)
+    c.poll(now=T + 300)                         # and nothing twice
+    assert int(db.query("SELECT SUM(flows) AS n FROM section_traffic")[0]["n"]) == 5

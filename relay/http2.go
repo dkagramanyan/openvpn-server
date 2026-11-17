@@ -58,7 +58,9 @@ func serveHTTP2Context(ctx context.Context, listener net.Listener, handler http.
 		ReadIdleTimeout: 10 * time.Second, PingTimeout: 5 * time.Second, WriteByteTimeout: 15 * time.Second,
 		// An upload cannot go faster than its stream window per round trip:
 		// 256 KB capped a phone at ~20 Mbit/s on a 100 ms path.
-		MaxUploadBufferPerConnection: 8 << 20, MaxUploadBufferPerStream: 2 << 20}
+		// The connection's window is 16 stream windows, as before: a few
+		// uploads to slow destinations must not stop the other flows.
+		MaxUploadBufferPerConnection: 32 << 20, MaxUploadBufferPerStream: 2 << 20}
 	protocolLogs := &transportLog{}
 	maxConnections := 128
 	if relay, ok := handler.(*relayServer); ok {
@@ -298,9 +300,11 @@ func (s *relayServer) proxyHTTP2UDP(w http.ResponseWriter, r *http.Request, conn
 			buffer := udpBuffers.Get().([]byte)
 			n, err := conn.Read(buffer[1:])
 			if err != nil {
+				udpBuffers.Put(buffer)
 				return
 			}
 			if n > maxUDPPayload {
+				udpBuffers.Put(buffer)
 				continue
 			}
 			_ = conn.SetReadDeadline(time.Now().Add(udpIdle))

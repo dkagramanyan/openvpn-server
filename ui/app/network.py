@@ -180,6 +180,27 @@ def with_defaults(data: dict, db=None) -> dict:
     return data
 
 
+def pushed_routes() -> list[str]:
+    """The IPv4 networks server.conf pushes as routes, as the OpenVPN firewall reads them:
+    without the two halves of a default route."""
+    routes = []
+    try:
+        lines = settings.server_conf.read_text().splitlines()
+    except OSError:
+        return routes
+    for line in lines:
+        try:
+            words = shlex.split(line, comments=True)
+            pushed = shlex.split(words[1]) if len(words) > 1 and words[0] == "push" else []
+            if pushed[:1] == ["route"] and len(pushed) > 1:
+                net = ipaddress.ip_network(pushed[1] + "/" + (pushed[2] if len(pushed) > 2 else "32"), strict=False)
+                if net.version == 4 and net.prefixlen > 1:
+                    routes.append(str(net))
+        except ValueError:
+            continue
+    return list(dict.fromkeys(routes))
+
+
 def from_server_conf() -> dict:
     """First-time settings: what server.conf and the environment say today."""
     subnet = pki.vpn_subnet()

@@ -27,7 +27,7 @@ from pydantic import BaseModel, Field
 
 from . import __version__, auth, backup, guest_check, pki, relay, relay_services, relay_history, sections, watchdog, network, network_discovery
 from .collector import Collector, Maintenance
-from .db import Database, HOUR_RETENTION, MINUTE_RETENTION, RELAY_FLOW_RETENTION, empty_point
+from .db import Database, HOUR_RETENTION, MINUTE_RETENTION, RELAY_FLOW_RETENTION, _TRAFFIC_UNION, empty_point
 from .mgmt import Management, ManagementError
 from .pki import PkiError
 from .portal_boundary import PortalBoundary
@@ -70,6 +70,7 @@ def bootstrap() -> None:
     if settings.db_path.exists() and db.get_setting("migration:legacy_sqlite") is None and db.get_setting("migration:postgres_dump") is None:
         raise RuntimeError("Legacy state needs migration: run bin/upgrade-relay.sh before starting this UI")
     migrate()
+    remember_pushed_routes()
     if db.one("SELECT 1 FROM users LIMIT 1") is None:
         password = settings.admin_password or secrets.token_urlsafe(12)
         db.execute("INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)",
@@ -90,6 +91,12 @@ def bootstrap() -> None:
             log.info("client profiles now list every protocol OpenVPN listens on")
     except PkiError as exc:
         log.error("cannot update the client profiles' address: %s", exc)
+
+
+def remember_pushed_routes() -> None:
+    """For the relay's policy service, which cannot read server.conf: the routes it pushes are closed
+    to guests there as in the OpenVPN firewall, also before the network settings were ever saved."""
+    db.set_setting("pushed_routes", json.dumps(network.pushed_routes()))
 
 
 def migrate() -> None:
@@ -450,8 +457,44 @@ def split(by_source: dict[str, tuple[int, int]]) -> dict[str, Any]:
             "bytes_out": sum(p["bytes_out"] for p in parts.values()), **parts}
 
 
-def clients_payload(period: Period | None = None) -> list[dict[str, Any]]:
+SPARK_POINTS = 24
+
+
+def client_sparks(start: int, end: int) -> dict[str, list[int]]:
+    """{client: bytes (both directions) in up to 24 equal steps of [start, end)}, one query for everyone."""
+    step = max(60, -(-(end - start) // SPARK_POINTS))
+    points = max(1, min(SPARK_POINTS, -(-(end - start) // step)))
+    out: dict[str, list[int]] = {}
+    for r in db.query(f"SELECT client_name, CAST((ts - ?) / ? AS INTEGER) AS b, SUM(bytes_in + bytes_out) AS n "
+                      f"FROM ({_TRAFFIC_UNION}) GROUP BY client_name, b", (start, step, *((start, end) * 3))):
+        if 0 <= r["b"] < points:
+            out.setdefault(r["client_name"], [0] * points)[r["b"]] = int(r["n"] or 0)
+    return out
+
+
+def client_top_sections(start: int, end: int) -> dict[str, dict[str, Any]]:
+    """{client: {"section", "share"}}: the podkop section with the most traffic in [start, end), as a share of
+    the client's counted traffic. Direct ('') and unknown ('?') only when the client has no named section."""
+    by_client: dict[str, dict[str, int]] = {}
+    for r in db.query("SELECT client_name, section, SUM(bytes_in + bytes_out) AS n FROM section_traffic "
+                      "WHERE ts >= ? AND ts < ? GROUP BY client_name, section", (start, end)):
+        by_client.setdefault(r["client_name"], {})[r["section"]] = int(r["n"] or 0)
+    out = {}
+    for name, parts in by_client.items():
+        total = sum(parts.values())
+        named = {k: v for k, v in parts.items() if k not in ("", "?") and v > 0}
+        pick = named or {k: v for k, v in parts.items() if v > 0}
+        if total > 0 and pick:
+            section = max(pick, key=lambda k: (pick[k], k))
+            out[name] = {"section": section, "share": round(pick[section] / total, 3)}
+    return out
+
+
+def clients_payload(period: Period | None = None, extras: bool = False) -> list[dict[str, Any]]:
+    """extras: the list page's sparkline and top section for the period (two more queries)."""
     period = period or Period("today", 0, None, None)
+    sparks = client_sparks(period.start, period.end) if extras else {}
+    top_sections = client_top_sections(period.start, period.end) if extras else {}
     certs = pki.list_clients(hidden_serials())
     statics = pki.static_ips()
     guests = pki.guests()
@@ -490,6 +533,8 @@ def clients_payload(period: Period | None = None) -> list[dict[str, Any]]:
             "online": bool(via),
             "online_via": via,
             "sessions_live": online.get(name, []),
+            # The oldest OpenVPN connection that is still open (the relay reports no start).
+            "online_since": min((x["connected_since"] for x in online.get(name, []) if x.get("connected_since")), default=None),
             "relay_live": relay_live.get(name),
             "traffic": split(traffic.get(name, {})),
             # All time. "sessions" = OpenVPN visits (reconnects merged) + relay sessions.
@@ -501,6 +546,7 @@ def clients_payload(period: Period | None = None) -> list[dict[str, Any]]:
                       "last_seen": max(seen) if seen else None, "first_seen": min(first) if first else None,
                       "online_seconds": t.get("online_seconds", 0)},
             "note": notes.get(name, ""),
+            **({"spark": sparks.get(name, []), "top_section": top_sections.get(name)} if extras else {}),
         })
     order = {"valid": 0, "expired": 1, "revoked": 2}
     rows.sort(key=lambda r: (not r["online"], order.get(r["state"], 3), r["name"].lower()))
@@ -810,7 +856,7 @@ async def stream(request: Request, user: dict[str, Any] = Authed):
 # -- clients ----------------------------------------------------------------------
 @app.get("/api/clients")
 def list_clients(period: Period = Depends(), user: dict[str, Any] = Authed):
-    return {**period.info(), "clients": clients_payload(period)}
+    return {**period.info(), "clients": clients_payload(period, extras=True)}
 
 
 @app.post("/api/clients", status_code=201, dependencies=[Csrf])
@@ -1340,6 +1386,7 @@ def put_config(which: str, body: ConfigBody, user: dict[str, Any] = Authed):
 def restart(user: dict[str, Any] = Authed):
     result = mgmt.signal("SIGTERM")
     event("server_restart", user, None, result)
+    remember_pushed_routes()      # the firewall reads server.conf again at this restart too
     return {"result": result, "note": "OpenVPN is restarting; clients reconnect automatically"}
 
 

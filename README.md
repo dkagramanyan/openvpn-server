@@ -302,8 +302,12 @@ Setup:
 
 1. On this server's host, turn on connection accounting (a host setting in
    host network mode, like IPv4 forwarding):
-   `sudo sysctl -w net.netfilter.nf_conntrack_acct=1`, and put
-   `net.netfilter.nf_conntrack_acct = 1` into `/etc/sysctl.d/99-openvpn.conf`.
+   `sudo sysctl -w net.netfilter.nf_conntrack_acct=1 net.netfilter.nf_conntrack_timestamp=1`,
+   and put `net.netfilter.nf_conntrack_acct = 1` and
+   `net.netfilter.nf_conntrack_timestamp = 1` into
+   `/etc/sysctl.d/99-openvpn.conf`. The first gives the byte counts; the second
+   says when each connection began, which tells apart two clients that had the
+   same VPN address one after the other.
    The OpenVPN container warns in its log while it is off.
 2. **Settings → Router**: enter the router's SSH address (`root@192.168.1.1`)
    and **Save**. The card then shows one command: paste it into the router's

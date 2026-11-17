@@ -98,7 +98,7 @@ docker compose run --rm --no-deps --entrypoint python openvpn-ui -m app.migrate_
 
 say "Start the service"
 # Connection accounting is a host setting: here the Docker-in-Docker container is the host.
-sysctl -q -w net.netfilter.nf_conntrack_acct=1
+sysctl -q -w net.netfilter.nf_conntrack_acct=1 net.netfilter.nf_conntrack_timestamp=1
 up
 docker exec openvpn-ui python -c "from app.main import db; assert db.get_setting('legacy-preserved') == 'yes'; assert db.get_setting('migration:legacy_sqlite')"
 docker exec openvpn iptables -t mangle -S OVPN-MSS | has 'set-mss 1400' || fail "no MSS clamp in the firewall"

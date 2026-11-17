@@ -152,45 +152,178 @@ function dashboardView(el) {
 }
 
 /* -------------------------------------------------------------- clients */
+// A small menu under a button; it lives in <body>, so a scrolling table cannot cut it off.
+function menuButton(label, items, cls) {
+  let menu = null;
+  const close = () => { if (menu) { menu.remove(); menu = null; document.removeEventListener('click', outside, true); window.removeEventListener('scroll', close, true); window.removeEventListener('resize', close); } };
+  const outside = e => { if (menu && !menu.contains(e.target) && !button.contains(e.target)) close(); };
+  const button = h('button', { class: 'btn ' + (cls || 'sm'), 'aria-haspopup': 'menu', onClick: () => {
+    if (menu) { close(); return; }
+    menu = h('div', { class: 'menu', role: 'menu', onClick: e => { if (e.target.closest('a,button')) setTimeout(close, 0); } }, items());
+    document.body.append(menu);
+    const r = button.getBoundingClientRect(), w = menu.offsetWidth, hgt = menu.offsetHeight;
+    menu.style.left = Math.max(8, Math.min(r.right - w, window.innerWidth - w - 8)) + 'px';
+    menu.style.top = (r.bottom + hgt + 8 > window.innerHeight && r.top - hgt - 4 > 0 ? r.top - hgt - 4 : r.bottom + 4) + 'px';
+    document.addEventListener('click', outside, true); window.addEventListener('scroll', close, true); window.addEventListener('resize', close);
+  } }, label);
+  return button;
+}
+// Traffic of the period in up to 24 steps (both directions together).
+function sparkline(values) {
+  const el = h('span', { class: 'spark' });
+  const max = Math.max(0, ...(values || []));
+  if (!max) { el.classList.add('flat'); el.title = 'No traffic in this period'; return el; }
+  const n = values.length, W = 96, H = 24, x = i => n === 1 ? W / 2 : 1 + i * (W - 2) / (n - 1), y = v => H - 2 - (H - 5) * v / max;
+  const points = values.map((v, i) => `${x(i).toFixed(1)},${y(Number(v) || 0).toFixed(1)}`);
+  if (n === 1) points.push(`${(W / 2 + 6).toFixed(1)},${y(values[0]).toFixed(1)}`), points.unshift(`${(W / 2 - 6).toFixed(1)},${y(values[0]).toFixed(1)}`);
+  el.innerHTML = `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" aria-hidden="true"><polygon class="area" points="${points[0].split(',')[0]},${H - 1} ${points.join(' ')} ${points[points.length - 1].split(',')[0]},${H - 1}"/><polyline class="line" points="${points.join(' ')}"/></svg>`;
+  el.title = `Peak ${fmtBytes(max)} per step`;
+  return el;
+}
 function clientsView(el) {
-  let rows = [], filter = 'all', search = '', sort = { key: 'default', asc: true };
+  const saved = (() => { try { return JSON.parse(localStorage.getItem('clients:view') || '{}') || {}; } catch (_) { return {}; } })();
+  const FILTERS = [['all', 'All'], ['online', 'Online'], ['vpn', 'On OpenVPN'], ['relay', 'On relay'], ['valid', 'Valid'], ['expiring', 'Expiring'], ['revoked', 'Revoked']];
+  const SORTS = ['default', 'name', 'expires', 'seen', 'dl', 'ul', 'sessions'];
+  let rows = [], search = '', showInactive = false;
+  let filter = FILTERS.some(f => f[0] === saved.filter) ? saved.filter : 'all';
+  let sort = saved.sort && SORTS.includes(saved.sort.key) ? { key: saved.sort.key, asc: !!saved.sort.asc } : { key: 'default', asc: true };
+  const selected = new Set();
+  const remember = () => { try { localStorage.setItem('clients:view', JSON.stringify({ filter, sort })); } catch (_) {} };
+  const phone = window.matchMedia('(max-width: 640px)');
   const table = h('div');
   const count = h('span');
+  const bulk = h('div', { class: 'bulk-bar', hidden: true });
   const searchIn = h('input', { class: 'input search', placeholder: 'Search clients…', onInput: e => { search = e.target.value.toLowerCase(); draw(); } });
   const filters = h('div', { class: 'seg' });
-  for (const [k, l] of [['all', 'All'], ['online', 'Online'], ['vpn', 'On OpenVPN'], ['relay', 'On relay'], ['valid', 'Valid'], ['expiring', 'Expiring'], ['revoked', 'Revoked']]) {
-    filters.append(h('button', { class: k === filter ? 'active' : '', onClick: e => { filter = k; filters.querySelectorAll('button').forEach(b => b.classList.toggle('active', b === e.currentTarget)); draw(); } }, l));
-  }
   el.append(topbar('Clients', count, searchIn, rangeControl(load), h('button', { class: 'btn primary', onClick: () => newClientDialog(load) }, icon('plus'), 'New client')),
-    h('div', { class: 'row', style: 'margin-bottom:12px' }, filters), h('section', { class: 'card' }, table));
+    h('div', { class: 'row', style: 'margin-bottom:12px' }, filters), bulk, h('section', { class: 'card' }, table));
+  const onPhone = () => { if (table.isConnected) draw(); else phone.removeEventListener('change', onPhone); };
+  phone.addEventListener('change', onPhone);
 
+  const matches = {
+    all: () => true, online: c => c.online, vpn: c => (c.online_via || []).includes('vpn'), relay: c => (c.online_via || []).includes('relay'),
+    valid: c => c.state === 'valid', expiring: c => c.state === 'valid' && c.days_left !== null && c.days_left < 30,
+    revoked: c => c.state === 'revoked' || c.state === 'expired' };
+  const inactive = c => c.state !== 'valid';
+  const enc = c => encodeURIComponent(c.name);
+
+  function drawFilters() {
+    filters.replaceChildren(...FILTERS.map(([k, l]) => {
+      const n = rows.filter(matches[k]).length;
+      return h('button', { class: k === filter ? 'active' : '', onClick: () => { filter = k; remember(); draw(); } }, l, k === 'all' ? null : h('span', { class: 'n' }, n));
+    }));
+  }
+  function activity(c) {
+    if (!c.online) return h('span', { title: c.total.last_seen ? 'Last seen ' + fmtDateTime(c.total.last_seen) : '' }, c.total.last_seen ? fmtAgo(c.total.last_seen) : 'never');
+    const via = c.online_via || [], tags = [];
+    if (via.includes('vpn')) {
+      const protos = [...new Set((c.sessions_live || []).map(s => s.proto).filter(Boolean))];
+      tags.push(h('span', { class: 'via-tag', title: `${(c.sessions_live || []).length} OpenVPN device(s) connected` }, 'OpenVPN' + (protos.length === 1 ? ' ' + protos[0] : '')));
+    }
+    if (via.includes('relay')) tags.push(h('span', { class: 'via-tag relay', title: c.relay_live ? `${fmtNum(c.relay_live.active)} open relay connections` : 'Apple relay' }, 'Relay'));
+    return h('span', { class: 'activity' }, h('span', { class: 'ink2' }, h('span', { class: 'dot-live' }),
+      c.online_since ? fmtDur(Date.now() / 1000 - c.online_since) : c.relay_live ? `${fmtNum(c.relay_live.active)} conn.` : 'now'), tags);
+  }
+  function badges(c) {
+    return h('div', { class: 'row', style: 'gap:6px' }, stateBadge(c), c.tfa ? h('span', { class: 'badge plain', title: 'Two-factor authentication enabled' }, '2FA') : null,
+      c.guest ? h('span', { class: 'subnet', title: 'Guest: internet and the personal portal, no LAN' }, 'guest') : c.static_ip ? h('span', { class: 'subnet', title: 'Static IP' }, c.static_ip) : null,
+      c.previous ? h('span', { class: 'badge plain expiring', title: 'Previous certificate still valid' }, 'renewed') : null);
+  }
+  function topSection(c) {
+    const t = c.top_section;
+    if (!t) return null;
+    return h('span', { class: 'split', title: 'The podkop section with the most traffic in this period' }, `${t.section === '' ? 'direct' : t.section === '?' ? 'section unknown' : t.section} ${Math.round(t.share * 100)}%`);
+  }
+  function download(c, cls) {
+    if (c.state !== 'valid') return null;
+    return menuButton([icon('download'), 'Download'], () => [
+      h('a', { class: 'btn', role: 'menuitem', href: `/api/clients/${enc(c)}/ovpn`, download: c.name + '.ovpn' }, icon('download'), 'OpenVPN config'),
+      relayButton(c),
+      h('button', { class: 'btn', role: 'menuitem', onClick: () => shareDialog(c.name) }, 'Share link…')], cls);
+  }
+  function check(c) {
+    return h('input', { type: 'checkbox', class: 'pick', checked: selected.has(c.name), 'aria-label': 'Select ' + c.name,
+      onChange: e => { if (e.target.checked) selected.add(c.name); else selected.delete(c.name); drawBulk(); const all = table.querySelector('.pick-all'); if (all) all.checked = false; } });
+  }
+  async function each(names, label, call) {
+    let done = 0; const failed = [];
+    table.classList.add('loading');
+    for (const name of names) {
+      try { await call(name); done++; } catch (e) { failed.push(`${name}: ${e.message}`); }
+    }
+    table.classList.remove('loading');
+    toast(failed.length ? `${label}: ${done} done, ${failed.length} failed (${failed[0]})` : `${label}: ${done} client${done === 1 ? '' : 's'}`, failed.length ? 'err' : 'ok');
+    selected.clear(); load();
+  }
+  function drawBulk() {
+    for (const name of [...selected]) if (!rows.some(c => c.name === name)) selected.delete(name);
+    const picked = rows.filter(c => selected.has(c.name));
+    bulk.hidden = !picked.length;
+    if (!picked.length) return;
+    const valid = picked.filter(c => c.state === 'valid'), live = picked.filter(c => c.state !== 'revoked');
+    const access = guest => async () => {
+      const list = valid.filter(c => c.guest !== guest).map(c => c.name);
+      if (!list.length) { toast(guest ? 'They are guests already' : 'They have full access already', 'ok'); return; }
+      if (await confirmDialog(guest ? 'Make guests' : 'Give full access', `${list.join(', ')}: ${guest ? 'the internet and the personal portal, no LAN' : 'the internet, your LAN and this server'}. Connected OpenVPN devices reconnect now, the relay follows within seconds.`, guest ? 'Make guests' : 'Give full access'))
+        each(list, 'Access changed', name => api(`/api/clients/${encodeURIComponent(name)}/access`, { method: 'PUT', body: { guest } }));
+    };
+    bulk.replaceChildren(h('strong', null, `${picked.length} selected`),
+      h('button', { class: 'btn sm', disabled: !valid.length, onClick: access(true) }, 'Make guest'),
+      h('button', { class: 'btn sm', disabled: !valid.length, onClick: access(false) }, 'Give full access'),
+      h('button', { class: 'btn sm danger', disabled: !live.length, onClick: async () => {
+        const list = live.map(c => c.name);
+        if (await confirmDialog('Revoke certificates', `${list.join(', ')} will be disconnected and can no longer connect, over OpenVPN or the relay. This cannot be undone.`, 'Revoke', true))
+          each(list, 'Revoked', name => api(`/api/clients/${encodeURIComponent(name)}/revoke`, { method: 'POST', body: {} }));
+      } }, 'Revoke'),
+      h('button', { class: 'btn sm ghost', onClick: () => { selected.clear(); draw(); } }, 'Clear'));
+  }
+
+  const show = (...nodes) => table.replaceChildren(...nodes.filter(Boolean));
   function draw() {
     const rl = rangeLabel(state.range);
+    drawFilters();
     let list = rows.filter(c => {
       if (search && !(c.name.toLowerCase().includes(search) || (c.note || '').toLowerCase().includes(search) || (c.static_ip || '').includes(search))) return false;
-      if (filter === 'online') return c.online;
-      if (filter === 'vpn' || filter === 'relay') return (c.online_via || []).includes(filter);
-      if (filter === 'valid') return c.state === 'valid';
-      if (filter === 'expiring') return c.state === 'valid' && c.days_left !== null && c.days_left < 30;
-      if (filter === 'revoked') return c.state === 'revoked' || c.state === 'expired';
-      return true;
+      return matches[filter](c);
     });
-    const key = { name: c => c.name.toLowerCase(), expires: c => c.expires || 0, seen: c => c.total.last_seen || 0, dl: c => c.traffic.bytes_out, ul: c => c.traffic.bytes_in, sessions: c => c.total.sessions }[sort.key];
+    const key = { name: c => c.name.toLowerCase(), expires: c => c.expires || 0, seen: c => c.online ? Infinity : c.total.last_seen || 0, dl: c => c.traffic.bytes_out, ul: c => c.traffic.bytes_in, sessions: c => c.total.sessions }[sort.key];
     if (key) list = list.slice().sort((a, b) => (key(a) > key(b) ? 1 : key(a) < key(b) ? -1 : 0) * (sort.asc ? 1 : -1));
+    // Revoked and expired clients wait under one line, unless they are what was asked for.
+    const fold = filter === 'all' && !search;
+    const hiddenCount = fold ? list.filter(inactive).length : 0;
+    if (fold && !showInactive) list = list.filter(c => !inactive(c));
+    else if (fold) list = list.filter(c => !inactive(c)).concat(list.filter(inactive));
     count.textContent = `${rows.filter(c => c.state === 'valid').length} valid · ${rows.filter(c => c.online).length} online · ${rows.filter(c => c.traffic.bytes_in + c.traffic.bytes_out > 0).length} with traffic ${rl === 'all' ? 'ever' : rl} · ${rows.length} total`;
-    const th = (label, k, cls) => h('th', { class: (cls || '') + (k ? ' sortable' : '') + (sort.key === k ? ' sorted' + (sort.asc ? ' asc' : '') : ''), onClick: k ? () => { sort = { key: k, asc: sort.key === k ? !sort.asc : k === 'name' }; draw(); } : null }, label);
-    if (!list.length) { table.replaceChildren(h('div', { class: 'empty' }, rows.length ? 'No clients match' : 'No clients yet - create the first one')); return; }
-    table.replaceChildren(h('div', { class: 'table-wrap' }, h('table', { class: 'tbl' },
-      h('thead', null, h('tr', null, th('Name', 'name'), th('Status'), th('Expires', 'expires'), th('Last seen', 'seen'), th('Download · ' + rl, 'dl', 'r'), th('Upload · ' + rl, 'ul', 'r'), th('Sessions', 'sessions', 'r'), h('th', null))),
-      h('tbody', null, list.map(c => h('tr', { class: 'clickable', onClick: e => { if (!e.target.closest('button,a')) go('#/clients/' + encodeURIComponent(c.name)); } },
+    drawBulk();
+    const more = hiddenCount ? h('button', { class: 'fold', onClick: () => { showInactive = !showInactive; draw(); } },
+      showInactive ? 'Hide revoked and expired' : `Show ${hiddenCount} inactive (revoked or expired)`) : null;
+    if (!list.length) { show(h('div', { class: 'empty' }, rows.length ? (more ? 'No active clients' : 'No clients match') : 'No clients yet - create the first one'), more); return; }
+    const open = c => e => { if (!e.target.closest('button,a,input,label')) go('#/clients/' + enc(c)); };
+    if (phone.matches) {
+      show(h('div', { class: 'client-cards' }, list.map(c => h('div', { class: 'client-card' + (inactive(c) ? ' inactive' : ''), onClick: open(c) },
+        h('div', { class: 'cc-h' }, check(c), h('div', { class: 'name-cell' }, c.name, c.note ? h('span', { class: 'sub' }, c.note) : null), download(c)),
+        h('div', { class: 'cc-b' }, badges(c), h('span', { class: 'small' }, activity(c))),
+        h('div', { class: 'cc-t' }, sparkline(c.spark),
+          h('span', { class: 'num', title: splitText(c.traffic, 'out') }, '↓ ' + fmtBytes(trafficOf(c.traffic, 'out'))),
+          h('span', { class: 'num', title: splitText(c.traffic, 'in') }, '↑ ' + fmtBytes(trafficOf(c.traffic, 'in'))), topSection(c))))), more);
+      return;
+    }
+    const th = (label, k, cls) => h('th', { class: (cls || '') + (k ? ' sortable' : '') + (sort.key === k ? ' sorted' + (sort.asc ? ' asc' : '') : ''), onClick: k ? () => { sort = { key: k, asc: sort.key === k ? !sort.asc : k === 'name' }; remember(); draw(); } : null }, label);
+    const pickAll = h('input', { type: 'checkbox', class: 'pick pick-all', 'aria-label': 'Select all shown', checked: list.length > 0 && list.every(c => selected.has(c.name)),
+      onChange: e => { list.forEach(c => e.target.checked ? selected.add(c.name) : selected.delete(c.name)); draw(); } });
+    show(h('div', { class: 'table-wrap' }, h('table', { class: 'tbl clients' },
+      h('thead', null, h('tr', null, h('th', { class: 'pick-cell' }, pickAll), th('Name', 'name'), th('Status'), th('Expires', 'expires'), th('Activity', 'seen'),
+        th('Traffic · ' + rl), th('Download', 'dl', 'r'), th('Upload', 'ul', 'r'), th('Sessions', 'sessions', 'r'), h('th', null))),
+      h('tbody', null, list.map(c => h('tr', { class: 'clickable' + (inactive(c) ? ' inactive' : '') + (selected.has(c.name) ? ' picked' : ''), onClick: open(c) },
+        h('td', { class: 'pick-cell' }, check(c)),
         h('td', { class: 'name-cell' }, c.name, c.note ? h('span', { class: 'sub' }, c.note) : null),
-        h('td', null, h('div', { class: 'row', style: 'gap:6px' }, stateBadge(c), c.tfa ? h('span', { class: 'badge plain', title: 'Two-factor authentication enabled' }, '2FA') : null, c.guest ? h('span', { class: 'subnet', title: 'Guest: internet and the personal portal, no LAN' }, 'guest') : c.static_ip ? h('span', { class: 'subnet', title: 'Static IP' }, c.static_ip) : null, c.previous ? h('span', { class: 'badge plain expiring', title: 'Previous certificate still valid' }, 'renewed') : null)),
+        h('td', null, badges(c)),
         h('td', { class: 'num' }, c.expires ? [fmtDate(c.expires), h('span', { class: 'muted small' }, ' · ' + fmtDays(c.days_left))] : '—'),
-        h('td', null, c.online ? h('span', { class: 'ink2' }, 'now') : fmtAgo(c.total.last_seen)),
+        h('td', null, activity(c)),
+        h('td', { class: 'spark-cell' }, sparkline(c.spark), topSection(c)),
         trafficCell(c.traffic, 'out'), trafficCell(c.traffic, 'in'),
         h('td', { class: 'r num', title: `All time: ${fmtNum(c.total.vpn_visits)} OpenVPN visits (${fmtNum(c.total.vpn_connections)} connections) · ${fmtNum(c.total.relay_sessions)} relay sessions` }, fmtNum(c.total.sessions)),
-        h('td', { class: 'actions' }, c.state === 'valid' ? h('a', { class: 'btn sm', href: `/api/clients/${encodeURIComponent(c.name)}/ovpn`, download: c.name + '.ovpn', title: 'Download OpenVPN config' }, icon('download'), 'OpenVPN') : null,
-          c.state === 'valid' ? relayButton(c, true) : null)))))));
+        h('td', { class: 'actions' }, download(c))))))), more);
   }
   async function load() {
     table.classList.add('loading');

@@ -41,6 +41,8 @@ class Settings:
         self.tfa_issuer = _env("OVPN_TFA_ISSUER", "OpenVPN").strip() or "OpenVPN"
         self._guest_sub = _env("GUEST_SUB", "").strip()
         self.relay_transport = _env("OVPN_RELAY_TRANSPORT", "http2").strip().lower()
+        if self.relay_transport == "both":      # the relay's own older word for it
+            self.relay_transport = "http2+http3"
         if self.relay_transport not in ("http2", "http3", "http2+http3"):
             raise ValueError("OVPN_RELAY_TRANSPORT must be http2, http3 or http2+http3")
         self.relay_signer_url = _env("OVPN_RELAY_SIGNER_URL", "").strip()

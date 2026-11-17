@@ -43,6 +43,7 @@ PENDING_MAX_AGE = 3600         # unanswered for an hour: counted as "section unk
 SUBNETS_MAX_AGE = 3600         # the router's address lists are fetched again after an hour
 CHECK_SECONDS = 300            # the router is asked at least this often, traffic or not
 SESSION_SLACK = 600            # a connection may end this long after its VPN session
+START_SLACK = 120              # ... and its start is known (delta-time): the session's last sighting may lag this much
 KEY_COMMENT = "openvpn-server-sections"
 HOST_RX = re.compile(r"^[A-Za-z0-9_](?:[A-Za-z0-9_.-]{0,251}[A-Za-z0-9_])?$")
 
@@ -217,7 +218,11 @@ def parse_flow(line: str) -> dict[str, Any] | None:
         down = int(counts[1]) if len(counts) > 1 else 0
     except ValueError:
         return None
-    return {"ts": int(m[1]), "proto": proto[1] if proto else "", "src": src[0], "dst": dst[0],
+    # With net.netfilter.nf_conntrack_timestamp=1 the line says how long the connection lived.
+    age = [f[11:] for f in fields if f.startswith("delta-time=")]
+    ts = int(m[1])
+    return {"ts": ts, "start": ts - int(age[0]) if age and age[0].isdigit() else None,
+            "proto": proto[1] if proto else "", "src": src[0], "dst": dst[0],
             "dport": int(dport[0]) if dport and dport[0].isdigit() else 0, "bytes_in": up, "bytes_out": down}
 
 
@@ -241,40 +246,50 @@ class SectionCollector(threading.Thread):
                                        "agent": None}
 
     # ---- intake
-    def client_at(self, conn, vpn_ip: str, ts: int) -> str | None:
-        """The client that had this VPN address when the connection ended."""
+    def client_at(self, conn, vpn_ip: str, ts: int, start: int | None = None) -> str | None:
+        """The client that had this VPN address when the connection began. An address is given to
+        the next client at once, and a connection can be forgotten by the kernel long after its
+        client left, so the start is what tells them apart. Without it (no connection timestamps
+        on the host): the client that had the address when the connection ended."""
+        when, slack = (start, START_SLACK) if start is not None else (ts, SESSION_SLACK)
         row = conn.execute(
             "SELECT client_name FROM vpn_sessions WHERE vpn_ip = ? AND connected_at <= ? "
             "AND COALESCE(disconnected_at, last_seen) + ? >= ? ORDER BY connected_at DESC, id DESC LIMIT 1",
-            (vpn_ip, ts, SESSION_SLACK, ts)).fetchone()
+            (vpn_ip, when + (5 if start is not None else 0), slack, when)).fetchone()
         return row["client_name"] if row else None
 
     def read_vpn(self, max_bytes: int = 4 << 20, now: int | None = None) -> int:
         """New lines of log/flows.log into section_pending. The position (inode and offset) is saved
         with them; a truncated or replaced file is read from its start."""
         now = int(time.time()) if now is None else now
+        tail = b""
         try:
             with open(self.flows_log, "rb") as fh:
                 st = os.fstat(fh.fileno())
                 inode, _, offset = (self.db.get_setting("logpos:flows.log") or "0:0").partition(":")
                 pos = int(offset) if int(inode) == st.st_ino and int(offset) <= st.st_size else 0
+                if pos == 0 and int(inode) == st.st_ino and int(offset) > st.st_size:
+                    tail = self._rotated_tail(int(offset), max_bytes)     # cut since the last look
                 fh.seek(pos)
                 data = fh.read(max_bytes)
         except (OSError, ValueError):
             return 0
         end = data.rfind(b"\n") + 1
-        if not end:
+        if not end and not tail:
             return 0
+        data = tail + data[:end]
+        end_pos = pos + end
         added = 0
         with self.db.tx() as conn:
             cache: dict[tuple[str, int], str | None] = {}
-            for line in data[:end].decode("utf-8", "replace").splitlines():
+            for line in data.decode("utf-8", "replace").splitlines():
                 flow = parse_flow(line)
                 if not flow or (flow["bytes_in"] == 0 and flow["bytes_out"] == 0):
                     continue
-                key = (flow["src"], flow["ts"] // 60)
+                when = flow["start"] if flow["start"] is not None else flow["ts"]
+                key = (flow["src"], when // 60, flow["start"] is None)
                 if key not in cache:
-                    cache[key] = self.client_at(conn, flow["src"], flow["ts"])
+                    cache[key] = self.client_at(conn, flow["src"], flow["ts"], flow["start"])
                 client = cache[key]
                 if client is None:
                     self.status["unmapped"] += 1
@@ -284,8 +299,20 @@ class SectionCollector(threading.Thread):
                              (flow["ts"], client, flow["dst"], flow["bytes_in"], flow["bytes_out"], now))
                 added += 1
             conn.execute("INSERT INTO settings (key, value) VALUES ('logpos:flows.log', ?) ON CONFLICT(key) DO UPDATE "
-                         "SET value = excluded.value", (f"{st.st_ino}:{pos + end}",))
+                         "SET value = excluded.value", (f"{st.st_ino}:{end_pos}",))
         return added
+
+    def _rotated_tail(self, offset: int, max_bytes: int) -> bytes:
+        """The log was copied to flows.log.1 and emptied: the lines written after the last look are there."""
+        try:
+            with open(str(self.flows_log) + ".1", "rb") as fh:
+                if os.fstat(fh.fileno()).st_size < offset:
+                    return b""
+                fh.seek(offset)
+                data = fh.read(max_bytes)
+        except OSError:
+            return b""
+        return data[:data.rfind(b"\n") + 1]
 
     def read_relay(self, limit: int = 5000, now: int | None = None) -> int:
         """Finished relay connections with traffic into section_pending, once each."""

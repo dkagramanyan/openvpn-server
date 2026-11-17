@@ -121,6 +121,9 @@ const udpIdle = 2 * time.Minute
 func (s *relayServer) proxyHTTP3UDP(ctx context.Context, w http.ResponseWriter, conn *net.UDPConn,
 	token string, addr netip.Addr, origin string) {
 	flow := flowFrom(ctx)
+	// Before HTTPStream: taking the stream sends the response headers.
+	w.Header().Set(http3.CapsuleProtocolHeader, "?1")
+	w.WriteHeader(http.StatusOK)
 	stream := w.(http3.HTTPStreamer).HTTPStream()
 	var once sync.Once
 	closeFlow := func() {
@@ -131,9 +134,8 @@ func (s *relayServer) proxyHTTP3UDP(ctx context.Context, w http.ResponseWriter, 
 		})
 	}
 	defer closeFlow()
-	w.Header().Set(http3.CapsuleProtocolHeader, "?1")
-	w.WriteHeader(http.StatusOK)
 	go s.watch(ctx, token, addr, origin, closeFlow)
+	_ = conn.SetReadBuffer(1 << 20) // a download burst, as on HTTP/2
 	_ = conn.SetReadDeadline(time.Now().Add(udpIdle))
 	var wg sync.WaitGroup
 	wg.Add(2)

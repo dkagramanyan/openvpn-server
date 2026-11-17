@@ -138,6 +138,9 @@ func TestHTTP2AndHTTP3TogetherWithOneCredential(t *testing.T) {
 		t.Fatalf("HTTP/3 UDP: %v (%v)", err, response)
 	}
 	defer flow.Close()
+	if response.Header.Get(http3.CapsuleProtocolHeader) != "?1" {
+		t.Errorf("HTTP/3 CONNECT-UDP answered without Capsule-Protocol: %v", response.Header)
+	}
 	flow.SetDeadline(time.Now().Add(3 * time.Second))
 	payload := make([]byte, 1000)
 	for range 3 {

@@ -120,7 +120,7 @@ def test_guest_relay_policy_is_internet_without_lan(config, monkeypatch):
     monkeypatch.setattr(relay, "is_guest", lambda name: guest["value"])
     db = SavedSettings(apple_relay={"enabled": True, "url": "https://relay.example.test"}, **{"relay_client:alice": {"secret": "token", "serial": "01"}})
     policy = relay.authorize(db, "Bearer alice:token")
-    assert policy["guest"] and policy["allowed_cidrs"] == ["0.0.0.0/0", "::/0"]
+    assert policy["guest"] and policy["allowed_cidrs"] == ["0.0.0.0/0"]
     assert policy["blocked_cidrs"] == ["203.0.113.0/24"]   # the relay adds private ranges and its own networks
     assert policy["portal"] == {"host": "vpn.example.test", "target": "192.0.2.10:9443", "hosts": []}
     guest["value"] = False
@@ -245,3 +245,19 @@ def test_invalid_guest_links_are_refused(config, url):
     config["gateway"]["guest_links"] = [{"url": url}]
     with pytest.raises(pki.PkiError, match="Guest link"):
         network.save_settings(network.NetworkSettings(**config))
+
+
+def test_pushed_routes_are_closed_to_relay_guests_before_the_settings_were_ever_saved(config, monkeypatch, tmp_path):
+    """The OpenVPN firewall reads the routes from server.conf; the policy service cannot, so the UI
+    leaves them in the database for it."""
+    from app import relay
+    conf = tmp_path / "server.conf"
+    conf.write_text('push "route 171.134.51.0 255.255.255.0"\npush "route 198.51.100.4"\n'
+                    'push "route 0.0.0.0 128.0.0.0"\npush "route bogus 255.0.0.0"\n# push "route 10.9.0.0 255.255.0.0"\n')
+    monkeypatch.setattr(network.settings, "server_conf", conf)
+    assert network.pushed_routes() == ["171.134.51.0/24", "198.51.100.4/32"]
+    monkeypatch.setattr(relay.settings, "read_network", lambda: {})
+    db = SavedSettings(pushed_routes=network.pushed_routes())
+    assert relay.guest_routes(db) == ["171.134.51.0/24", "198.51.100.4/32"]
+    monkeypatch.setattr(relay.settings, "read_network", lambda: {"routes": ["203.0.113.0/24"]})
+    assert relay.guest_routes(db) == ["203.0.113.0/24"]          # saved settings win: server.conf follows them

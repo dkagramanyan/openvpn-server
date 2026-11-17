@@ -29,7 +29,29 @@ type policy struct {
 }
 
 // Private, shared and this host's own networks: never reachable for guests.
-var guestBlocked = append([]netip.Prefix{netip.MustParsePrefix("100.64.0.0/10")}, hostNetworks()...)
+// The host's networks are read again every half a minute: an interface that
+// comes up or is renumbered after the relay started counts too.
+var sharedRange = netip.MustParsePrefix("100.64.0.0/10")
+
+var hostNets struct {
+	sync.Mutex
+	prefixes []netip.Prefix
+	read     time.Time
+}
+
+func guestBlocked() []netip.Prefix {
+	hostNets.Lock()
+	defer hostNets.Unlock()
+	if time.Since(hostNets.read) > 30*time.Second {
+		hostNets.prefixes = append([]netip.Prefix{sharedRange}, hostNetworks()...)
+		hostNets.read = time.Now()
+	}
+	return hostNets.prefixes
+}
+
+// Never a destination, for anyone: limited broadcast and the reserved class E
+// (a UDP socket would send a LAN broadcast), "this network".
+var neverRouted = []netip.Prefix{netip.MustParsePrefix("240.0.0.0/4"), netip.MustParsePrefix("0.0.0.0/8")}
 
 func hostNetworks() []netip.Prefix {
 	var prefixes []netip.Prefix
@@ -48,7 +70,7 @@ func localForGuests(addr netip.Addr, extra []netip.Prefix) bool {
 	if addr.IsPrivate() {
 		return true
 	}
-	for _, prefixes := range [][]netip.Prefix{guestBlocked, extra} {
+	for _, prefixes := range [][]netip.Prefix{guestBlocked(), extra} {
 		for _, prefix := range prefixes {
 			if prefix.Contains(addr) {
 				return true
@@ -95,6 +117,11 @@ func (p policy) allows(addr netip.Addr) bool {
 	addr = addr.Unmap()
 	if addr.IsLoopback() || addr.IsUnspecified() || addr.IsMulticast() || addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() {
 		return false
+	}
+	for _, prefix := range neverRouted {
+		if prefix.Contains(addr) {
+			return false
+		}
 	}
 	if p.Guest && localForGuests(addr, p.blockedPrefixes) {
 		return false

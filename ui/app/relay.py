@@ -167,6 +167,15 @@ def renewed(db, name, previous_serial):
                 conn.execute("UPDATE settings SET value = ? WHERE key = ?", (json.dumps(grant), key))
 
 
+def guest_routes(db) -> list[str]:
+    """The networks the VPN pushes: closed to guests, as in the OpenVPN firewall. From the saved
+    network settings, or, while those were never saved, what the UI read from server.conf."""
+    network_settings = settings.read_network()
+    if "routes" in network_settings:
+        return network_settings["routes"]
+    return json.loads(db.get_setting("pushed_routes") or "[]")
+
+
 def authorize(db, authorization: str, *, strict_state: bool = False) -> dict | None:
     if not authorization.startswith("Bearer ") or len(authorization) > 512:
         return None
@@ -186,7 +195,7 @@ def authorize(db, authorization: str, *, strict_state: bool = False) -> dict | N
         return None
     try:
         portal = network.guest_portal() if guest else None
-        routes = settings.read_network().get("routes", []) if guest else []
+        routes = guest_routes(db) if guest else []
     except (OSError, ValueError):
         if strict_state:
             raise   # the policy service answers 503: state unavailable, not "denied"
@@ -195,5 +204,7 @@ def authorize(db, authorization: str, *, strict_state: bool = False) -> dict | N
     # (the relay also refuses private ranges and its host's own networks) and
     # the personal portal, which the relay pins to the gateway's portal listener.
     return {"client": name, "credential_id": hashlib.sha256(grant["secret"].encode()).hexdigest(),
-            "guest": guest, "url": config["url"], "allowed_cidrs": ["0.0.0.0/0", "::/0"],
+            "guest": guest, "url": config["url"],
+            # OpenVPN carries no IPv6 for anyone and the guest rules are IPv4: a guest gets none here either.
+            "allowed_cidrs": ["0.0.0.0/0"] if guest else ["0.0.0.0/0", "::/0"],
             "blocked_cidrs": routes, "portal": portal}

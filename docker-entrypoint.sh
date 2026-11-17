@@ -313,10 +313,16 @@ rotate_flows() {
 FLOW_PID=
 start_flow_log() {
     command -v conntrack >/dev/null || return 0
-    sysctl -q -w net.netfilter.nf_conntrack_acct=1 2>/dev/null || true
+    sysctl -q -w net.netfilter.nf_conntrack_acct=1 net.netfilter.nf_conntrack_timestamp=1 2>/dev/null || true
     if [[ $(cat /proc/sys/net/netfilter/nf_conntrack_acct 2>/dev/null) != 1 ]]; then
         warn "Connection accounting is off, so traffic by section has no byte counts. On the host:
       sudo sysctl -w net.netfilter.nf_conntrack_acct=1   (persist it: net.netfilter.nf_conntrack_acct = 1 in /etc/sysctl.d/99-openvpn.conf)"
+    fi
+    # With timestamps a line says when its connection began: that tells two clients apart
+    # who had the same VPN address one after the other.
+    if [[ $(cat /proc/sys/net/netfilter/nf_conntrack_timestamp 2>/dev/null) != 1 ]]; then
+        warn "Connection timestamps are off: traffic by section may go to the next client that got the same VPN address. On the host:
+      sudo sysctl -w net.netfilter.nf_conntrack_timestamp=1   (persist it next to nf_conntrack_acct)"
     fi
     local net mask
     net=$(sed -n 's/^[[:space:]]*server[[:space:]]\+\([0-9.]\+\)[[:space:]].*/\1/p' "$SERVER_CONF" | head -1)

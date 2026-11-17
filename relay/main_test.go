@@ -41,7 +41,8 @@ func TestDestinationPolicy(t *testing.T) {
 			t.Errorf("full access denied internet or LAN destination %s", ip)
 		}
 	}
-	for _, ip := range []string{"127.0.0.1", "::1", "::ffff:127.0.0.1", "0.0.0.0", "::", "169.254.169.254", "fe80::1", "224.0.0.1", "ff02::1"} {
+	for _, ip := range []string{"127.0.0.1", "::1", "::ffff:127.0.0.1", "0.0.0.0", "::", "169.254.169.254", "fe80::1", "224.0.0.1", "ff02::1",
+		"255.255.255.255", "240.0.0.1", "0.1.2.3", "::ffff:255.255.255.255"} {
 		if p.allows(netip.MustParseAddr(ip)) {
 			t.Errorf("allowed special address %s", ip)
 		}

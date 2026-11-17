@@ -759,7 +759,7 @@ def test_guest_and_non_guest_relay_profiles(client, configured, guest_portal):
         assert profile["PayloadContent"][0]["MatchDomains"] == []
         assert "Guest" in profile["PayloadDisplayName"] and "without your local network" in profile["PayloadDescription"]
         policy = client.post("/api/relay/authorize", headers={"Authorization": guest_token}).json()
-        assert policy["guest"] is True and policy["allowed_cidrs"] == ["0.0.0.0/0", "::/0"] and policy["portal"] == guest_portal
+        assert policy["guest"] is True and policy["allowed_cidrs"] == ["0.0.0.0/0"] and policy["portal"] == guest_portal
         assert client.get("/api/clients/alice").json()["relay_available"]
         # Saving the unchanged role must not invalidate a working profile.
         client.put("/api/clients/alice/access", json={"guest": True}, headers=H)

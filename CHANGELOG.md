@@ -1,7 +1,7 @@
 <!-- Network addresses in examples are synthetic; deployment-specific notes are omitted. -->
 # Changelog
 
-## 2.4.0 - unreleased
+## 2.4.0 - 2026-11-18
 
 ### Traffic by podkop section
 * For each client, OpenVPN and Apple relay traffic per podkop section of the
@@ -19,11 +19,49 @@
   address ranges. The router going silent and coming back are events, and the
   traffic cards say so while it is silent.
 
+### Clients page
+* One **Download** button per client with a menu (OpenVPN config, Apple
+  relay, share link).
+* A traffic sparkline and the client's top podkop section for the period.
+* **Activity**: how long an online client is connected and through what; the
+  last sighting for the others.
+* Filters show their counts; the filter and the sort are remembered.
+* Revoked and expired clients are folded under "Show N inactive".
+* Select several clients to make them guests, give full access or revoke
+  them at once.
+* Cards instead of a table on a phone.
+
 ### Access
 * Changing a client between guest and full access now applies to OpenVPN at
   once, as it already did to the relay: connected devices are reconnected
   and get an address from the other range. Before, an OpenVPN device kept its
   old access until it reconnected by itself.
+
+* The same guest rules on both ways in, where they differed:
+  * relay guests get no IPv6, as OpenVPN guests never did (the guest rules
+    are IPv4);
+  * the routes `server.conf` pushes are closed to relay guests also before
+    the network settings were ever saved;
+  * the relay reads its host's networks again every half a minute, not only
+    when it starts;
+  * nobody reaches the limited broadcast address, 240.0.0.0/4 or 0.0.0.0/8
+    through the relay.
+
+### Fixes after a review
+* Traffic by section went to the next client that got the same VPN address
+  when a connection of the previous one was forgotten by the kernel later.
+  With `net.netfilter.nf_conntrack_timestamp=1` on the host (the container
+  tries to set it and warns otherwise) a connection belongs to the client
+  that had the address when it began.
+* Connections written to `log/flows.log` just before its rotation are no
+  longer lost.
+* Relay, HTTP/2: the connection's upload window is 16 stream windows again
+  (32 MB): four uploads to slow destinations could hold every other upload
+  of the same device.
+* Relay, HTTP/3: the answer to CONNECT-UDP carries `Capsule-Protocol: ?1`
+  as on HTTP/2; the UDP socket gets the same 1 MB read buffer.
+* `APPLE_RELAY_TRANSPORT=both`, which the relay accepts, no longer keeps the
+  UI from starting.
 
 ## 2.3.0 - 2026-11-18
 
