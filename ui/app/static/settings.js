@@ -24,7 +24,6 @@ function networkSettingsCard(saved, relay, general) {
   });
   const relayEnabled = h('input', { type: 'checkbox', checked: relay.enabled });
   const relayURL = text(relay.url || gw.relay_public_url);
-  const relayHTTP3 = h('input', { type: 'checkbox', checked: !!relay.http3 });
   const relayHTTP3State = h('span', null, 'Checking whether the relay accepts HTTP/3…');
   api('/api/relay/status').then(status => {
     const open = status.transports ? status.transports.http3 : status.transport === 'http3';
@@ -114,7 +113,7 @@ function networkSettingsCard(saved, relay, general) {
         portal_listener: portal.value.trim(), trusted_cidrs: parseList(trusted.value), guest_links: links.collect(),
         ...services.collect(),
       },
-      relay: { enabled: relayEnabled.checked, url: relayOrigin, http3: relayHTTP3.checked },
+      relay: { enabled: relayEnabled.checked, url: relayOrigin },
       remote: profileHost ? { host: profileHost, ports: Object.fromEntries(vpnPorts.map(p => [p.proto, Number(p.input.value)])) } : null,
     };
   };
@@ -180,8 +179,8 @@ function networkSettingsCard(saved, relay, general) {
         h('div', { class: 'form cols' }, ...vpnPorts.map(portField)),
         field('Apple relay URL', relayURL, 'Clients connect here; the gateway forwards it to this server.'),
         h('label', { class: 'check' }, relayEnabled, 'Offer Apple relay profiles'),
-        h('div', { class: 'full field' }, h('label', { class: 'check' }, relayHTTP3, 'Add HTTP/3 to new Apple relay profiles'),
-        h('div', { class: 'help' }, 'New profiles then carry the relay address for HTTP/3 (UDP, straight to this server) next to HTTP/2, which stays as the fallback. It needs the relay\'s UDP port forwarded from the router to this server and the relay hostname\'s certificate on this server. Installed profiles are not changed and keep working over HTTP/2. Try a new profile on one device first. ', relayHTTP3State)))),
+        h('div', { class: 'full field' }, h('strong', null, 'HTTP/3'),
+          h('div', { class: 'help' }, 'Every relay profile carries the relay address for HTTP/3 (UDP, straight to this server) next to HTTP/2 (TCP, through the gateway), which stays as the fallback. HTTP/3 needs the relay\'s UDP port forwarded from the router to this server and the relay hostname\'s certificate on this server. Profiles installed before 2.4.1 keep working over HTTP/2; download them again for HTTP/3. ', relayHTTP3State)))),
     section('Guests', null,
       h('p', null, 'Guests of OpenVPN and the Apple relay get the internet through your network (with its filtering) but no LAN access. Of your websites they can open only their personal portal, ',
         portalPage, ', to change their password and download their profiles, and the guest links below.'),

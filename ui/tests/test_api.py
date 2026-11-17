@@ -1270,15 +1270,17 @@ def test_calendar_periods_reach_every_period_endpoint(client):
     assert client.get("/api/traffic?range=bogus").status_code == 400
 
 
-def test_http3_setting_adds_a_second_address_and_installed_profiles_keep_working(client, configured, monkeypatch):
+def test_http3_is_in_every_profile_when_the_relay_serves_it_and_installed_profiles_keep_working(client, configured, monkeypatch):
     from app.settings import settings
-    assert configured["http3"] is False
+    monkeypatch.setattr(settings, "relay_transport", "http2")
     before = client.post("/api/clients/alice/relay.mobileconfig", headers=H).content
     profile, token = download(client)
     endpoint = profile["PayloadContent"][0]["Relays"][0]
-    assert list(endpoint) == ["HTTP2RelayURL", "AdditionalHTTPHeaderFields"]      # exactly the profile of 2.2
-    response = client.put("/api/relay/settings", json={**configured, "http3": True}, headers=H)
-    assert response.status_code == 200 and response.json()["http3"] is True
+    assert list(endpoint) == ["HTTP2RelayURL", "AdditionalHTTPHeaderFields"]      # an HTTP/2-only relay: 2.2's profile
+    assert client.get("/api/relay/settings").json()["http3"] is False
+    # The relay serves both (the default): every profile carries HTTP/3 first, HTTP/2 as the fallback.
+    monkeypatch.setattr(settings, "relay_transport", "http2+http3")
+    assert client.get("/api/relay/settings").json()["http3"] is True
     dual, dual_token = download(client)
     both = dual["PayloadContent"][0]["Relays"][0]
     assert list(both) == ["HTTP3RelayURL", "HTTP2RelayURL", "AdditionalHTTPHeaderFields"]
@@ -1286,19 +1288,14 @@ def test_http3_setting_adds_a_second_address_and_installed_profiles_keep_working
     assert dual_token == token                                                     # the installed credential
     for key in ("PayloadIdentifier", "PayloadUUID"):
         assert dual[key] == profile[key] and dual["PayloadContent"][0][key] == profile["PayloadContent"][0][key]
-    # The profile installed before the change still authorizes, and the policy is what it was.
+    # The old switch, saved off by 2.3, no longer takes HTTP/3 out.
+    db.set_setting("apple_relay", json.dumps({"enabled": True, "url": configured["url"], "http3": False}))
+    assert list(download(client)[0]["PayloadContent"][0]["Relays"][0])[0] == "HTTP3RelayURL"
+    # The profile installed before still authorizes, and the policy is what it was.
     policy = client.post("/api/relay/authorize", headers={"Authorization": token}).json()
     assert policy["client"] == "alice" and policy["url"] == configured["url"]
-    # A service that runs both transports does not change the profiles by itself.
-    monkeypatch.setattr(settings, "relay_transport", "http2+http3")
-    assert list(download(client)[0]["PayloadContent"][0]["Relays"][0])[0] == "HTTP3RelayURL"
-    assert client.put("/api/relay/settings", json={**configured, "http3": False}, headers=H).json()["http3"] is False
+    monkeypatch.setattr(settings, "relay_transport", "http2")
     assert client.post("/api/clients/alice/relay.mobileconfig", headers=H).content == before
-    # Settings saved by 2.2 have no "http3": off, and the credential issued then still works.
-    db.set_setting("apple_relay", json.dumps({"enabled": True, "url": configured["url"]}))
-    assert client.get("/api/relay/settings").json()["http3"] is False
-    assert client.post("/api/clients/alice/relay.mobileconfig", headers=H).content == before
-    assert client.post("/api/relay/authorize", headers={"Authorization": token}).status_code == 200
 
 
 def test_portal_sees_only_its_own_saved_relay_connections(client, configured, portal, monkeypatch):

@@ -24,13 +24,14 @@ from .relay_services import sign_profile
 class RelaySettings(BaseModel):
     enabled: bool = False
     url: str = Field(default="", max_length=2048)
-    # New profiles also carry the HTTP/3 address of the same origin (HTTP/2 stays as fallback).
+    # Kept so that settings saved by 2.3 still load; since 2.4.1 every profile carries HTTP/3
+    # whenever the relay serves it (APPLE_RELAY_TRANSPORT), and this value is ignored.
     http3: bool = False
 
 
 def get_settings(db) -> dict:
     config = RelaySettings(**json.loads(db.get_setting("apple_relay", "{}"))).model_dump()
-    return {**config, "transport": settings.relay_transport}
+    return {**config, "http3": "http3" in settings.relay_transport, "transport": settings.relay_transport}
 
 
 def validate_url(url: str) -> str:
@@ -134,11 +135,11 @@ def profile(db, name: str) -> bytes:
     title = ("Guest Relay · " if guest else "Full Access Relay · ") + name
     relay = payload("com.apple.relay.managed", ".relay", title)
     template = config["url"] + "/.well-known/masque/udp/{target_host}/{target_port}/"
-    # A service that speaks only HTTP/3 keeps its HTTP/3-only profiles. Otherwise HTTP/2 is the
-    # address every installed profile uses; "http3" adds the same origin over HTTP/3 next to it.
+    # HTTP/3 (UDP, straight to this server) whenever the relay serves it, with HTTP/2 (through the
+    # gateway) as the fallback; one origin, one credential, so installed profiles keep working.
     if config["transport"] == "http3":
         urls = {"HTTP3RelayURL": template}
-    elif config.get("http3"):
+    elif "http3" in config["transport"]:
         urls = {"HTTP3RelayURL": template, "HTTP2RelayURL": template}
     else:
         urls = {"HTTP2RelayURL": template}

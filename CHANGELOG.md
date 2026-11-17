@@ -1,6 +1,18 @@
 <!-- Network addresses in examples are synthetic; deployment-specific notes are omitted. -->
 # Changelog
 
+## 2.4.1 - 2026-11-18
+
+* **HTTP/3 always on.** Every Apple relay profile now carries the HTTP/3
+  address (UDP, straight to this server) next to HTTP/2 (through the
+  gateway) whenever the relay serves HTTP/3, which is the default
+  (`APPLE_RELAY_TRANSPORT=http2+http3`). The "Add HTTP/3 to new Apple relay
+  profiles" switch is gone; Settings → Network shows whether the HTTP/3
+  listener is open. One address and one credential: profiles installed
+  before keep working over HTTP/2, and a device gets HTTP/3 when its profile
+  is downloaded again. HTTP/3 needs UDP 8443 forwarded from the router to
+  this server.
+
 ## 2.4.0 - 2026-11-18
 
 ### Traffic by podkop section

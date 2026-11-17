@@ -266,10 +266,11 @@ things from you:
    HTTP/3 fault never stops HTTP/2.
 2. **UDP 8443 forwarded from the router to this server** (TCP 8443 stays on
    the gateway). The relay URL does not change.
-3. **Settings → Network → Add HTTP/3 to new Apple relay profiles.** A profile then
-   carries the same address twice, for HTTP/3 and HTTP/2. Try one device first:
-   that a device prefers HTTP/3 and falls back to HTTP/2 is how Apple
-   describes relays, but it was not tested here on a device.
+3. Nothing to switch on: every relay profile carries the same address twice,
+   for HTTP/3 and HTTP/2, whenever the relay serves HTTP/3 (the default).
+   **Settings → Network** shows whether its HTTP/3 listener is open. That a
+   device prefers HTTP/3 and falls back to HTTP/2 is how Apple describes
+   relays; check a device's sessions on the Relay page (`h3` or `h2`).
 
 Profiles installed before keep working over HTTP/2 unchanged; a device gets
 HTTP/3 when its profile is downloaded again. The Relay page shows which
