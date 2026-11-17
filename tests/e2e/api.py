@@ -95,6 +95,8 @@ def main():
         call("/api/clients", {"name": args[0], "guest": args[1:] == ["guest"]})
     elif cmd == "static":
         call(f"/api/clients/{args[0]}/static-ip", {"ip": args[1]}, "PUT")
+    elif cmd == "access":       # access NAME guest|full
+        call(f"/api/clients/{args[0]}/access", {"guest": args[1] == "guest"}, "PUT")
     elif cmd == "revoke":
         call(f"/api/clients/{args[0]}/revoke", {})
     elif cmd == "live":         # live NAME COUNT: that many devices connected, each with its own address

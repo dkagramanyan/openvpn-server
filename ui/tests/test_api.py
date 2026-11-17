@@ -355,13 +355,20 @@ def test_config_editor_refuses_lines_that_run_programs(client):
     (TMP / "config" / "easy-rsa.vars").unlink()      # no pki/vars here: the editor wrote the template
 
 
-def test_guests_get_addresses_per_device(client):
+def test_guests_get_addresses_per_device(client, monkeypatch):
     from app import pki
     # guests are a marker, not a static IP
     r = client.post("/api/clients", json={"name": "carol", "guest": True, "static_ip": "10.8.0.140"}, headers=H)
     assert r.status_code == 400 and "guest range" in r.json()["detail"]
+    killed = []
+    from app import main as main_module
+    monkeypatch.setattr(main_module.mgmt, "kill", lambda name: killed.append(name) or "SUCCESS: killed")
     r = client.put("/api/clients/alice/access", json={"guest": True}, headers=H)
     assert r.status_code == 200 and (TMP / "guests" / "alice").exists()
+    # the same rule for OpenVPN and the relay: connected devices reconnect into the guest range now
+    assert killed == ["alice"] and r.json()["reconnected"] is True
+    assert client.put("/api/clients/alice/access", json={"guest": True}, headers=H).json()["reconnected"] is False
+    assert killed == ["alice"]          # nothing changed: nobody is disconnected
     assert client.get("/api/clients/alice").json()["guest"] is True
     assert client.put("/api/clients/alice/static-ip", json={"ip": "10.8.0.101"}, headers=H).status_code == 400
     assert client.put("/api/clients/alice/access", json={"guest": False}, headers=H).status_code == 200

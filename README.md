@@ -135,9 +135,16 @@ connection goes, and asks the pushed DNS servers whether the hostname points at
 the listener's address. A 404 there means the gateway file is not applied yet.
 
 Without a portal listener in Settings, guests get the internet but not their
-portal. Changing a client between guest and full access applies to OpenVPN on
-the next connection and to the relay within seconds; the relay profile stays
-the same.
+portal.
+
+Access is one rule per client, set in this UI, and it holds for OpenVPN and
+the relay alike: a guest reaches the same things either way, a revoked or
+expired certificate closes both. Changing a client between guest and full
+access applies at once: connected OpenVPN devices are reconnected (they get
+an address from the other range) and the relay follows within seconds;
+neither profile has to be issued again. Two rules exist for OpenVPN only,
+because the relay has no place for them: the 2FA code and custom rules in
+`fw-rules.sh`.
 
 ## Network settings and the gateway file
 

@@ -174,7 +174,8 @@ api static alice 10.8.0.100
 client alice-phone $NET.10 alice.ovpn --explicit-exit-notify 1
 client gina-phone $NET.30 gina.ovpn --explicit-exit-notify 1
 [ "$(vpn_ip alice-phone)" = 10.8.0.100 ] || fail "alice did not get her static address"
-vpn_ip gina-phone | has -E '^10\.8\.0\.(1[3-9][0-9]|12[89]|2[0-4][0-9]|25[0-4])$' || fail "the guest got $(vpn_ip gina-phone), outside the guest range"
+GUEST_IP='^10\.8\.0\.(1[3-9][0-9]|12[89]|2[0-4][0-9]|25[0-4])$'
+vpn_ip gina-phone | has -E "$GUEST_IP" || fail "the guest got $(vpn_ip gina-phone), outside the guest range"
 for target in 192.0.2.10:8000 203.0.113.10:8000 198.51.100.10:8000 10.8.0.1:8080 192.0.2.1:8080; do
     reaches alice-phone $target || fail "alice (full access) cannot reach $target"
 done
@@ -197,10 +198,22 @@ vpn_ip alice-laptop | has -E '^10\.8\.0\.([2-9]|[1-9][0-9])$' || fail "the secon
 reaches alice-laptop 198.51.100.10:8000 && reaches alice-phone 198.51.100.10:8000 || fail "two devices of one client do not both work"
 api live alice 2
 
-say "A revoked client is cut off and cannot come back"
+say "A change of access applies at once: the connected device reconnects into the other range"
 api create carl
 api profile carl > /srv/e2e/carl.ovpn
 client carl-pc $NET.40 carl.ovpn
+reaches carl-pc 192.0.2.10:8000 || fail "carl (full access) cannot reach the LAN"
+api access carl guest
+for _ in $(seq 40); do vpn_ip carl-pc 2>/dev/null | has -E "$GUEST_IP" && break; sleep 1; done
+vpn_ip carl-pc | has -E "$GUEST_IP" || fail "carl, now a guest, still has $(vpn_ip carl-pc)"
+reaches carl-pc 198.51.100.10:8000 || fail "carl as a guest has no internet"
+reaches carl-pc 192.0.2.10:8000 && fail "carl as a guest still reaches the LAN"
+api access carl full
+for _ in $(seq 40); do reaches carl-pc 192.0.2.10:8000 && break; sleep 1; done
+reaches carl-pc 192.0.2.10:8000 || fail "carl with full access again does not reach the LAN"
+echo "    carl: full, guest, full again without touching the device"
+
+say "A revoked client is cut off and cannot come back"
 api revoke carl
 for _ in $(seq 30); do reaches carl-pc 198.51.100.10:8000 || break; sleep 1; done
 reaches carl-pc 198.51.100.10:8000 && fail "the revoked client still has traffic"

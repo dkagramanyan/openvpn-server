@@ -1155,9 +1155,23 @@ def static_ip(name: str, body: StaticIpBody, user: dict[str, Any] = Authed):
 @app.put("/api/clients/{name}/access", dependencies=[Csrf])
 def set_access(name: str, body: AccessBody, user: dict[str, Any] = Authed):
     find_client(name)
+    changed = relay.is_guest(name) != body.guest
     pki.set_guest(name, body.guest)
     event("access_changed", user, name, "guest" if body.guest else "full")
-    return {"guest": body.guest, "note": "OpenVPN applies on reconnect; relay access updates within seconds"}
+    # One rule for both ways in. The relay re-reads it within seconds; an OpenVPN device keeps the
+    # address range of its old role until it connects again, so its connections are ended now
+    # (the device reconnects by itself).
+    reconnected = False
+    if changed:
+        try:
+            mgmt.kill(name)
+            reconnected = True
+        except ManagementError as exc:
+            if "not found" not in str(exc).lower():
+                log.warning("could not reconnect %s after an access change: %s", name, exc)
+    return {"guest": body.guest, "reconnected": reconnected,
+            "note": "Applies to OpenVPN and the relay alike: connected OpenVPN devices reconnect now, "
+                    "the relay follows within seconds"}
 
 
 @app.post("/api/clients/{name}/share", dependencies=[Csrf])

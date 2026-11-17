@@ -299,7 +299,7 @@ function clientDetailView(el) {
       h('button', { class: c.guest === g ? 'active' : '', disabled: c.state !== 'valid', onClick: async () => {
         if (c.guest === g) return;
         const text = g ? `${name} will reach the internet and the personal portal: no LAN, not this server or other VPN clients.` : `${name} will reach the internet, your LAN and this server.`;
-        if (await confirmDialog(g ? 'Make guest' : 'Give full access', text + ' OpenVPN changes apply on reconnect. The relay applies them within seconds.', g ? 'Make guest' : 'Give full access')) {
+        if (await confirmDialog(g ? 'Make guest' : 'Give full access', text + ' The same rule applies to OpenVPN and the relay: connected OpenVPN devices reconnect now, the relay follows within seconds.', g ? 'Make guest' : 'Give full access')) {
           await withToast(api(`/api/clients/${enc}/access`, { method: 'PUT', body: { guest: g } }), 'Access changed'); load();
         } } }, label)));
     const kv = (pairs) => h('dl', { class: 'kv' }, pairs.map(([k, v]) => [h('dt', null, k), h('dd', null, v)]));

@@ -19,6 +19,12 @@
   address ranges. The router going silent and coming back are events, and the
   traffic cards say so while it is silent.
 
+### Access
+* Changing a client between guest and full access now applies to OpenVPN at
+  once, as it already did to the relay: connected devices are reconnected
+  and get an address from the other range. Before, an OpenVPN device kept its
+  old access until it reconnected by itself.
+
 ## 2.3.0 - 2026-11-18
 
 Installed OpenVPN and Apple relay profiles keep working; no profile has to be
