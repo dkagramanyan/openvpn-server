@@ -29,11 +29,15 @@ printf 'OPENVPN_ADMIN_PASSWORD=e2e-password\nOVPN_PUBLIC_HOST=%s\n' "$NET.1" > .
 
 docker run --rm -v /srv/openvpn:/etc/openvpn --entrypoint python openvpn-ui:local /etc/openvpn/bin/setup-env.py
 
+# grep -q leaves at the first match; the command before it in the pipeline can then fail on its
+# closed output, and with pipefail the whole check fails although the line is there
+has() { grep "$@" >/dev/null; }
+
 up() {
     docker compose up -d --no-build 2>&1 | sed 's/^/    /'
     for _ in $(seq 90); do
-        if wget -qO- http://127.0.0.1:8080/healthz 2>/dev/null | grep -q '"openvpn":true' \
-            && docker compose exec -T apple-relay wget -qO- http://127.0.0.1:8446/readyz 2>/dev/null | grep -q '"ok":true'; then
+        if wget -qO- http://127.0.0.1:8080/healthz 2>/dev/null | has '"openvpn":true' \
+            && docker compose exec -T apple-relay wget -qO- http://127.0.0.1:8446/readyz 2>/dev/null | has '"ok":true'; then
             return 0
         fi
         sleep 1
@@ -50,7 +54,7 @@ client() {
         'mkdir -p /dev/net; [ -c /dev/net/tun ] || mknod /dev/net/tun c 10 200; exec openvpn --config /profile.ovpn --mssfix 0 "$@"' \
         sh "$@" >/dev/null
     for _ in $(seq 40); do
-        docker exec "$name" ip -4 addr show tun0 2>/dev/null | grep -q 'inet 10\.8\.0\.' && return 0
+        docker exec "$name" ip -4 addr show tun0 2>/dev/null | has 'inet 10\.8\.0\.' && return 0
         sleep 0.5
     done
     docker logs "$name" 2>&1 | tail -20 >&2
@@ -63,8 +67,8 @@ turned_away() {
         --entrypoint sh openvpn-server:local -c \
         'mkdir -p /dev/net; [ -c /dev/net/tun ] || mknod /dev/net/tun c 10 200; exec openvpn --config /profile.ovpn' >/dev/null
     for _ in $(seq 40); do
-        docker exec "$1" ip -4 addr show tun0 2>/dev/null | grep -q 'inet 10\.8\.0\.' && fail "client $1 was let in"
-        docker logs "$1" 2>&1 | grep -q AUTH_FAILED && return 0
+        docker exec "$1" ip -4 addr show tun0 2>/dev/null | has 'inet 10\.8\.0\.' && fail "client $1 was let in"
+        docker logs "$1" 2>&1 | has AUTH_FAILED && return 0
         sleep 0.5
     done
     docker logs "$1" 2>&1 | tail -20 >&2
@@ -95,7 +99,7 @@ docker compose run --rm --no-deps --entrypoint python openvpn-ui -m app.migrate_
 say "Start the service"
 up
 docker exec openvpn-ui python -c "from app.main import db; assert db.get_setting('legacy-preserved') == 'yes'; assert db.get_setting('migration:legacy_sqlite')"
-docker exec openvpn iptables -t mangle -S OVPN-MSS | grep -q 'set-mss 1400' || fail "no MSS clamp in the firewall"
+docker exec openvpn iptables -t mangle -S OVPN-MSS | has 'set-mss 1400' || fail "no MSS clamp in the firewall"
 
 say "Create clients"
 mkdir -p /srv/e2e
@@ -104,7 +108,7 @@ api create bob
 api profile alice > /srv/e2e/alice.ovpn
 api profile bob > /srv/e2e/bob.ovpn
 grep -v ' udp$' /srv/e2e/alice.ovpn > /srv/e2e/alice-tcp.ovpn      # the TCP fallback only
-grep -c '^remote ' /srv/e2e/alice.ovpn | grep -qx 2 || fail "the profile should list a UDP and a TCP remote"
+grep -c '^remote ' /srv/e2e/alice.ovpn | has -x 2 || fail "the profile should list a UDP and a TCP remote"
 
 # A web server behind a published port: reached through the tunnel, its traffic is forwarded.
 docker run -d --name web -p 8000:8000 --entrypoint python openvpn-ui:local -m http.server 8000 >/dev/null
@@ -113,7 +117,7 @@ TARGET=$(ip -4 -o addr show eth0 | awk '{print $4}' | cut -d/ -f1)
 say "alice over UDP: traffic through the tunnel, then a clean exit"
 client alice-phone $NET.10 alice.ovpn --explicit-exit-notify 1
 docker exec alice-phone wget -qO /dev/null -T 10 "http://$TARGET:8000/" || fail "no traffic through the tunnel"
-docker exec alice-phone wget -qO- -T 10 http://10.8.0.1:8080/healthz | grep -q ok || fail "the server is not reachable through the tunnel"
+docker exec alice-phone wget -qO- -T 10 http://10.8.0.1:8080/healthz | has ok || fail "the server is not reachable through the tunnel"
 sleep 12
 docker stop -t 10 alice-phone >/dev/null
 
@@ -161,14 +165,14 @@ ip route add 198.51.100.0/24 via 192.0.2.11
 # The gateway's guest portal listener, on the home LAN.
 docker run -d --name portal-gw --network home --ip 192.0.2.20 --entrypoint python openvpn-ui:local -m http.server 9443 >/dev/null
 api portal 192.0.2.20:9443
-iptables -S DOCKER-USER | sed -n 2p | grep -q OVPN-FORWARD || fail "the guest rules do not run first"
+iptables -S DOCKER-USER | sed -n 2p | has OVPN-FORWARD || fail "the guest rules do not run first"
 api create gina guest
 api profile gina > /srv/e2e/gina.ovpn
 api static alice 10.8.0.100
 client alice-phone $NET.10 alice.ovpn --explicit-exit-notify 1
 client gina-phone $NET.30 gina.ovpn --explicit-exit-notify 1
 [ "$(vpn_ip alice-phone)" = 10.8.0.100 ] || fail "alice did not get her static address"
-vpn_ip gina-phone | grep -qE '^10\.8\.0\.(1[3-9][0-9]|12[89]|2[0-4][0-9]|25[0-4])$' || fail "the guest got $(vpn_ip gina-phone), outside the guest range"
+vpn_ip gina-phone | has -E '^10\.8\.0\.(1[3-9][0-9]|12[89]|2[0-4][0-9]|25[0-4])$' || fail "the guest got $(vpn_ip gina-phone), outside the guest range"
 for target in 192.0.2.10:8000 203.0.113.10:8000 198.51.100.10:8000 10.8.0.1:8080 192.0.2.1:8080; do
     reaches alice-phone $target || fail "alice (full access) cannot reach $target"
 done
@@ -182,12 +186,12 @@ for target in 192.0.2.10:8000 192.0.2.10:443 203.0.113.10:8000 192.0.2.20:9443 1
     reaches gina-phone $target && fail "the guest reaches $target"
 done
 docker exec gina-phone ping -c 1 -W 2 10.8.0.100 >/dev/null 2>&1 && fail "the guest can ping another client"
-docker exec openvpn ip6tables -S OVPN-INPUT | grep -q -- '-s fd00:8::/64 -i tun+ -j DROP' || fail "no IPv6 rule for the tunnel"
+docker exec openvpn ip6tables -S OVPN-INPUT | has -- '-s fd00:8::/64 -i tun+ -j DROP' || fail "no IPv6 rule for the tunnel"
 echo "    guest $(vpn_ip gina-phone): the internet and the portal, no LAN"
 
 say "One certificate on two devices: the second gets an address of its own"
 client alice-laptop $NET.11 alice.ovpn --explicit-exit-notify 1
-vpn_ip alice-laptop | grep -qE '^10\.8\.0\.([2-9]|[1-9][0-9])$' || fail "the second device got $(vpn_ip alice-laptop), not a pool address"
+vpn_ip alice-laptop | has -E '^10\.8\.0\.([2-9]|[1-9][0-9])$' || fail "the second device got $(vpn_ip alice-laptop), not a pool address"
 reaches alice-laptop 198.51.100.10:8000 && reaches alice-phone 198.51.100.10:8000 || fail "two devices of one client do not both work"
 api live alice 2
 
@@ -200,16 +204,16 @@ for _ in $(seq 30); do reaches carl-pc 198.51.100.10:8000 || break; sleep 1; don
 reaches carl-pc 198.51.100.10:8000 && fail "the revoked client still has traffic"
 docker restart carl-pc >/dev/null        # a fresh attempt with the revoked certificate
 api rejected carl "certificate revoked"
-docker exec carl-pc ip -4 addr show tun0 2>/dev/null | grep -q 'inet ' && fail "the revoked client was let in"
+docker exec carl-pc ip -4 addr show tun0 2>/dev/null | has 'inet ' && fail "the revoked client was let in"
 
 say "The firewall follows server.conf when OpenVPN is restarted from the UI"
-fw -S OVPN-FORWARD | grep -q -- '-d 192.0.2.1/32 .*--dport 53 -j ACCEPT' || fail "no DNS rule for guests"
+fw -S OVPN-FORWARD | has -- '-d 192.0.2.1/32 .*--dport 53 -j ACCEPT' || fail "no DNS rule for guests"
 api dns 192.0.2.1 198.51.100.53
-for _ in $(seq 30); do fw -S OVPN-FORWARD | grep -q 198.51.100.53 && break; sleep 1; done    # 2 s pause, then the restart
-fw -S OVPN-FORWARD | grep -q -- '-d 198.51.100.53/32 .*--dport 53 -j ACCEPT' || fail "the guest DNS rule did not follow server.conf"
-fw -S OVPN-FORWARD | grep -q -- '-d 192.0.2.1/32 .*--dport 53' && fail "the old guest DNS rule is still there"
-fw -S OVPN-FORWARD | grep -q -- '-s 10.8.0.128/25 -d 10.0.0.0/8 -j DROP' || fail "guests are not blocked from private ranges"
-fw -S OVPN-FORWARD | grep -q -- '-s 10.8.0.128/25 -d 203.0.113.0/24 -j DROP' || fail "guests are not blocked from the pushed routes"
+for _ in $(seq 30); do fw -S OVPN-FORWARD | has 198.51.100.53 && break; sleep 1; done    # 2 s pause, then the restart
+fw -S OVPN-FORWARD | has -- '-d 198.51.100.53/32 .*--dport 53 -j ACCEPT' || fail "the guest DNS rule did not follow server.conf"
+fw -S OVPN-FORWARD | has -- '-d 192.0.2.1/32 .*--dport 53' && fail "the old guest DNS rule is still there"
+fw -S OVPN-FORWARD | has -- '-s 10.8.0.128/25 -d 10.0.0.0/8 -j DROP' || fail "guests are not blocked from private ranges"
+fw -S OVPN-FORWARD | has -- '-s 10.8.0.128/25 -d 203.0.113.0/24 -j DROP' || fail "guests are not blocked from the pushed routes"
 
 say "Rules removed behind its back and a lease nobody holds are repaired within a minute"
 for _ in $(seq 40); do [ -n "$(docker exec openvpn ls /tmp/openvpn-leases)" ] && break; sleep 1; done    # the clients are back
@@ -217,11 +221,11 @@ fw -F OVPN-INPUT
 fw -t nat -F OVPN-NAT
 docker exec openvpn sh -c 'echo "ghost 192.0.2.1 9" > /tmp/openvpn-leases/10.8.0.200 && touch -d @1000000000 /tmp/openvpn-leases/10.8.0.200'
 for _ in $(seq 80); do
-    fw -S OVPN-INPUT | grep -q DROP && fw -t nat -S OVPN-NAT | grep -q MASQUERADE \
+    fw -S OVPN-INPUT | has DROP && fw -t nat -S OVPN-NAT | has MASQUERADE \
         && ! docker exec openvpn test -e /tmp/openvpn-leases/10.8.0.200 && break
     sleep 1
 done
-fw -S OVPN-INPUT | grep -q DROP && fw -t nat -S OVPN-NAT | grep -q MASQUERADE || fail "the firewall was not restored"
+fw -S OVPN-INPUT | has DROP && fw -t nat -S OVPN-NAT | has MASQUERADE || fail "the firewall was not restored"
 docker exec openvpn test -e /tmp/openvpn-leases/10.8.0.200 && fail "the stale lease was not released"
 docker exec openvpn test -e /tmp/openvpn-leases/10.8.0.100 || fail "the lease of a connected client was released"
 [ "$(docker inspect -f '{{.RestartCount}}' openvpn-ui)" = 0 ] || fail "the UI restarted itself"
@@ -251,7 +255,7 @@ api summary > /srv/e2e/before.json
 
 say "Lose everything, restore from the archive"
 docker stop -t 30 openvpn >/dev/null
-docker logs --tail 5 openvpn 2>&1 | grep -q 'OpenVPN stopped (exit code 0)' && [ "$(docker inspect -f '{{.State.ExitCode}}' openvpn)" = 0 ] \
+docker logs --tail 5 openvpn 2>&1 | has 'OpenVPN stopped (exit code 0)' && [ "$(docker inspect -f '{{.State.ExitCode}}' openvpn)" = 0 ] \
     || fail "a stop signal did not shut OpenVPN down cleanly"
 docker compose down -v 2>&1 | sed 's/^/    /'
 rm -rf pki/* clients/* staticclients/* guests db/openvpn-ui.db* config/management.pw .env
@@ -267,7 +271,7 @@ cmp /srv/e2e/before.json /srv/e2e/after.json || { cat /srv/e2e/before.json /srv/
 
 say "alice's old profile still connects"
 client alice-phone $NET.10 alice.ovpn --explicit-exit-notify 1
-docker exec alice-phone wget -qO- -T 10 http://10.8.0.1:8080/healthz | grep -q ok || fail "no traffic after the restore"
+docker exec alice-phone wget -qO- -T 10 http://10.8.0.1:8080/healthz | has ok || fail "no traffic after the restore"
 docker stop -t 10 alice-phone >/dev/null
 
 say "Encrypted backups"
