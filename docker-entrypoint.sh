@@ -22,7 +22,8 @@ OVPN_STRICT_FORWARD=${OVPN_STRICT_FORWARD:-1}
 OVPN_LOG_STDOUT=${OVPN_LOG_STDOUT:-1}
 OVPN_LOG_MAX_BYTES=${OVPN_LOG_MAX_BYTES:-10485760}
 OVPN_CRL_RENEW_DAYS=${OVPN_CRL_RENEW_DAYS:-30}
-OVPN_MSS=${OVPN_MSS:-1400}
+OVPN_MSS=${OVPN_MSS:-1320}
+OVPN_TCP_CONGESTION=${OVPN_TCP_CONGESTION-bbr}
 OVPN_MAX_DEVICES=${OVPN_MAX_DEVICES:-10}
 OVPN_FLOW_LOG_MAX_BYTES=${OVPN_FLOW_LOG_MAX_BYTES:-33554432}
 
@@ -172,6 +173,18 @@ if [[ $(cat /proc/sys/net/ipv4/ip_forward) != 1 ]]; then
       sudo sysctl -w net.ipv4.ip_forward=1   (persist it in /etc/sysctl.d/99-openvpn.conf)"
 fi
 
+# TCP from this host to the devices (the Apple relay's HTTP/2, OpenVPN's TCP
+# fallback) holds its speed on a lossy mobile or Wi-Fi path far better with BBR
+# than with the default CUBIC. A host setting too; OVPN_TCP_CONGESTION= (empty)
+# leaves the host's choice alone.
+if [[ -n $OVPN_TCP_CONGESTION ]]; then
+    sysctl -q -w net.ipv4.tcp_congestion_control="$OVPN_TCP_CONGESTION" 2>/dev/null || true
+    if [[ $(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null) != "$OVPN_TCP_CONGESTION" ]]; then
+        warn "TCP congestion control is $(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null), not $OVPN_TCP_CONGESTION: the relay over HTTP/2 and OpenVPN over TCP are slower on lossy networks. On the host:
+      sudo sysctl -w net.ipv4.tcp_congestion_control=$OVPN_TCP_CONGESTION   (persist it in /etc/sysctl.d/99-openvpn.conf)"
+    fi
+fi
+
 # What server.conf says the tunnel network is, against what the firewall is told.
 conf_net=$(sed -n 's/^[[:space:]]*server[[:space:]]\+\([0-9.]\+\)[[:space:]].*/\1/p' "$SERVER_CONF" | head -1)
 if [[ -n $conf_net && $conf_net != "${TRUST_SUB%/*}" ]]; then
@@ -250,8 +263,10 @@ firewall() {
     # TCP segment size. OpenVPN's mssfix lowers the MSS that TCP connections
     # negotiate through the tunnel, so that an encrypted packet still fits the
     # path. With kernel offload (DCO) on Linux the data packets never pass through
-    # OpenVPN and nothing lowers it. Do it here instead: 1400 is what the default
-    # "mssfix 1492" gives for IPv4 over UDP with AES-GCM. OVPN_MSS=0 turns it off.
+    # OpenVPN and nothing lowers it. Do it here instead. The default "mssfix 1492"
+    # would give 1400, which fits only a full 1500-byte path; mobile networks
+    # often carry less (IPv4 inside IPv6, for one), and the encrypted packet is
+    # then fragmented. 1320 fits a path of 1412 bytes. OVPN_MSS=0 turns it off.
     if chain mangle OVPN-MSS FORWARD -A 2>/dev/null; then
         if (( OVPN_MSS > 0 )); then
             for dir in -i -o; do

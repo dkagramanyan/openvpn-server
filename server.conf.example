@@ -58,7 +58,7 @@ auth SHA512
 # MTU: tun-mtu 1500 and "mssfix 1492 mtu" are the OpenVPN 2.7 defaults. With
 # kernel offload (DCO) the data packets never pass through OpenVPN, so mssfix
 # does nothing on this side; the container clamps the TCP MSS in its firewall
-# instead (OVPN_MSS, default 1400 - the value mssfix 1492 gives). Lower
+# instead (OVPN_MSS, default 1320: fits paths down to 1412 bytes). Lower
 # OVPN_MSS if large transfers stall on some network.
 sndbuf 0
 rcvbuf 0

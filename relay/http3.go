@@ -201,6 +201,7 @@ func (s *relayServer) proxyHTTP3UDP(ctx context.Context, w http.ResponseWriter, 
 				// A datagram above the path's size is lost, as on any UDP path.
 				var tooLarge *quic.DatagramTooLargeError
 				if errors.As(err, &tooLarge) {
+					s.metrics.observe("udp_oversize_drops", time.Time{})
 					continue
 				}
 				return

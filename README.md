@@ -564,7 +564,8 @@ Environment variables of the `openvpn` service:
 | VPN and guest subnet, portal listener | From `server.conf` (guests: its upper half) | set in Settings → Network |
 | `OVPN_EGRESS_IFACE` | default-route interface | interface used for MASQUERADE |
 | `OVPN_STRICT_FORWARD` | `1` | only VPN-originated traffic and replies are forwarded |
-| `OVPN_MSS` | `1400` | TCP MSS clamp for tunnel traffic; `0` = off |
+| `OVPN_MSS` | `1320` | TCP MSS clamp for tunnel traffic; `0` = off |
+| `OVPN_TCP_CONGESTION` | `bbr` | TCP congestion control the host should use (relay over HTTP/2, OpenVPN over TCP); empty = leave the host's. If the container cannot set it, the log gives the host command |
 | `OVPN_MAX_DEVICES` | `10` | connections one certificate may have at the same time; `0` = no limit |
 | `OVPN_LOG_STDOUT` | `1` | mirror openvpn.log to `docker logs` |
 | `OVPN_LOG_MAX_BYTES` | 10 MiB | rotate openvpn.log (checked every minute) above this size |
@@ -765,8 +766,8 @@ again. `fw-rules.sh` runs in between; append your own rules to `OVPN-FORWARD`
 there.
 
 `OVPN-MSS` (table `mangle`) lowers the TCP segment size of connections through
-the tunnel to `OVPN_MSS` (1400), so that an encrypted packet fits networks
-with an MTU below 1500. OpenVPN's own `mssfix` does this only without kernel
+the tunnel to `OVPN_MSS` (1320), so that an encrypted packet fits networks
+with an MTU down to 1412 (mobile networks often carry less than 1500). OpenVPN's own `mssfix` does this only without kernel
 offload: with DCO on Linux the data packets never pass through OpenVPN.
 OpenVPN Connect and the Windows client clamp on their side as well; the rule
 covers the clients that do not. `OVPN_MSS=0` turns it off.

@@ -82,7 +82,8 @@ function relayView(el) {
       tile('Certificate', !info.ready ? '—' : !info.tls ? 'none' : `${Math.max(0, Math.floor((info.tls.not_after - Date.now() / 1000) / 86400))} days left`,
         !info.tls ? 'relay-tls/ is empty: HTTP/3 and direct HTTP/2 wait for it' : `${(info.tls.names || []).join(', ')} · ${info.tls.issuer || ''} · until ${fmtDate(info.tls.not_after)}`),
       tile('Open connections', info.ready ? fmtNum(info.active.length) : '—', limits ? `limit ${fmtNum(limits.flows)} in total · ${fmtNum(limits.per_client)} per client` : ''),
-      tile('Since it started', info.ready ? fmtNum(info.total || 0) : '—', `accepted · ${fmtNum(info.failed || 0)} failed · ${fmtNum(info.denied || 0)} denied`));
+      tile('Since it started', info.ready ? fmtNum(info.total || 0) : '—', `accepted · ${fmtNum(info.failed || 0)} failed · ${fmtNum(info.denied || 0)} denied`
+        + ((info.metrics || {}).udp_oversize_drops_total ? ` · ${fmtNum(info.metrics.udp_oversize_drops_total)} UDP packets too large for HTTP/3 dropped` : '')));
     active.replaceChildren(groups(true));
     events.replaceChildren(groups(false));
   }

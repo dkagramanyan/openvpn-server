@@ -101,7 +101,7 @@ say "Start the service"
 sysctl -q -w net.netfilter.nf_conntrack_acct=1 net.netfilter.nf_conntrack_timestamp=1
 up
 docker exec openvpn-ui python -c "from app.main import db; assert db.get_setting('legacy-preserved') == 'yes'; assert db.get_setting('migration:legacy_sqlite')"
-docker exec openvpn iptables -t mangle -S OVPN-MSS | has 'set-mss 1400' || fail "no MSS clamp in the firewall"
+docker exec openvpn iptables -t mangle -S OVPN-MSS | has 'set-mss 1320' || fail "no MSS clamp in the firewall"
 
 say "Create clients"
 mkdir -p /srv/e2e

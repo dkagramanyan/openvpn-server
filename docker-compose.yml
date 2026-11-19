@@ -88,9 +88,10 @@ services:
     environment:
       # Network policy is saved privately through the admin UI.
       OVPN_STRICT_FORWARD: ${OVPN_STRICT_FORWARD:-1}
+      OVPN_MSS: ${OVPN_MSS:-1320}                       # TCP MSS clamp for tunnel traffic (kernel offload has no mssfix); 0 = off
+      OVPN_TCP_CONGESTION: ${OVPN_TCP_CONGESTION-bbr}   # TCP congestion control asked of the host; empty = leave the host's
       # OVPN_EGRESS_IFACE: eth0     # auto-detected from the default route
       # OVPN_STRICT_FORWARD: "1"    # set to 0 to allow unsolicited inbound to VPN clients
-      # OVPN_MSS: "1400"            # TCP MSS clamp for tunnel traffic (kernel offload has no mssfix); 0 = off
       # OVPN_MAX_DEVICES: "10"      # connections one certificate may have at a time; 0 = no limit
     volumes:
       - ./:/etc/openvpn

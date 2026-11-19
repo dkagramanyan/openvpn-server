@@ -1,6 +1,21 @@
 <!-- Network addresses in examples are synthetic; deployment-specific notes are omitted. -->
 # Changelog
 
+## 2.5.1 - 2026-11-19
+
+Speed on lossy networks (mobile data, weak Wi-Fi).
+
+* **BBR for TCP from this host.** At start the container asks the host for
+  BBR congestion control (`OVPN_TCP_CONGESTION`, default `bbr`; empty leaves
+  the host's choice). It serves the relay over HTTP/2 and OpenVPN's TCP
+  fallback. Where the container may not set it, the log gives the one host
+  command.
+* **`OVPN_MSS` is 1320 by default** (was 1400). 1400 fits only a full
+  1500-byte path; on mobile networks that carry less, encrypted packets were
+  fragmented. Set `OVPN_MSS=1400` to keep the old value.
+* The Relay page counts UDP packets dropped because they were too large for
+  the phone's HTTP/3 path (`relay_udp_oversize_drops_total` in `/metrics`).
+
 ## 2.5.0 - 2026-11-18
 
 The Apple relay without the gateway in its path.
