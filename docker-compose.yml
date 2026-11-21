@@ -26,6 +26,9 @@ services:
       RELAY_H2_READ_IDLE: ${APPLE_RELAY_H2_READ_IDLE:-10s}
       RELAY_H2_PING_TIMEOUT: ${APPLE_RELAY_H2_PING_TIMEOUT:-5s}
       RELAY_MAX_H2_STREAMS: ${APPLE_RELAY_MAX_H2_STREAMS:-512}
+      # Networks that take TCP but drop UDP (the router's FakeIP range): UDP to them is
+      # refused at once so apps use TCP. "off" refuses none.
+      RELAY_UDP_REFUSED: ${APPLE_RELAY_UDP_REFUSED:-198.18.0.0/15}
       RELAY_NETWORK_CONFIG: /etc/relay-network/proxies.conf
       RELAY_AUTH_URL: ${APPLE_RELAY_AUTH_URL:-http://127.0.0.1:8447/api/relay/authorize}
     # The certificate for HTTP/3 and direct HTTP/2 (relay-cert keeps it renewed).

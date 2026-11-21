@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
@@ -87,6 +89,18 @@ func (c *certificateFiles) get() (*tls.Certificate, error) {
 	return c.loaded, nil
 }
 
+// resetKey is derived from the private key file, so it is the same after a
+// restart: connections the previous process held are reset too.
+func (c *certificateFiles) resetKey() *quic.StatelessResetKey {
+	data, err := os.ReadFile(c.key)
+	if err != nil {
+		return nil
+	}
+	mac := hmac.New(sha256.New, data)
+	mac.Write([]byte("apple-relay stateless reset"))
+	return (*quic.StatelessResetKey)(mac.Sum(nil))
+}
+
 // One phone keeps one QUIC connection for all of its flows, so the stream
 // limit is the per-client flow limit, and the windows let a single download
 // or upload use a fast path fully.
@@ -126,11 +140,23 @@ func (s *relayServer) serveHTTP3(ctx context.Context, address string, files *cer
 	}
 	defer udp.Close()
 	server := s.http3Server(files.get)
+	// A phone that wakes with a connection this relay has dropped (idle for 90 s,
+	// or the relay restarted) must be told at once: without a reset key quic-go
+	// ignores its packets and the phone waits out its own timeout.
+	transport := &quic.Transport{Conn: udp, StatelessResetKey: files.resetKey()}
+	defer transport.Close()
+	config := server.QUICConfig.Clone()
+	config.EnableDatagrams = true
+	listener, err := transport.ListenEarly(server.TLSConfig, config)
+	if err != nil {
+		return err
+	}
+	defer listener.Close()
 	go func() { <-ctx.Done(); server.Close() }()
 	up(true)
 	defer up(false)
 	log.Printf("Apple Network Relay HTTP/3 listening on %s/udp", udp.LocalAddr())
-	err = server.Serve(udp)
+	err = server.ServeListener(listener)
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}

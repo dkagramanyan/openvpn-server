@@ -13,6 +13,7 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -44,6 +45,7 @@ type relayServer struct {
 	h2ReadIdle       time.Duration
 	h2PingTimeout    time.Duration
 	proxyConfig      string
+	udpRefused       []netip.Prefix
 }
 
 // Revalidate live tunnels as well as new requests. Policy changes, expiry,
@@ -182,6 +184,15 @@ func (s *relayServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	// Dial the numeric address we checked, never resolve a hostname twice.
 	if udpReq != nil {
+		// A UDP socket opens to anything, so a range that never answers UDP (the
+		// LAN router's FakeIP proxy) is refused here: the app goes to TCP at once.
+		addresses = slices.DeleteFunc(addresses, func(a netip.AddrPort) bool {
+			return slices.ContainsFunc(s.udpRefused, func(p netip.Prefix) bool { return p.Contains(a.Addr()) })
+		})
+		if len(addresses) == 0 {
+			reject(w, r, 502, "udp_unavailable", "UDP unavailable for this destination", "destination_ip_unroutable")
+			return
+		}
 		var conn *net.UDPConn
 		var addr netip.AddrPort
 		for _, candidate := range addresses {
@@ -289,7 +300,19 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	// Destinations that take TCP but drop UDP; "off" refuses none.
+	var udpRefused []netip.Prefix
+	if value := env("RELAY_UDP_REFUSED", "198.18.0.0/15"); value != "off" {
+		for _, cidr := range strings.Fields(value) {
+			prefix, err := netip.ParsePrefix(cidr)
+			if err != nil {
+				log.Fatalf("RELAY_UDP_REFUSED: %v", err)
+			}
+			udpRefused = append(udpRefused, prefix.Masked())
+		}
+	}
 	handler := &relayServer{
+		udpRefused:  udpRefused,
 		proxyConfig: os.Getenv("RELAY_NETWORK_CONFIG"),
 		api:         env("RELAY_AUTH_URL", "http://127.0.0.1:8447/api/relay/authorize"),
 		client: &http.Client{Timeout: 3 * time.Second, Transport: &http.Transport{Proxy: nil, MaxIdleConnsPerHost: 32, IdleConnTimeout: 90 * time.Second},

@@ -188,6 +188,15 @@ func TestHTTP2AndHTTP3TogetherWithOneCredential(t *testing.T) {
 	output.Close()
 	resp.Body.Close()
 
+	// UDP to a range that never answers it is refused, not accepted and lost.
+	s.udpRefused = []netip.Prefix{netip.MustParsePrefix(ip + "/32")}
+	if refused, response, err := tr.Dial(request); err == nil || response == nil || response.StatusCode != 502 {
+		if refused != nil {
+			refused.Close()
+		}
+		t.Fatalf("UDP to a refused range: %v %v", response, err)
+	}
+
 	// Stopping HTTP/3 ends its flows and leaves HTTP/2 serving.
 	stopHTTP3()
 	if err := <-served; !errors.Is(err, context.Canceled) {
@@ -199,6 +208,58 @@ func TestHTTP2AndHTTP3TogetherWithOneCredential(t *testing.T) {
 	flow.SetDeadline(time.Now().Add(3 * time.Second))
 	if _, _, err := flow.ReadFrom(make([]byte, 10)); err == nil {
 		t.Fatal("HTTP/3 flow survived its server")
+	}
+}
+
+// A packet for a connection the relay no longer knows is answered with a
+// stateless reset, and with the same token after a restart.
+func TestHTTP3ResetsUnknownConnections(t *testing.T) {
+	tlsServer := httptest.NewTLSServer(http.NotFoundHandler())
+	defer tlsServer.Close()
+	dir := t.TempDir()
+	files := &certificateFiles{chain: filepath.Join(dir, "fullchain.pem"), key: filepath.Join(dir, "privkey.pem")}
+	writeCertificate(t, dir, tlsServer.TLS.Certificates[0])
+	free, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := free.LocalAddr().String()
+	free.Close()
+	packet := make([]byte, 100) // a short-header packet of an unknown connection
+	for i := range packet {
+		packet[i] = byte(i)
+	}
+	packet[0] = 0x40
+	var tokens [2][]byte
+	for run := range tokens {
+		ctx, stop := context.WithCancel(context.Background())
+		var up atomic.Bool
+		served := make(chan error, 1)
+		go func() { served <- (&relayServer{}).serveHTTP3(ctx, address, files, up.Store) }()
+		for range 200 {
+			if up.Load() {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		client, err := net.Dial("udp", address)
+		if err != nil {
+			t.Fatal(err)
+		}
+		client.SetDeadline(time.Now().Add(3 * time.Second))
+		client.Write(packet)
+		answer := make([]byte, 2000)
+		n, err := client.Read(answer)
+		client.Close()
+		stop()
+		<-served
+		if err != nil || n < 21 {
+			t.Fatalf("no stateless reset for an unknown connection: %d %v", n, err)
+		}
+		tokens[run] = answer[n-16 : n]
+	}
+	if string(tokens[0]) != string(tokens[1]) {
+		t.Fatal("the reset token changed with the restart")
 	}
 }
 

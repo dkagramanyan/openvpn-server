@@ -1,6 +1,21 @@
 <!-- Network addresses in examples are synthetic; deployment-specific notes are omitted. -->
 # Changelog
 
+## 2.5.2 - 2026-11-21
+
+Two relay changes aimed at long waits on phones (not yet confirmed on a phone).
+
+* **A phone is told at once when its HTTP/3 connection is gone.** The relay
+  forgets a connection after 90 s without an answer (a locked phone) and on a
+  restart. It did not answer packets of such a connection, so the phone kept
+  sending until its own timeout. Now it answers with a QUIC stateless reset,
+  also after a restart (the reset key is derived from the certificate's
+  private key).
+* **UDP to the router's FakeIP range is refused** (`APPLE_RELAY_UDP_REFUSED`,
+  default `198.18.0.0/15`; `off` refuses nothing). The router's proxy carries
+  TCP only, and the relay accepted every such QUIC flow that then got no
+  answer. Apps now go to TCP without waiting.
+
 ## 2.5.1 - 2026-11-19
 
 Speed on lossy networks (mobile data, weak Wi-Fi).
