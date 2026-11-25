@@ -17,6 +17,7 @@ Xray through 3x-ui, as a third way in.
 * **Internet only**: a routing rule blocks private ranges, pushed routes and
   this host's networks on that inbound, for everyone.
 * Backups (UI archives and `backup.sh`) include `xui/`.
+* The web UI calls itself *Access server* (page title, sidebar, sign-in).
 
 ## 2.7.0 - 2026-11-26
 

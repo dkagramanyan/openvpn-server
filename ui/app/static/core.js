@@ -280,7 +280,7 @@ function sidebar() {
   const link = (name, label, ic, extra) => h('a', { href: '#/' + name, class: state.route.name === name ? 'active' : '' }, icon(ic), h('span', { class: 'label' }, label), extra);
   const live = state.live;
   return h('aside', { class: 'sidebar' },
-    h('div', { class: 'brand' }, h('div', { class: 'logo' }, svg('svg', { viewBox: '0 0 24 24' }, svg('path', { d: 'M12 2a7 7 0 0 0-3.5 13.06V20h7v-4.94A7 7 0 0 0 12 2z' }))), 'OpenVPN'),
+    h('div', { class: 'brand' }, h('div', { class: 'logo' }, svg('svg', { viewBox: '0 0 24 24' }, svg('path', { d: 'M12 2a7 7 0 0 0-3.5 13.06V20h7v-4.94A7 7 0 0 0 12 2z' }))), 'Access server'),
     h('nav', { class: 'nav' },
       link('dashboard', 'Dashboard', 'dash'),
       link('clients', 'Clients', 'users', h('span', { class: 'pill', id: 'online-pill' }, live && (live.connected || live.relay_ready) ? onlineClients(live).size : '…')),
@@ -490,7 +490,7 @@ function loginView() {
     } catch (ex) { err.textContent = ex.message; } finally { btn.disabled = false; }
   } }, field('Username', user), field('Password', pass), err, btn);
   return h('div', { class: 'login' }, h('div', { class: 'card' },
-    h('div', { class: 'brand' }, h('div', { class: 'logo' }, svg('svg', { viewBox: '0 0 24 24' }, svg('path', { d: 'M12 2a7 7 0 0 0-3.5 13.06V20h7v-4.94A7 7 0 0 0 12 2z' }))), 'OpenVPN'),
+    h('div', { class: 'brand' }, h('div', { class: 'logo' }, svg('svg', { viewBox: '0 0 24 24' }, svg('path', { d: 'M12 2a7 7 0 0 0-3.5 13.06V20h7v-4.94A7 7 0 0 0 12 2z' }))), 'Access server'),
     h('p', { class: 'small muted' }, 'Administrators and VPN users sign in here.'),
     form));
 }

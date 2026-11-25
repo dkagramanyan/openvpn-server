@@ -1,7 +1,9 @@
 # openvpn-server
 
-OpenVPN server and Apple Network Relay in Docker, with a web UI for clients,
-live status, traffic statistics and a personal portal for every client.
+An access server in Docker: OpenVPN, Apple Network Relay and Xray (3x-ui),
+with a web UI for clients, live status, traffic statistics, a personal portal
+for every client and a Telegram bot through which clients get their own
+access.
 
 * **OpenVPN 2.7.9** and **easy-rsa 3.2.7**, built from the signed upstream
   release tarballs on Alpine 3.24.
