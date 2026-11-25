@@ -156,7 +156,8 @@ class Bot:
                          else ". First set a username in Telegram: Settings → My profile → Username."))
             return
         info = self.info(name)
-        menu = [["OpenVPN"] + (["Apple relay"] if info["relay"] else []), ["Portal password", "Status"]]
+        menu = [["OpenVPN"] + (["Apple relay"] if info["relay"] else []) + (["Xray"] if info["xray"] else []),
+                ["Portal password", "Status"]]
         command = text.split("@", 1)[0].lower()
         if not info["valid"] and command not in ("/start", "status", "/status"):
             self.send(chat, "Your access has expired or was revoked. Ask the administrator.", menu)
@@ -165,6 +166,8 @@ class Bot:
             self.send_link(chat, sender["id"], name, "openvpn", menu)
         elif command in ("apple relay", "/relay") and info["relay"]:
             self.send_link(chat, sender["id"], name, "relay", menu)
+        elif command in ("xray", "/xray") and info["xray"]:
+            self.send_link(chat, sender["id"], name, "xray", menu)
         elif command in ("portal password", "/password"):
             if not self.allowed(sender["id"]):
                 self.send(chat, "Too many requests. Try again in an hour.", menu)
@@ -182,6 +185,7 @@ class Bot:
             self.send(chat, f"Hello! This bot gives you access for the account {name}.\n\n"
                       "OpenVPN: a link to your OpenVPN profile (Android, iPhone, Windows, macOS, Linux).\n"
                       + ("Apple relay: a profile for iPhone, iPad and Mac, no app needed.\n" if info["relay"] else "")
+                      + ("Xray: a key for an Xray app, for networks where OpenVPN is blocked.\n" if info["xray"] else "")
                       + "Portal password: a new password for the website.\nStatus: your access.", menu)
 
     def send_link(self, chat: int, telegram_id: int, name: str, kind: str, menu) -> None:
@@ -192,8 +196,9 @@ class Bot:
         if not link["public"]:
             self.send(chat, "Links are not available yet: the administrator has to set the website hostname.", menu)
             return
-        how = ("Open it on the device that will use the VPN and tap “Open in OpenVPN Connect” "
-               "(install OpenVPN Connect first)." if kind == "openvpn" else
-               "Open it in Safari on the iPhone, iPad or Mac, tap “Install the profile”, "
-               "then Settings → Profile Downloaded → Install.")
+        how = {"openvpn": "Open it on the device that will use the VPN and tap “Open in OpenVPN Connect” "
+                          "(install OpenVPN Connect first).",
+               "relay": "Open it in Safari on the iPhone, iPad or Mac, tap “Install the profile”, "
+                        "then Settings → Profile Downloaded → Install.",
+               "xray": "Open it on the device that will use it: the page shows your key and how to import it."}[kind]
         self.send(chat, f"{link['url']}\n\n{how} The link works once and for one hour.", menu)

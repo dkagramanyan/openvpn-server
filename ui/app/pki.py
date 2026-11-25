@@ -325,9 +325,11 @@ def tfa_uri(name: str) -> str | None:
     return f"otpauth://totp/{issuer}:{name}?secret={b32}&issuer={issuer}&algorithm=SHA1&digits=6&period=30"
 
 
-def qr_svg(uri: str) -> str:
+def qr_svg(uri: str, inline: bool = False) -> str:
+    """An SVG file, or with inline=True an <svg> element for an HTML page that scales with CSS."""
     buf = io.BytesIO()
-    segno.make(uri, error="m").save(buf, kind="svg", scale=5, dark="#0b0b0b", light=None, xmldecl=True, svgns=True)
+    segno.make(uri, error="m").save(buf, kind="svg", scale=5, dark="#0b0b0b", light=None, xmldecl=not inline,
+                                    svgns=True, omitsize=inline)
     return buf.getvalue().decode()
 
 

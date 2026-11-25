@@ -25,7 +25,7 @@ ACTION=$1
 SERVER_ENV=${2%/}
 BACKUP_DIR=${3%/}
 
-ITEMS=(server.conf config pki clients staticclients guests fw-rules.sh docker-compose.yml .env)
+ITEMS=(server.conf config pki clients staticclients guests fw-rules.sh docker-compose.yml .env xui)
 DB=db/openvpn-ui.db
 
 confirm() {
@@ -58,7 +58,7 @@ case $ACTION in
         echo -e "\033[1;32mBackup created at $BACKUP_DIR\033[0m"
         ;;
     -r)
-        if command -v docker >/dev/null && docker ps --format '{{.Names}}' 2>/dev/null | grep -qxE 'openvpn|openvpn-ui'; then
+        if command -v docker >/dev/null && docker ps --format '{{.Names}}' 2>/dev/null | grep -qxE 'openvpn|openvpn-ui|openvpn-xui'; then
             echo -e "\033[1;31mThe service is running. Stop it first: docker compose down\033[0m"; exit 1
         fi
         [[ -e $BACKUP_DIR ]] || { echo -e "\033[1;31mNo backup at $BACKUP_DIR\033[0m"; exit 1; }

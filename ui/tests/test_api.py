@@ -1568,3 +1568,77 @@ def test_telegram_bot_makes_no_link_without_a_public_address(client, telegram, m
     before = db.one("SELECT count(*) AS n FROM share_tokens")["n"]
     bot.handle(tg("OpenVPN"))
     assert "website hostname" in api.text and db.one("SELECT count(*) AS n FROM share_tokens")["n"] == before
+
+
+@pytest.fixture
+def xray_on(monkeypatch):
+    from app import xray
+    old = db.get_setting("xray")
+    db.set_setting("xray", json.dumps({"enabled": True, "inbound_id": 1}))
+    monkeypatch.setattr(xray, "link", lambda db, name: f"vless://uuid@vpn.example.test:8445?pbk=QRkey&sid=1#{name}<x>")
+    yield
+    if old is None:
+        db.execute("DELETE FROM settings WHERE key = 'xray'")
+    else:
+        db.set_setting("xray", old)
+
+
+def test_xray_share_link_shows_the_key_once(client, xray_on):
+    from app.main import limiter
+    r = client.post("/api/clients/alice/share", json={"kind": "xray"}, headers=H)
+    assert r.status_code == 200 and r.json()["import_url"] == ""
+    path = "/p/" + r.json()["url"].rsplit("/p/", 1)[1]
+    try:
+        page = client.get(path)
+        assert page.status_code == 200 and "Show my key" in page.text and "vless://" not in page.text
+        key = client.get(path + "/download")
+        assert key.status_code == 200 and key.headers["content-type"].startswith("text/html")
+        assert "vless://uuid@vpn.example.test:8445?pbk=QRkey&amp;sid=1#alice&lt;x&gt;" in key.text   # escaped, and "QR" in a key is kept
+        assert "<svg" in key.text and "<?xml" not in key.text and "script-src" not in key.headers["content-security-policy"]
+        assert client.get(path + "/download").status_code == 404
+    finally:
+        limiter._state.clear()
+    assert client.get("/api/clients/alice").json()["xray_available"] is True
+
+
+def test_xray_links_need_xray_on_and_its_panel(client):
+    db.execute("DELETE FROM settings WHERE key = 'xray'")
+    r = client.post("/api/clients/alice/share", json={"kind": "xray"}, headers=H)
+    assert r.status_code == 400 and "Xray is off" in r.json()["detail"]
+    info = client.get("/api/xray/settings").json()     # no 3x-ui here: its state file is missing
+    assert info["enabled"] is False and info["inbounds"] == [] and "xui" in info["error"]
+    assert client.put("/api/xray/settings", json={"enabled": True, "inbound_id": None}, headers=H).status_code == 400
+
+
+def test_telegram_bot_offers_xray_when_on(client, telegram, xray_on):
+    bot, api = telegram
+    assert client.put("/api/clients/alice/telegram", json={"username": "alice_tg"}, headers=H).status_code == 200
+    bot.handle(tg("/start"))
+    assert "Xray" in [b["text"] for row in api.sent[-1]["reply_markup"]["keyboard"] for b in row]
+    bot.handle(tg("Xray"))
+    assert "/p/" in api.text and "shows your key" in api.text
+
+
+def test_xray_rule_sits_after_the_api_rule_and_is_written_once(monkeypatch):
+    from app import xray
+    template = {"routing": {"rules": [{"type": "field", "inboundTag": ["api"], "outboundTag": "api"},
+                                      {"type": "field", "ip": ["geoip:cn"], "outboundTag": "blocked"}]},
+                "outbounds": [{"protocol": "freedom", "tag": "direct"}]}
+    calls = []
+    def call(method, path, body=None, form=None, host=None):
+        calls.append(path)
+        if path == "panel/api/xray/":
+            return json.dumps({"xraySetting": template})        # 3x-ui sends it JSON-encoded
+        if path == "panel/api/xray/update":
+            template.clear(); template.update(json.loads(form["xraySetting"]))
+    monkeypatch.setattr(xray, "call", call)
+    monkeypatch.setattr(xray, "host_networks", lambda: ["192.0.2.0/24"])
+    monkeypatch.setattr(xray.network, "pushed_routes", lambda: ["198.51.100.0/24"])
+    assert xray.ensure_rule("in-8445-tcp") is True
+    rules = template["routing"]["rules"]
+    assert rules[0]["inboundTag"] == ["api"] and rules[1]["ruleTag"] == xray.RULE_TAG and rules[2]["ip"] == ["geoip:cn"]
+    assert rules[1]["ip"] == ["geoip:private", "192.0.2.0/24", "198.51.100.0/24"] and rules[1]["inboundTag"] == ["in-8445-tcp"]
+    assert {"protocol": "blackhole", "tag": "blocked"} in template["outbounds"]
+    assert "panel/api/server/restartXrayService" in calls
+    calls.clear()
+    assert xray.ensure_rule("in-8445-tcp") is False and calls == ["panel/api/xray/"]    # unchanged: no restart

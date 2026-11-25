@@ -16,3 +16,4 @@ config/client.conf
 config/client.conf.bak
 config/router/
 config/acme/
+xui/

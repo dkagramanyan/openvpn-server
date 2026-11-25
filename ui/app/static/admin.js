@@ -253,7 +253,7 @@ function clientsView(el) {
     return menuButton([icon('download'), 'Download'], () => [
       h('a', { class: 'btn', role: 'menuitem', href: `/api/clients/${enc(c)}/ovpn`, download: c.name + '.ovpn' }, icon('download'), 'OpenVPN config'),
       relayButton(c),
-      h('button', { class: 'btn', role: 'menuitem', onClick: () => shareDialog(c.name, c.relay_available) }, 'Share link…')], cls);
+      h('button', { class: 'btn', role: 'menuitem', onClick: () => shareDialog(c.name, c.relay_available, c.xray_available) }, 'Share link…')], cls);
   }
   function check(c) {
     return h('input', { type: 'checkbox', class: 'pick', checked: selected.has(c.name), 'aria-label': 'Select ' + c.name,
@@ -434,7 +434,7 @@ function clientDetailView(el) {
           const r = await withToast(api(`/api/clients/${enc}/tfa`, { method: 'POST', body: { enabled: true } }), '2FA enabled'); tfaDialog(name, r.tfa_uri); load();
         } }) : null,
       c.state === 'valid' && c.tfa ? act('Disable 2FA', async () => { if (await confirmDialog('Disable 2FA', `Remove the TOTP secret of ${name}?`, 'Disable', true)) { await withToast(api(`/api/clients/${enc}/tfa`, { method: 'POST', body: { enabled: false } }), '2FA disabled'); load(); } }) : null,
-      c.state === 'valid' ? act('Share link', () => shareDialog(name, c.relay_available)) : null,
+      c.state === 'valid' ? act('Share link', () => shareDialog(name, c.relay_available, c.xray_available)) : null,
       c.state === 'valid' && !c.guest ? act('Static IP', () => staticIpDialog(c, load)) : null,
       c.state !== 'revoked' && !c.previous ? act('Renew', async () => { if (await confirmDialog('Renew certificate', 'A new certificate is issued for the same key. The previous certificate stays valid until you revoke it, so the client keeps working while you deliver the new profile.', 'Renew')) { await withToast(api(`/api/clients/${enc}/renew`, { method: 'POST', body: {} }), 'Certificate renewed'); load(); } }) : null,
       c.previous ? act('Revoke previous cert', async () => { if (await confirmDialog('Revoke previous certificate', 'The old certificate will be added to the CRL. Make sure the client already uses the new profile.', 'Revoke', true)) { await withToast(api(`/api/clients/${enc}/revoke-previous`, { method: 'POST' }), 'Previous certificate revoked'); load(); } }, 'danger') : null,
@@ -533,9 +533,9 @@ function rejectionsTable(list, withName) {
       withName ? h('td', null, r.client || h('span', { class: 'muted' }, 'unknown')) : null,
       h('td', null, r.reason), h('td', { class: 'mono small' }, r.address), h('td', { class: 'r num' }, fmtNum(r.count)), h('td', { class: 'num' }, fmtAgo(r.last_ts)))))));
 }
-function shareDialog(name, relayAvailable) {
+function shareDialog(name, relayAvailable, xrayAvailable) {
   const hours = h('select', { class: 'input' }, [['1', '1 hour'], ['24', '24 hours'], ['168', '7 days']].map(([v, l]) => h('option', { value: v, selected: v === '24' }, l)));
-  const kind = h('select', { class: 'input' }, [['openvpn', 'OpenVPN'], ['relay', 'Apple relay']].map(([v, l]) => h('option', { value: v }, l)));
+  const kind = h('select', { class: 'input' }, [['openvpn', 'OpenVPN', true], ['relay', 'Apple relay', relayAvailable], ['xray', 'Xray', xrayAvailable]].filter(o => o[2]).map(([v, l]) => h('option', { value: v }, l)));
   const out = h('div', { class: 'stack', style: 'gap:10px' });
   const copy = (text, what) => navigator.clipboard.writeText(text).then(() => toast(what + ' copied', 'ok'), () => toast('Copying needs HTTPS - select the link instead', 'err'));
   const make = async () => {
@@ -543,13 +543,13 @@ function shareDialog(name, relayAvailable) {
     try { r = await api(`/api/clients/${encodeURIComponent(name)}/share`, { method: 'POST', body: { hours: Number(hours.value), kind: kind.value } }); } catch (e) { toast(e.message, 'err'); return; }
     out.replaceChildren(h('div', { class: 'qr' }, h('div', { class: 'code' }, h('img', { src: 'data:image/svg+xml;base64,' + btoa(r.qr_svg), alt: 'QR code of the link' })),
       h('div', { class: 'stack', style: 'flex:1;min-width:220px;gap:8px' },
-        h('p', { style: 'margin:0' }, `${r.kind === 'relay' ? 'Scan it with the camera of the iPhone or iPad: Safari offers the relay profile.' : 'Scan it with the phone camera: OpenVPN Connect imports the profile.'} Or send the link: it opens a page that offers the profile, so a messenger's link preview does not use it up. The profile can be fetched once; the link expires ${fmtDateTime(r.expires_at)}.`),
+        h('p', { style: 'margin:0' }, `${{ relay: 'Scan it with the camera of the iPhone or iPad: Safari offers the relay profile.', xray: 'Scan it with the phone camera: the page shows the Xray key once.', openvpn: 'Scan it with the phone camera: OpenVPN Connect imports the profile.' }[r.kind]} Or send the link: it opens a page that offers the profile, so a messenger's link preview does not use it up. The profile can be fetched once; the link expires ${fmtDateTime(r.expires_at)}.`),
         h('div', { class: 'uri mono muted' }, r.url),
         h('div', { class: 'row' }, h('button', { class: 'btn sm', onClick: () => copy(r.url, 'Link') }, 'Copy link'), r.import_url ? h('button', { class: 'btn sm', onClick: () => copy(r.import_url, 'Import link') }, 'Copy import link') : null))),
       r.public ? '' : warnings(['No website hostname is set in Settings → Network (nor OVPN_PROFILE_BASE_URL), so the link uses this admin address and only works where that is reachable.']));
   };
   dialog({ title: `Share profile · ${name}`, wide: true, body: h('div', { class: 'stack' },
-    h('div', { class: 'row', style: 'align-items:flex-end' }, relayAvailable ? field('Profile', kind) : null, field('Valid for', hours), h('button', { class: 'btn primary', onClick: make }, 'Create link')), out),
+    h('div', { class: 'row', style: 'align-items:flex-end' }, relayAvailable || xrayAvailable ? field('Profile', kind) : null, field('Valid for', hours), h('button', { class: 'btn primary', onClick: make }, 'Create link')), out),
     buttons: [{ label: 'Done', cls: 'primary', value: true }] });
 }
 function staticIpDialog(c, after) {

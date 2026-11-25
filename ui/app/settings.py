@@ -58,6 +58,8 @@ class Settings:
         self.profile_base_url = _env("OVPN_PROFILE_BASE_URL", "").strip().rstrip("/")
         # Token of the Telegram bot clients use to get their links and portal password (from @BotFather).
         self.telegram_token = _env("OVPN_TELEGRAM_BOT_TOKEN", "").strip()
+        # Port of the 3x-ui panel (xui service, host network), reached at 127.0.0.1.
+        self.xui_port = int(_env("XUI_PORT", "2053"))
 
     def read_network(self):
         try:

@@ -367,6 +367,7 @@ const SETTINGS_PANES = [
   { id: 'guests', title: 'Guests', hint: 'Portal and guest links', form: true, needs: ['gateway'] },
   { id: 'vpn', title: 'VPN network', hint: 'Subnets, pool, DNS, routes', form: true, needs: ['restart'] },
   { id: 'gateway', title: 'Gateway', hint: 'How Traefik reaches this server', form: true, needs: ['gateway'] },
+  { id: 'xray', title: 'Xray', hint: '3x-ui inbound for client keys', needs: ['own'] },
   { id: 'router', title: 'Router', hint: 'Traffic by podkop section', needs: ['own'] },
   { id: 'account', title: 'Account', hint: 'Password, appearance, version', needs: ['own'] },
 ];
@@ -388,6 +389,7 @@ function settingsView(el) {
     const form = networkForm(network, relay, general);
     const panes = {
       ...form.panes,
+      xray: xrayCard(),
       router: routerCard(),
       account: h('div', { class: 'stack' }, h('div', { class: 'grid two' }, passwordCard(), appearanceCard()),
         card('About', h('dl', { class: 'kv' },
@@ -519,4 +521,30 @@ function appearanceCard() {
     } }, t));
   }
   return card('Appearance', h('div', { class: 'row' }, theme));
+}
+
+// Xray through 3x-ui: the inbound whose clients this UI keeps, one per client.
+function xrayCard() {
+  const body = h('div', { class: 'stack' }, h('div', { class: 'small muted' }, 'Loading…'));
+  (async () => {
+    let info;
+    try { info = await api('/api/xray/settings'); } catch (e) { setChildren(body, h('div', { class: 'notice', role: 'alert' }, e.message)); return; }
+    const on = h('input', { type: 'checkbox', checked: info.enabled });
+    const inbound = h('select', { class: 'input', 'aria-label': 'Xray inbound' },
+      h('option', { value: '' }, info.inbounds.length ? 'Choose an inbound' : 'No inbounds in 3x-ui yet'),
+      info.inbounds.map(i => h('option', { value: String(i.id), selected: i.id === info.inbound_id }, `${i.remark || i.tag} · ${i.protocol}${i.security ? ' + ' + i.security : ''} · port ${i.port}`)));
+    setChildren(body,
+      info.error ? h('div', { class: 'notice', role: 'alert' }, info.error) : null,
+      h('p', { class: 'small muted', style: 'margin:0' }, 'Create the inbound in the 3x-ui panel (VLESS + REALITY over TCP works best), forward its port on the router, then choose it here. ',
+        'Clients get a key from Share link or the Telegram bot; it stops working when their certificate ends. Xray gives internet only: private ranges and this server’s networks are blocked for everyone.'),
+      h('label', { class: 'check' }, on, 'Offer Xray keys to clients'),
+      field('Inbound', inbound),
+      h('div', { class: 'row' }, h('button', { class: 'btn primary', onClick: async () => {
+        try {
+          await withToast(api('/api/xray/settings', { method: 'PUT', body: { enabled: on.checked, inbound_id: inbound.value ? Number(inbound.value) : null } }), 'Xray settings saved');
+        } catch (_) {}
+      } }, 'Save')),
+      h('p', { class: 'small muted', style: 'margin:0' }, 'The panel listens on this server only (XUI_LISTEN, port XUI_PORT). Its login is printed once in docker compose logs xui; reach it with ssh -L 2053:127.0.0.1:2053 <server>.'));
+  })();
+  return body;
 }

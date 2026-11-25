@@ -17,7 +17,7 @@ from .settings import settings
 
 # Relative to the OpenVPN directory. The database goes in as a snapshot, see create().
 ITEMS = ("server.conf", "config", "pki", "clients", "staticclients", "guests", "fw-rules.sh",
-         "docker-compose.yml", ".env")
+         "docker-compose.yml", ".env", "xui")      # xui: the 3x-ui database (inbounds, keys of clients)
 PREFIX, SUFFIX = "openvpn-backup-", ".tar.gz"
 MAX_AGE = 86400
 RECIPIENT_RE = re.compile(r"age1[a-z0-9]{58}")

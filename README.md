@@ -372,6 +372,44 @@ clients and trusted LAN networks through the gateway's regular HTTPS listener.
 From the open internet it is not reachable; a first profile goes out as a
 one-time link (from the bot or **Share link**).
 
+## Xray (3x-ui)
+
+The `xui` service runs [3x-ui](https://github.com/MHSanaei/3x-ui) (Xray with a
+panel) next to OpenVPN and the relay, for networks where OpenVPN is blocked.
+The UI gives every client its own Xray key on one inbound and takes it away
+with the certificate.
+
+1. `sudo docker compose up -d xui`, then `sudo docker compose logs xui`: the
+   first start prints the panel login and address once. The panel listens on
+   this server only (`XUI_LISTEN=127.0.0.1`, port `XUI_PORT=2053`); open it
+   with `ssh -L 2053:127.0.0.1:2053 <server>` and the printed address. Its
+   subscription server is switched off at the first start.
+2. In the panel, add an inbound: VLESS, TCP, security REALITY (pick a target
+   with *Scan*, generate the keys), on a free port such as 8445. Forward that
+   TCP port on the router to this server.
+3. In this UI, **Settings → Xray**: tick *Offer Xray keys*, choose the inbound,
+   Save.
+
+Clients then get a key from **Share link** (profile *Xray*) or the bot's
+**Xray** button. The one-time page shows the `vless://` key and its QR code
+once; it goes into v2RayTun, Streisand, v2rayNG or Hiddify. The key carries
+the public host of profiles (Settings) and the inbound's port.
+
+* Clients made by this UI have the comment `openvpn-ui` in 3x-ui; clients you
+  add in the panel yourself are left alone.
+* A key ends with the certificate: revoking, deleting or creating a client
+  again under its name removes its 3x-ui client at once, and an hourly check
+  removes what is left and moves end dates after renewals.
+* Xray gives internet only, for full-access clients and guests alike: a
+  routing rule (`ruleTag` `openvpn-ui-no-lan`, kept right after 3x-ui's own
+  `api` rule) sends private ranges, the pushed routes and every network of this
+  host to `blocked`. Use OpenVPN for the LAN.
+* Traffic per client is in the 3x-ui panel; the charts of this UI count
+  OpenVPN and the relay.
+* `xui/` holds 3x-ui's database and the UI's API token (`openvpn-ui.json`); it
+  is in the backups. Delete `xui/openvpn-ui.json` to have a new panel login
+  and token made at the next start.
+
 ## Telegram bot
 
 Clients get access themselves from a Telegram bot: a one-time link to their

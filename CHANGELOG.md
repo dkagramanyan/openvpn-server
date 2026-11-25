@@ -1,6 +1,23 @@
 <!-- Network addresses in examples are synthetic; deployment-specific notes are omitted. -->
 # Changelog
 
+## 2.8.0 - 2026-11-26
+
+Xray through 3x-ui, as a third way in.
+
+* **`xui` service**: 3x-ui 3.11.0 on the host network. Its panel listens on
+  this server only (`XUI_LISTEN`, `XUI_PORT`); the first start prints a random
+  login, switches the subscription server off and hands the UI an API token in
+  `xui/openvpn-ui.json`.
+* **Settings → Xray**: choose the inbound made in the panel. The UI keeps one
+  3x-ui client per client (comment `openvpn-ui`), ending with its certificate;
+  revocation, deletion and a reused name remove it, an hourly check tidies up.
+* **Xray keys** through Share link (profile *Xray*) and the bot's **Xray**
+  button: a one-time page with the `vless://` key and its QR code.
+* **Internet only**: a routing rule blocks private ranges, pushed routes and
+  this host's networks on that inbound, for everyone.
+* Backups (UI archives and `backup.sh`) include `xui/`.
+
 ## 2.7.0 - 2026-11-26
 
 A Telegram bot hands out access; portal passwords come from it.

@@ -26,7 +26,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Str
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import __version__, auth, backup, guest_check, pki, relay, relay_services, relay_history, sections, telegram_bot, watchdog, network, network_discovery
+from . import __version__, auth, backup, guest_check, pki, relay, relay_services, relay_history, sections, telegram_bot, watchdog, xray, network, network_discovery
 from .collector import Collector, Maintenance
 from .db import Database, HOUR_RETENTION, MINUTE_RETENTION, RELAY_FLOW_RETENTION, _TRAFFIC_UNION, empty_point
 from .mgmt import Management, ManagementError
@@ -54,14 +54,14 @@ _mgmt_host, _mgmt_port, _ = settings.management_endpoint()
 mgmt = Management(_mgmt_host, _mgmt_port, settings.management_password)
 collector = Collector(db, mgmt, settings.poll_interval, settings.status_file,
                       (settings.log_dir / "openvpn.log", settings.log_dir / "oath.log"))
-maintenance = Maintenance(db, [lambda: pki.ensure_crl_fresh(), backup.ensure_recent])
+maintenance = Maintenance(db, [lambda: pki.ensure_crl_fresh(), backup.ensure_recent, lambda: xray.reconcile(db)])
 
 
 def bot_info(name: str) -> dict:
     cert = relay.eligible(name)
     gateway = network.get_settings(db)["gateway"]
     return {"valid": bool(cert), "guest": relay.is_guest(name), "expires_at": cert["not_after"] if cert else None,
-            "relay": relay.get_settings(db)["enabled"], "portal_url": f"https://{gateway['openvpn_host']}/portal" if gateway["openvpn_host"] else "the website of this server"}
+            "relay": relay.get_settings(db)["enabled"], "xray": xray.enabled(db), "portal_url": f"https://{gateway['openvpn_host']}/portal" if gateway["openvpn_host"] else "the website of this server"}
 
 
 def bot_link(name: str, kind: str) -> dict:
@@ -369,6 +369,11 @@ class AccessBody(BaseModel):
     guest: bool
 
 
+class XrayBody(BaseModel):
+    enabled: bool
+    inbound_id: int | None = None
+
+
 class TelegramBody(BaseModel):
     username: str = Field(max_length=64)
 
@@ -383,7 +388,7 @@ class RouterKeyBody(BaseModel):
 
 class ShareBody(BaseModel):
     hours: int = Field(default=24, ge=1, le=24 * 30)
-    kind: Literal["openvpn", "relay"] = "openvpn"
+    kind: Literal["openvpn", "relay", "xray"] = "openvpn"
 
 
 class ControlChannelBody(BaseModel):
@@ -524,6 +529,7 @@ def clients_payload(period: Period | None = None, extras: bool = False) -> list[
     statics = pki.static_ips()
     guests = pki.guests()
     relay_enabled = relay.get_settings(db)["enabled"]
+    xray_enabled = xray.enabled(db)
     tfa = pki.tfa_secrets()
     live = collector.snapshot()
     online: dict[str, list[dict[str, Any]]] = {}
@@ -553,6 +559,7 @@ def clients_payload(period: Period | None = None, extras: bool = False) -> list[
             "static_ip": statics.get(name),
             "guest": name in guests,
             "relay_available": relay_enabled and cert["state"] == "valid",
+            "xray_available": xray_enabled and cert["state"] == "valid",
             "tfa": name in tfa,
             # Online = an OpenVPN connection or an open relay connection.
             "online": bool(via),
@@ -945,6 +952,7 @@ def _create_client(body: NewClientBody, user: dict[str, Any]) -> dict[str, Any]:
     # A new certificate is a new client: history, access and 2FA of an earlier one with this name stay behind.
     db.archive_client_history(name)
     drop_share_links(name)
+    xray.forget(db, name)
     pki.set_guest(name, body.guest)
     if not static_ip:
         pki.set_static_ip(name, None)
@@ -1123,6 +1131,24 @@ def get_relay_settings(user: dict[str, Any] = Authed):
     return relay.get_settings(db)
 
 
+@app.get("/api/xray/settings")
+def get_xray_settings(user: dict[str, Any] = Authed):
+    """The saved choice, and what 3x-ui offers (or why it cannot be asked)."""
+    try:
+        inbounds, error = xray.inbounds(), None
+    except PkiError as exc:
+        inbounds, error = [], str(exc)
+    return {**xray.get_settings(db), "inbounds": inbounds, "error": error}
+
+
+@app.put("/api/xray/settings", dependencies=[Csrf])
+def set_xray_settings(body: XrayBody, user: dict[str, Any] = Authed):
+    saved = xray.save_settings(db, body.enabled, body.inbound_id)
+    xray.reconcile(db)          # the routing rule now, not in an hour
+    event("xray_settings_changed", user, None, "on" if body.enabled else "off")
+    return saved
+
+
 @app.get("/api/relay/status")
 def relay_status(user: dict[str, Any] = Authed):
     return {**relay_services.runtime_status(), "sessions": relay_history.sessions(db),
@@ -1201,6 +1227,7 @@ def revoke(name: str, body: ReasonBody, user: dict[str, Any] = Authed):
     pki.revoke_client(name, body.reason or None)
     relay.revoke(db, name)
     drop_share_links(name)
+    xray.forget(db, name)
     killed = ""
     try:
         killed = mgmt.kill(name)
@@ -1245,6 +1272,7 @@ def delete_client(name: str, user: dict[str, Any] = Authed):
     disable_portal(name)
     relay.revoke(db, name)
     drop_share_links(name)
+    xray.forget(db, name)
     serials = [row["cert"]["serial"]] + [h["serial"] for h in row["history"]]
     with db.tx() as conn:
         for serial in serials:
@@ -1309,6 +1337,8 @@ def create_share_link(name: str, kind: str, hours: int, created_by: str, request
     """{"url", "import_url", "expires_at", "public"}: a one-time link to one profile of a valid client."""
     if kind == "relay" and not relay.get_settings(db)["enabled"]:
         raise HTTPException(400, "Apple relay profiles are not offered (Settings → Apple relay)")
+    if kind == "xray" and not xray.enabled(db):
+        raise HTTPException(400, "Xray is off (Settings → Xray)")
     token = secrets.token_urlsafe(24)
     now = int(time.time())
     db.execute("INSERT INTO share_tokens (token_hash, client_name, created_at, expires_at, created_by, kind) "
@@ -1349,6 +1379,8 @@ SHARE_CSS = ("body{font:17px/1.5 system-ui,sans-serif;max-width:26rem;margin:12v
              "color:#16181d;background:#fff}h1{font-size:1.4rem}a{display:block;margin:14px 0;padding:13px 16px;"
              "border-radius:8px;text-align:center;text-decoration:none;font-weight:600;color:#fff;background:#1f6feb}"
              "a+a{color:#1f6feb;background:none;border:1px solid}"
+             "textarea{width:100%;box-sizing:border-box;font:13px/1.4 ui-monospace,monospace;padding:8px}"
+             "svg{display:block;width:100%;max-width:18rem;margin:16px auto;background:#fff}"
              "@media(prefers-color-scheme:dark){body{color:#e6e8eb;background:#111418}}")
 SHARE_HEAD = ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
               '<meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex">'
@@ -1361,7 +1393,15 @@ SHARE_PAGES = {
     + "<p>Open this page in Safari on the iPhone, iPad or Mac that will use the relay. The profile can be fetched once.</p>"
       '<a href="DOWNLOAD_URL">Install the profile</a>'
       "<p>Then open Settings → Profile Downloaded and tap Install.</p></body></html>",
+    "xray": SHARE_HEAD.replace("TITLE", "Xray key")
+    + "<p>Open this page on the device that will use it. The key is shown once: keep the next page open "
+      "until it is imported.</p><a href=\"DOWNLOAD_URL\">Show my key</a></body></html>",
 }
+XRAY_KEY_HEAD = (SHARE_HEAD.replace("TITLE", "Xray key")
+                 + "<p>Install an Xray app: v2RayTun or Streisand (iPhone, Mac), v2RayTun or v2rayNG (Android), "
+                   "Hiddify (Windows, macOS, Linux). Copy the key below and import it from the clipboard, "
+                   "or scan the code with the app on another device.</p>")
+XRAY_KEY_TAIL = "<p>The key is personal: do not share it. This page cannot be opened again.</p></body></html>"
 SHARE_CSP = ("default-src 'none'; style-src 'sha256-" + base64.b64encode(hashlib.sha256(SHARE_CSS.encode()).digest()).decode()
              + "'; frame-ancestors 'none'; base-uri 'none'")
 
@@ -1383,7 +1423,9 @@ def shared_profile(token: str, request: Request):
     """Public: the profile itself, once."""
     name, kind = shared_link(token, request)
     # Built before the link is spent: a failure here leaves it usable.
-    if kind == "relay":
+    if kind == "xray":
+        content = xray.link(db, name)
+    elif kind == "relay":
         try:
             content = relay.profile(db, name)
         except PkiError:
@@ -1400,6 +1442,10 @@ def shared_profile(token: str, request: Request):
             db.add_event("profile_link_used", name, None, client_ip(request), conn=conn)
     if not spent:       # two requests at once: the other one got it
         raise HTTPException(404, "This link is invalid, expired or already used")
+    if kind == "xray":
+        page = (XRAY_KEY_HEAD + '<textarea readonly rows="6" aria-label="Xray key">' + html.escape(content) + "</textarea>"
+                + pki.qr_svg(content, inline=True) + XRAY_KEY_TAIL)
+        return HTMLResponse(page, headers={"Content-Security-Policy": SHARE_CSP})
     if kind == "relay":
         return Response(content, media_type="application/x-apple-aspen-config",
                         headers={"Content-Disposition": f'attachment; filename="{name}-relay.mobileconfig"'})
