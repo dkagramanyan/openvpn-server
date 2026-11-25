@@ -24,9 +24,10 @@ check Alpine "$(pinned ALPINE_VERSION)" \
     "$(curl -fsSL https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/x86_64/latest-releases.yaml | sed -n 's/^ *version: *//p' | head -1)" \
     https://alpinelinux.org/releases/
 for pkg in $(sed -n 's/==.*//p' ui/requirements.in); do
-    check "$pkg" "$(sed -n "s/^$pkg==//p" ui/requirements.in)" \
-        "$(curl -fsSL "https://pypi.org/pypi/$pkg/json" | python3 -c 'import json, sys; print(json.load(sys.stdin)["info"]["version"])')" \
-        "https://pypi.org/project/$pkg/"
+    project=${pkg%%[*}      # PyPI knows psycopg, not psycopg[binary]
+    check "$pkg" "$(awk -F'==' -v p="$pkg" '$1 == p { print $2 }' ui/requirements.in)" \
+        "$(curl -fsSL "https://pypi.org/pypi/$project/json" | python3 -c 'import json, sys; print(json.load(sys.stdin)["info"]["version"])')" \
+        "https://pypi.org/project/$project/"
 done
 
 (( ${#behind[@]} )) || { echo "Everything is current."; exit 0; }

@@ -292,7 +292,7 @@ tls:
         curl = ["curl", "--silent", "--show-error", "--fail", "--proxytunnel", "--write-out", "%{http_connect}", "--max-time", "10", "--noproxy", "", "--proxy", origin,
                 "--proxy-http2", "--proxy-cacert", str(folder / "identity/ca.pem"), "--proxy-header", "@" + str(headers)]
         page = command(*curl, "http://" + address + ":8080/")
-        assert "OpenVPN" in page
+        assert "Access server" in page
         print("PASS: signed profile verified; real HTTP/2 CONNECT through Docker Traefik reaches LAN")
         def saved_session(minimum):
             for _ in range(30):
@@ -333,7 +333,7 @@ tls:
         command("docker", "start", postgres)
         for _ in range(60):
             restored = subprocess.run([*curl, "http://" + address + ":8080/"], capture_output=True)
-            if restored.returncode == 0 and b"OpenVPN" in restored.stdout:
+            if restored.returncode == 0 and b"Access server" in restored.stdout:
                 break
             time.sleep(0.5)
         else:
@@ -359,7 +359,7 @@ tls:
         assert any(e["guest"] and e["kind"] == "denied" and e["reason"] == "destination_denied" for e in activity)
         # The portal host goes to the gateway's portal listener, which serves only portal pages.
         inner_tls = ["--insecure"]   # the fixture certificate is for localhost
-        assert "OpenVPN" in command(*curl, *inner_tls, "https://openvpn.example.test/portal")
+        assert "Access server" in command(*curl, *inner_tls, "https://openvpn.example.test/portal")
         hidden = subprocess.run([*[x for x in curl if x != "--fail"], *inner_tls, "--output", "/dev/null", "--write-out", "%{http_code}",
                                  "https://openvpn.example.test/api/clients"], capture_output=True, text=True)
         assert hidden.stdout.endswith("404"), hidden.stdout
@@ -376,7 +376,7 @@ tls:
         assert guest_payload["MatchDomains"] == []   # everything through the relay
         api("/api/clients/alice/access", {"guest": False}, "PUT")
         time.sleep(2)
-        assert "OpenVPN" in command(*curl, "http://" + address + ":8080/")
+        assert "Access server" in command(*curl, "http://" + address + ":8080/")
         runtime = json.loads(api("/api/relay/status"))
         assert runtime["total"] >= 2 and runtime["denied"] >= 1
         user_stats = next(row for row in runtime["clients"] if row["client"] == "alice")
@@ -459,11 +459,11 @@ HTTPServer(("0.0.0.0", 8089), Handler).serve_forever()
                 api("/api/login", {"username": "admin", "password": password})
                 break
             except Exception: time.sleep(1)
-        assert "OpenVPN" in command(*curl, "http://" + address + ":8080/")
+        assert "Access server" in command(*curl, "http://" + address + ":8080/")
         print("PASS: relay works during UI outage; live role changes apply; policy outage returns retryable 503; policy cannot read admin data or keys")
         config = json.loads(api("/api/server/config/server"))["content"]
         api("/api/server/config/server", {"content": config + "\n# A UI save keeps relay access\n"}, "PUT")
-        assert "OpenVPN" in command(*curl, "http://" + address + ":8080/")
+        assert "Access server" in command(*curl, "http://" + address + ":8080/")
         print("PASS: UI config saves keep relay access")
         api("/api/clients/alice/relay", method="DELETE")
         time.sleep(2)
