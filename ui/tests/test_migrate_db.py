@@ -53,6 +53,8 @@ def test_import_preserves_every_table_accounts_credentials_history_and_source(tm
                 rows = [{**row, 'source': 'vpn'} for row in rows]
             if table == 'share_tokens':             # legacy links are OpenVPN profile links
                 rows = [{**row, 'kind': 'openvpn'} for row in rows]
+            if table == 'clients':                  # no Telegram usernames before 2.7
+                rows = [{**row, 'telegram': None, 'telegram_id': None, 'telegram_name': None} for row in rows]
             assert result['imported'][table] == len(rows)
             actual = db.query(f'SELECT * FROM {table}' + (" WHERE key NOT LIKE 'migration:%'" if table == 'settings' else ''))
             assert sorted(actual, key=str) == sorted(rows, key=str)

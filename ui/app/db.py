@@ -305,6 +305,11 @@ class Database:
             conn.execute("ALTER TABLE relay_flows ADD COLUMN IF NOT EXISTS address TEXT")
             # 2.6: a one-time link carries the OpenVPN profile or the Apple relay profile.
             conn.execute("ALTER TABLE share_tokens ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'openvpn'")
+            # 2.7: the client's Telegram username (lower case, no "@"), and the account that claimed it.
+            for column, kind in (("telegram", "TEXT"), ("telegram_id", "BIGINT"), ("telegram_name", "TEXT")):
+                conn.execute(f"ALTER TABLE clients ADD COLUMN IF NOT EXISTS {column} {kind}")
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS clients_telegram ON clients(telegram) WHERE telegram IS NOT NULL")
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS clients_telegram_id ON clients(telegram_id) WHERE telegram_id IS NOT NULL")
             if not conn.execute("SELECT 1 FROM information_schema.columns WHERE table_schema = ? AND "
                                 "table_name = 'relay_flows' AND column_name = 'sectioned'", (schema,)).fetchone():
                 conn.execute("ALTER TABLE relay_flows ADD COLUMN sectioned BOOLEAN NOT NULL DEFAULT true")

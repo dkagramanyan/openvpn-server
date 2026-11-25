@@ -1,6 +1,26 @@
 <!-- Network addresses in examples are synthetic; deployment-specific notes are omitted. -->
 # Changelog
 
+## 2.7.0 - 2026-11-26
+
+A Telegram bot hands out access; portal passwords come from it.
+
+* **Telegram bot** (`OVPN_TELEGRAM_BOT_TOKEN`, off when empty). The admin
+  enters a client's Telegram username under **Telegram & portal**; the first
+  message from that username links the Telegram account, which alone is
+  answered from then on. The bot sends one-time links (one hour) to the
+  OpenVPN and the Apple relay profile, a new portal password, and the status of
+  the access. Private chats only, 20 links or passwords an hour per account,
+  every action in the event log as `telegram`. Long polling: no port to open.
+  A client created again under a reused name starts without a Telegram
+  account; a disabled portal login comes back when the client asks the bot
+  (revoke the client to cut access).
+* **Portal passwords are generated.** A client cannot choose or change its own
+  password any more; the bot (or **New password** on the client page, shown
+  once) issues a new one and ends the earlier sign-ins. A new login's username
+  is the client name; existing logins keep theirs. The admin dialog has no
+  password field any more.
+
 ## 2.6.0 - 2026-11-26
 
 One-time profile links that work for people outside the network.

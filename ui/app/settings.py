@@ -56,6 +56,8 @@ class Settings:
         self.backup_recipient = _env("OVPN_BACKUP_RECIPIENT", "").strip()
         # Public base URL of the one-time profile links (a reverse proxy forwarding /p/ to the UI).
         self.profile_base_url = _env("OVPN_PROFILE_BASE_URL", "").strip().rstrip("/")
+        # Token of the Telegram bot clients use to get their links and portal password (from @BotFather).
+        self.telegram_token = _env("OVPN_TELEGRAM_BOT_TOKEN", "").strip()
 
     def read_network(self):
         try:

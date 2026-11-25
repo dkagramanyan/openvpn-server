@@ -126,6 +126,7 @@ services:
       UVICORN_HOST: ${OVPN_UI_BIND:-0.0.0.0}                # address the UI listens on (port 8080)
       FORWARDED_ALLOW_IPS: ${OVPN_UI_TRUSTED_PROXIES:-127.0.0.1} # proxies whose X-Forwarded-For is believed
       OVPN_PROFILE_BASE_URL: ${OVPN_PROFILE_BASE_URL:-}     # public base of one-time profile links (/p/...)
+      OVPN_TELEGRAM_BOT_TOKEN: ${OVPN_TELEGRAM_BOT_TOKEN:-} # Telegram bot for clients; empty = off
       OVPN_BACKUP_RECIPIENT: ${OVPN_BACKUP_RECIPIENT:-}     # age public key: backup archives are encrypted to it
       OVPN_RELAY_TRANSPORT: ${APPLE_RELAY_TRANSPORT:-http2+http3}
       OVPN_RELAY_REQUIRE_SIGNED: ${OVPN_RELAY_REQUIRE_SIGNED:-true}

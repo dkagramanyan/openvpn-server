@@ -355,7 +355,6 @@ dialog.modal .m-f { padding: 0 18px 16px; display: flex; gap: 8px; justify-conte
 .connection-method summary, .portal-panel summary { font-weight: 600; cursor: pointer; font-size: 15px; }
 .connection-method[open] summary, .portal-panel[open] summary { margin-bottom: 16px; }
 .connection-method .btn { align-self: flex-start; }
-.form-message { padding: 10px; border-radius: 8px; background: var(--surface-2); }
 .download-help { max-width: 640px; margin: 40px auto; padding: 20px; }
 @media (max-width: 600px) {
   .settings-section { padding: 14px; }

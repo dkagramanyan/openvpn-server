@@ -794,12 +794,17 @@ def test_ui_certificate_renewal_preserves_relay_profile(client, configured, monk
     assert download(client)[0]["PayloadIdentifier"] == original["PayloadIdentifier"]
 
 
+PORTAL = {}     # the portal login the fixture got: {"username", "password"}
+
+
 @pytest.fixture
 def portal(client):
     from fastapi.testclient import TestClient
-    assert client.put("/api/clients/alice/portal", json={"username": "alice-login", "password": "portal-test-password"}, headers=H).status_code == 200
+    r = client.post("/api/clients/alice/portal/password", headers=H)
+    assert r.status_code == 200, r.text
+    PORTAL.update(username=r.json()["username"], password=r.json()["password"])
     browser = TestClient(app)
-    assert browser.post("/api/portal/login", json={"username": "alice-login", "password": "portal-test-password"}, headers=H).status_code == 200
+    assert browser.post("/api/portal/login", json=PORTAL, headers=H).status_code == 200
     yield browser
     browser.close()
     client.delete("/api/clients/alice/portal", headers=H)
@@ -835,23 +840,30 @@ def test_portal_cannot_access_any_administrative_api(portal):
     assert portal.post("/api/relay/authorize").status_code == 403
 
 
-def test_portal_password_reset_disable_and_admin_collision(client, portal):
-    assert client.put("/api/clients/alice/portal", json={"username": "admin", "password": "replacement-password"}, headers=H).status_code == 400
-    assert portal.post("/api/portal/password", json={"current": "portal-test-password", "new": "my-new-test-password"}, headers=H).status_code == 200
-    assert portal.get("/api/portal").status_code == 200
-    assert client.put("/api/clients/alice/portal", json={"username": "alice-login", "password": "admin-reset-password"}, headers=H).status_code == 200
-    assert portal.get("/api/portal").status_code == 401
-    assert portal.post("/api/portal/login", json={"username": "alice-login", "password": "admin-reset-password"}, headers=H).status_code == 200
+def test_portal_password_is_generated_reset_and_disabled(client, portal):
+    old = dict(PORTAL)
+    assert old["username"] == "alice" and re.fullmatch(r"[a-z2-9]{4}(-[a-z2-9]{4}){3}", old["password"])
+    # Clients do not choose their password: the Telegram bot (or the admin) issues a new one.
+    assert portal.post("/api/portal/password", json={"current": old["password"], "new": "my-new-test-password"}, headers=H).status_code != 200
+    assert portal.post("/api/me/password", json={"current": old["password"], "new": "my-new-test-password"}, headers=H).status_code == 403
+    r = client.post("/api/clients/alice/portal/password", headers=H)
+    assert r.status_code == 200 and r.json()["username"] == "alice" and r.json()["password"] != old["password"]
+    new = {"username": "alice", "password": r.json()["password"]}
+    assert portal.get("/api/portal").status_code == 401                  # earlier sign-ins ended
+    assert portal.post("/api/portal/login", json=old, headers=H).status_code == 401
+    assert portal.post("/api/portal/login", json=new, headers=H).status_code == 200
+    PORTAL.update(new)
     assert client.delete("/api/clients/alice/portal", headers=H).status_code == 200
     assert portal.get("/api/portal").status_code == 401
-    assert portal.post("/api/portal/login", json={"username": "alice-login", "password": "admin-reset-password"}, headers=H).status_code == 401
+    assert portal.post("/api/portal/login", json=new, headers=H).status_code == 401
+    assert client.post("/api/clients/old/portal/password", headers=H).status_code == 400   # expired cert
 
 
 def test_portal_rejects_revoked_or_replaced_client(client, portal, monkeypatch):
     cert = relay.eligible("alice")
     monkeypatch.setattr(relay, "eligible", lambda name: {**cert, "serial": "UNEXPECTED-REPLACEMENT"})
     assert portal.get("/api/portal").status_code == 401
-    assert portal.post("/api/portal/login", json={"username": "alice-login", "password": "portal-test-password"}, headers=H).status_code == 401
+    assert portal.post("/api/portal/login", json=PORTAL, headers=H).status_code == 401
 
 
 def test_portal_survives_normal_ui_renewal(client, portal, monkeypatch):
@@ -885,7 +897,7 @@ def test_one_sign_in_for_admins_and_clients(client, portal):
             admin = browser.post(path, json={"username": "admin", "password": "test-password"}, headers=H)
             assert admin.status_code == 200 and admin.json()["role"] == "admin"
             user = TestClient(app)
-            answer = user.post(path, json={"username": "alice-login", "password": "portal-test-password"}, headers=H)
+            answer = user.post(path, json=PORTAL, headers=H)
             assert answer.status_code == 200 and answer.json()["role"] == "client"
             assert user.get("/api/clients").status_code == 403
             user.close()
@@ -897,7 +909,7 @@ def test_one_sign_in_for_admins_and_clients(client, portal):
     try:
         assert guest_side.post("/api/portal/login", json={"username": "admin", "password": "test-password"}, headers=restricted).status_code == 401
         assert not guest_side.cookies
-        assert guest_side.post("/api/portal/login", json={"username": "alice-login", "password": "portal-test-password"}, headers=restricted).status_code == 200
+        assert guest_side.post("/api/portal/login", json=PORTAL, headers=restricted).status_code == 200
     finally:
         guest_side.close()
 
@@ -1426,3 +1438,133 @@ def test_share_links_use_the_public_website_hostname(client, monkeypatch):
     assert link["url"].startswith("http://testserver/p/") and link["public"] is False
     monkeypatch.setattr(main.settings, "profile_base_url", "https://vpn.example.test")
     assert client.post("/api/clients/alice/share", json={}, headers=H).json()["url"].startswith("https://vpn.example.test/p/")
+
+
+class FakeTelegram:
+    def __init__(self):
+        self.sent = []
+
+    def call(self, method, timeout=15, **params):
+        assert method == "sendMessage"
+        self.sent.append(params)
+        return {}
+
+    @property
+    def text(self):
+        return self.sent[-1]["text"]
+
+
+def tg(text, sender=1001, username="Alice_TG", kind="private"):
+    return {"chat": {"id": sender, "type": kind}, "text": text,
+            "from": {"id": sender, "username": username, "first_name": "Alice"}}
+
+
+@pytest.fixture
+def telegram(client, monkeypatch):
+    from app import main, telegram_bot
+    from app.main import limiter
+    monkeypatch.setattr(main.settings, "profile_base_url", "https://vpn.example.test")
+    api = FakeTelegram()
+    bot = telegram_bot.Bot(api, db, link=main.bot_link, password=main.issue_portal_password, info=main.bot_info)
+    bot.username = "access_bot"
+    monkeypatch.setattr(main, "bot", bot)
+    yield bot, api
+    client.put("/api/clients/alice/telegram", json={"username": ""}, headers=H)
+    client.delete("/api/clients/alice/portal", headers=H)
+    limiter._state.clear()
+
+
+def test_telegram_bot_binds_a_username_once_then_trusts_the_id(client, configured, telegram):
+    from fastapi.testclient import TestClient
+    bot, api = telegram
+    bot.handle(tg("/start"))
+    assert "no access" in api.text and "@Alice_TG" in api.text
+    assert client.put("/api/clients/alice/telegram", json={"username": "not valid"}, headers=H).status_code == 400
+    r = client.put("/api/clients/alice/telegram", json={"username": "@alice_tg"}, headers=H)
+    assert r.status_code == 200 and r.json()["telegram"] == "alice_tg" and not r.json()["telegram_linked"]
+    assert r.json()["bot_username"] == "access_bot"
+    bot.handle(tg("/start"))                                      # usernames match without regard to case
+    assert "account alice" in api.text
+    assert [b["text"] for row in api.sent[-1]["reply_markup"]["keyboard"] for b in row] == ["OpenVPN", "Apple relay", "Portal password", "Status"]
+    info = client.get("/api/clients/alice/portal").json()
+    assert info["telegram_linked"] and info["telegram_name"] == "Alice"
+    assert any(e["kind"] == "telegram_linked" for e in client.get("/api/events").json()["events"])
+    # Someone who takes the username later is not the bound account.
+    bot.handle(tg("/start", sender=2002))
+    assert "no access" in api.text
+    # The bound account keeps working after it changes its username.
+    bot.handle(tg("OpenVPN", username="renamed"))
+    url = re.search(r"https://vpn\.example\.test(/p/\S+)", api.text)
+    assert url and "OpenVPN Connect" in api.text
+    assert "<cert>" in client.get(url.group(1) + "/download").text
+    bot.handle(tg("/relay"))
+    url = re.search(r"https://vpn\.example\.test(/p/\S+)", api.text)
+    assert plistlib.loads(client.get(url.group(1) + "/download").content)["PayloadContent"][0]["Relays"]
+    bot.handle(tg("Portal password"))
+    login = dict(re.findall(r"(Username|Password): (\S+)", api.text))
+    browser = TestClient(app)
+    try:
+        assert browser.post("/api/portal/login", json={"username": login["Username"], "password": login["Password"]}, headers=H).status_code == 200
+        assert browser.get("/api/portal").json()["telegram_bot"] == "access_bot"
+    finally:
+        browser.close()
+    bot.handle(tg("Status"))
+    assert "Account: alice" in api.text and "Access: full" in api.text
+    sent = len(api.sent)
+    bot.handle(tg("Status", kind="group"))                       # groups are ignored
+    assert len(api.sent) == sent
+    # A new username from the admin unbinds the old account.
+    assert not client.put("/api/clients/alice/telegram", json={"username": "someone_else"}, headers=H).json()["telegram_linked"]
+    bot.handle(tg("Status"))
+    assert "no access" in api.text
+
+
+def test_telegram_bot_refuses_ended_access_and_limits_requests(client, telegram, monkeypatch):
+    from app import telegram_bot
+    bot, api = telegram
+    assert client.put("/api/clients/alice/telegram", json={"username": "alice_tg"}, headers=H).status_code == 200
+    r = client.put("/api/clients/old/telegram", json={"username": "ALICE_TG"}, headers=H)
+    assert r.status_code == 400 and "already set for alice" in r.json()["detail"]
+    monkeypatch.setattr(telegram_bot, "ACTIONS_PER_HOUR", 2)
+    for _ in range(2):
+        bot.handle(tg("OpenVPN"))
+        assert "/p/" in api.text
+    bot.handle(tg("OpenVPN"))
+    assert "Too many requests" in api.text
+    monkeypatch.setattr(relay, "eligible", lambda name: None)
+    bot.handle(tg("Portal password"))
+    assert "expired or was revoked" in api.text
+
+
+def test_telegram_api_errors_never_carry_the_token():
+    from app import telegram_bot
+    api = telegram_bot.Api("123:SECRET-TOKEN", base="http://127.0.0.1:9")
+    with pytest.raises(telegram_bot.ApiError) as error:
+        api.call("getMe", timeout=2)
+    assert "SECRET" not in str(error.value)
+
+
+def test_a_reused_client_name_does_not_inherit_a_telegram_binding(client, monkeypatch):
+    from app import main
+    db.execute("INSERT INTO clients (name, created_at, telegram, telegram_id, telegram_name) VALUES ('dave', 1, 'dave_tg', 777, 'Dave')")
+    for stub in ("create_client", "set_guest", "set_static_ip"):
+        monkeypatch.setattr(main.pki, stub, lambda *args, **kwargs: None)
+    monkeypatch.setattr(main.pki, "list_clients", lambda *args, **kwargs: {})
+    try:
+        # the stubbed PKI issues no certificate, so the answer's final lookup of the client is a 404
+        assert client.post("/api/clients", json={"name": "dave"}, headers=H).status_code in (201, 404)
+        assert db.one("SELECT telegram, telegram_id, telegram_name FROM clients WHERE name = 'dave'") == \
+            {"telegram": None, "telegram_id": None, "telegram_name": None}
+    finally:
+        db.execute("DELETE FROM clients WHERE name = 'dave'")
+
+
+def test_telegram_bot_makes_no_link_without_a_public_address(client, telegram, monkeypatch):
+    from app import main
+    bot, api = telegram
+    monkeypatch.setattr(main.settings, "profile_base_url", "")
+    monkeypatch.setattr(main.network, "get_settings", lambda db=None: {"gateway": {"openvpn_host": ""}})
+    assert client.put("/api/clients/alice/telegram", json={"username": "alice_tg"}, headers=H).status_code == 200
+    before = db.one("SELECT count(*) AS n FROM share_tokens")["n"]
+    bot.handle(tg("OpenVPN"))
+    assert "website hostname" in api.text and db.one("SELECT count(*) AS n FROM share_tokens")["n"] == before

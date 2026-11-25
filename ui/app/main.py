@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Literal
 from urllib.parse import urlsplit, parse_qs
 
+import psycopg
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.exception_handlers import request_validation_exception_handler, http_exception_handler
@@ -25,7 +26,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Str
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import __version__, auth, backup, guest_check, pki, relay, relay_services, relay_history, sections, watchdog, network, network_discovery
+from . import __version__, auth, backup, guest_check, pki, relay, relay_services, relay_history, sections, telegram_bot, watchdog, network, network_discovery
 from .collector import Collector, Maintenance
 from .db import Database, HOUR_RETENTION, MINUTE_RETENTION, RELAY_FLOW_RETENTION, _TRAFFIC_UNION, empty_point
 from .mgmt import Management, ManagementError
@@ -54,6 +55,26 @@ mgmt = Management(_mgmt_host, _mgmt_port, settings.management_password)
 collector = Collector(db, mgmt, settings.poll_interval, settings.status_file,
                       (settings.log_dir / "openvpn.log", settings.log_dir / "oath.log"))
 maintenance = Maintenance(db, [lambda: pki.ensure_crl_fresh(), backup.ensure_recent])
+
+
+def bot_info(name: str) -> dict:
+    cert = relay.eligible(name)
+    gateway = network.get_settings(db)["gateway"]
+    return {"valid": bool(cert), "guest": relay.is_guest(name), "expires_at": cert["not_after"] if cert else None,
+            "relay": relay.get_settings(db)["enabled"], "portal_url": f"https://{gateway['openvpn_host']}/portal" if gateway["openvpn_host"] else "the website of this server"}
+
+
+def bot_link(name: str, kind: str) -> dict:
+    if not share_base()[1]:         # no public address: a link would be useless, so none is made
+        return {"public": False}
+    link = create_share_link(name, kind, 1, "telegram")
+    db.add_event("profile_link_created", name, "telegram", f"{kind}, valid 1 h")
+    return link
+
+
+bot = (telegram_bot.Bot(telegram_bot.Api(settings.telegram_token), db, link=bot_link,
+                        password=lambda name: issue_portal_password(name), info=bot_info)
+       if settings.telegram_token else None)
 relay_collector = relay_history.RelayCollector(db, collector.set_relay)
 section_collector = sections.SectionCollector(db)
 limiter = auth.LoginLimiter()
@@ -133,7 +154,11 @@ async def lifespan(_: FastAPI):
     relay_collector.start()
     section_collector.start()
     dog = watchdog.start()
+    if bot:
+        bot.start()
     yield
+    if bot:
+        bot.stop()
     if dog:
         dog.stop()
     collector.stop()
@@ -344,9 +369,8 @@ class AccessBody(BaseModel):
     guest: bool
 
 
-class PortalBody(BaseModel):
-    username: str = Field(min_length=1, max_length=64, pattern=r"^[a-zA-Z0-9_.@-]+$")
-    password: str = Field(min_length=8, max_length=256)
+class TelegramBody(BaseModel):
+    username: str = Field(max_length=64)
 
 
 class RouterBody(BaseModel):
@@ -623,8 +647,9 @@ def me(user: dict[str, Any] = SignedIn):
 
 
 @app.post("/api/me/password", dependencies=[Csrf])
-@app.post("/api/portal/password", dependencies=[Csrf])
 def change_password(body: PasswordBody, request: Request, user: dict[str, Any] = SignedIn):
+    if user["role"] == "client":        # client passwords come from the Telegram bot
+        raise HTTPException(403, "Ask the Telegram bot for a new password")
     row = db.one("SELECT password_hash FROM users WHERE id = ?", (user["id"],))
     if row is None or not auth.verify_password(body.current, row["password_hash"]):
         raise HTTPException(400, "Current password is incorrect")
@@ -643,32 +668,71 @@ def disable_portal(name):
 
 @app.get("/api/clients/{name}/portal")
 def portal_account(name: str, user: dict[str, Any] = Authed):
+    """The client's portal login and Telegram binding."""
     find_client(name)
     row = db.one("SELECT username FROM users WHERE client_name = ?", (name,))
-    return {"enabled": bool(row), "username": row["username"] if row else name}
+    tg = db.one("SELECT telegram, telegram_id, telegram_name FROM clients WHERE name = ?", (name,)) or {}
+    return {"enabled": bool(row), "username": row["username"] if row else name,
+            "telegram": tg.get("telegram") or "", "telegram_linked": tg.get("telegram_id") is not None,
+            "telegram_name": tg.get("telegram_name") or "",
+            "bot": bool(bot), "bot_username": bot.username if bot else None}
 
 
-@app.put("/api/clients/{name}/portal", dependencies=[Csrf])
-def set_portal_account(name: str, body: PortalBody, user: dict[str, Any] = Authed):
-    find_client(name)
+def issue_portal_password(name: str) -> tuple[str, str]:
+    """(username, password): a new generated portal password for a valid client, creating its login
+    (username = client name) if it has none. Its earlier sign-ins end."""
     cert = relay.eligible(name)
     if not cert:
         raise HTTPException(400, "Portal access requires a valid client certificate")
-    password_hash = auth.hash_password(body.password)
+    alphabet = "abcdefghjkmnpqrstuvwxyz23456789"
+    password = "-".join("".join(secrets.choice(alphabet) for _ in range(4)) for _ in range(4))
+    password_hash = auth.hash_password(password)
     with db.tx() as conn:
-        existing = conn.execute("SELECT client_name FROM users WHERE username = ?", (body.username,)).fetchone()
-        if existing is not None and existing["client_name"] != name:
-            raise HTTPException(400, "This username is already in use")
-        row = conn.execute("SELECT id FROM users WHERE client_name = ?", (name,)).fetchone()
+        row = conn.execute("SELECT id, username FROM users WHERE client_name = ?", (name,)).fetchone()
         if row:
+            username = row["username"]
             conn.execute("DELETE FROM web_sessions WHERE user_id = ?", (row["id"],))
-            conn.execute("UPDATE users SET username = ?, password_hash = ?, client_serial = ? WHERE id = ?",
-                         (body.username, password_hash, cert["serial"], row["id"]))
+            conn.execute("UPDATE users SET password_hash = ?, client_serial = ? WHERE id = ?",
+                         (password_hash, cert["serial"], row["id"]))
         else:
+            username = name
+            if conn.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone():
+                raise HTTPException(400, "Another account already uses this client's name as its username")
             conn.execute("INSERT INTO users (username, password_hash, created_at, client_name, client_serial) VALUES (?, ?, ?, ?, ?)",
-                         (body.username, password_hash, int(time.time()), name, cert["serial"]))
-    event("portal_access_set", user, name)
-    return {"enabled": True, "username": body.username}
+                         (username, password_hash, int(time.time()), name, cert["serial"]))
+    return username, password
+
+
+@app.post("/api/clients/{name}/portal/password", dependencies=[Csrf])
+def new_portal_password(name: str, user: dict[str, Any] = Authed):
+    """For a client without Telegram: a generated password, shown to the admin once."""
+    find_client(name)
+    username, password = issue_portal_password(name)
+    event("portal_password_issued", user, name)
+    return {"enabled": True, "username": username, "password": password}
+
+
+@app.put("/api/clients/{name}/telegram", dependencies=[Csrf])
+def set_telegram(name: str, body: TelegramBody, user: dict[str, Any] = Authed):
+    """The client's Telegram username; empty removes it. A new username unbinds the old account."""
+    find_client(name)
+    try:
+        username = telegram_bot.normalize(body.username) if body.username.strip() else None
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    try:
+        with db.tx() as conn:
+            taken = conn.execute("SELECT name FROM clients WHERE telegram = ? AND name != ?", (username, name)).fetchone() if username else None
+            if taken:
+                raise HTTPException(400, f"@{username} is already set for {taken['name']}")
+            conn.execute("INSERT INTO clients (name, created_at, telegram) VALUES (?, ?, ?) ON CONFLICT(name) DO UPDATE SET "
+                         "telegram_id = CASE WHEN clients.telegram IS NOT DISTINCT FROM excluded.telegram THEN clients.telegram_id END, "
+                         "telegram_name = CASE WHEN clients.telegram IS NOT DISTINCT FROM excluded.telegram THEN clients.telegram_name END, "
+                         "telegram = excluded.telegram", (name, int(time.time()), username))
+    except psycopg.errors.UniqueViolation:      # the same username saved for another client at the same moment
+        raise HTTPException(400, f"@{username} is already set for another client")
+    event("telegram_set", user, name, f"@{username}" if username else "removed")
+    return portal_account(name, user)
 
 
 @app.delete("/api/clients/{name}/portal", dependencies=[Csrf])
@@ -689,6 +753,7 @@ def own_profile_info(request: Request, user: dict[str, Any] = SignedIn):
     guest = relay.is_guest(user["client_name"])
     return {"name": user["client_name"], "guest": guest, "expires_at": cert["not_after"],
             "links": network.guest_links() if guest else [],
+            "telegram_bot": bot.username if bot else None,
             "relay_available": relay.get_settings(db)["enabled"], "signed_profiles": bool(relay_services.signing_config(db)["url"]),
             "relay_download": {"url": "/api/portal/relay.mobileconfig", "csrf": profile_download_token(request, "/api/portal/relay.mobileconfig")}}
 
@@ -884,7 +949,9 @@ def _create_client(body: NewClientBody, user: dict[str, Any]) -> dict[str, Any]:
     if not static_ip:
         pki.set_static_ip(name, None)
     db.execute("INSERT INTO clients (name, note, created_at) VALUES (?, ?, ?) "
-               "ON CONFLICT(name) DO UPDATE SET note = excluded.note, created_at = excluded.created_at",
+               # A reused name is a new person: the old Telegram binding must not carry over.
+               "ON CONFLICT(name) DO UPDATE SET note = excluded.note, created_at = excluded.created_at, "
+               "telegram = NULL, telegram_id = NULL, telegram_name = NULL",
                (name, body.note.strip(), int(time.time())))
     tfa_uri = None
     if body.tfa:

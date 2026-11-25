@@ -1,5 +1,5 @@
 'use strict';
-/* Personal portal: a client account downloads its own profiles and changes its password. */
+/* Personal portal: a client account downloads its own profiles. Passwords come from the Telegram bot. */
 
 function portalView(el) {
   const body = h('div', { class: 'stack portal-content' });
@@ -12,8 +12,8 @@ function portalView(el) {
       const profile = await api('/api/portal');
       const own = sectionsCard('/api/portal/sections', { period: true });
       own.load();
-      body.replaceChildren(connectCard(profile), relayActivityPanel(), own.card, h('details', { class: 'portal-panel' },
-        h('summary', null, 'Change my password'), portalPasswordForm()));
+      body.replaceChildren(connectCard(profile), relayActivityPanel(), own.card,
+        h('p', { class: 'small muted' }, profile.telegram_bot ? ['For a new password, send /password to ', h('a', { href: `https://t.me/${profile.telegram_bot}`, rel: 'noopener' }, '@' + profile.telegram_bot), ' in Telegram.'] : 'For a new password, ask the administrator.'));
     } catch (error) {
       body.replaceChildren(h('div', { class: 'notice', role: 'alert' }, error.message),
         h('button', { class: 'btn', onClick: () => renderView() }, 'Try again'));
@@ -100,24 +100,4 @@ function relayActivityPanel() {
     if (!polling) { polling = true; every(10000, () => { if (panel.open) load(); }); }
   });
   return panel;
-}
-
-function portalPasswordForm() {
-  const input = (autocomplete, extra = {}) => h('input', { class: 'input', type: 'password', autocomplete, required: true, ...extra });
-  const current = input('current-password');
-  const password = input('new-password', { minlength: 8 }), repeat = input('new-password', { minlength: 8 });
-  const message = h('p', { class: 'form-message', role: 'status', hidden: true });
-  const button = h('button', { class: 'btn primary', type: 'submit' }, 'Change password');
-  const say = text => { message.hidden = false; message.textContent = text; };
-  return h('form', { class: 'form', onSubmit: async event => {
-    event.preventDefault();
-    if (password.value !== repeat.value) { say('The new passwords do not match. Enter them again.'); return; }
-    button.disabled = true;
-    try {
-      await api('/api/portal/password', { method: 'POST', body: { current: current.value, new: password.value } });
-      current.value = password.value = repeat.value = '';
-      say('Your password has been changed.');
-    } catch (error) { say(error.message); } finally { button.disabled = false; }
-  } }, field('Current password', current), field('New password', password, 'At least 8 characters.'),
-    field('Repeat new password', repeat), message, button);
 }

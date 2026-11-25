@@ -34,7 +34,6 @@ def command(*args, data=None, env=None):
 
 def check_browser(api_url, portal_url, admin_password, folder):
     from playwright.sync_api import sync_playwright
-    portal_password = secrets.token_hex(16)
     errors = []
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(executable_path=os.environ.get("CHROME_BIN", "/usr/bin/google-chrome"), headless=True)
@@ -55,18 +54,18 @@ def check_browser(api_url, portal_url, admin_password, folder):
         admin.get_by_text("Signed downloads enabled", exact=True).wait_for()
         admin.screenshot(path="/tmp/ovpn-relay-activity.png", full_page=True)
         admin.goto(api_url + "/#/clients/alice")
-        admin.get_by_role("button", name="Portal access", exact=True).click()
-        admin.get_by_label("Portal username", exact=True).fill("alice-portal")
-        admin.get_by_label("Portal password", exact=True).fill(portal_password)
-        admin.get_by_role("button", name="Save login", exact=True).click()
-        admin.get_by_text("Portal login saved", exact=True).wait_for()
+        admin.get_by_role("button", name="Telegram & portal", exact=True).click()
+        admin.get_by_role("button", name="New password", exact=True).click()
+        admin.get_by_text("New password issued", exact=True).wait_for()
+        portal_password = admin.get_by_label("New portal password", exact=True).inner_text()
+        admin.get_by_role("button", name="Done", exact=True).click()
         # The fixture CA is verified by curl/OpenSSL below; it is not installed
         # into Chrome's global trust store on the developer/CI machine.
         context = browser.new_context(accept_downloads=True, ignore_https_errors=True, viewport={"width": 390, "height": 844})
         user = context.new_page()
         user.on("pageerror", lambda error: errors.append(str(error)))
         user.goto(portal_url + "/portal")
-        user.locator('input[name=username]').fill("alice-portal")
+        user.locator('input[name=username]').fill("alice")
         user.locator('input[type=password]').fill(portal_password)
         user.get_by_role("button", name="Sign in", exact=True).click()
         user.get_by_role("heading", name="Connect your device", exact=True).wait_for()
@@ -89,8 +88,8 @@ def check_browser(api_url, portal_url, admin_password, folder):
         assert "alice" in plistlib.loads(verified.encode())["PayloadDisplayName"]
         assert user.evaluate("fetch('/api/server').then(r => r.status)") == 404
         user.screenshot(path="/tmp/ovpn-user-portal.png", full_page=True)
-        admin.get_by_role("button", name="Portal access", exact=True).click()
-        admin.get_by_role("button", name="Disable access", exact=True).click()
+        admin.get_by_role("button", name="Telegram & portal", exact=True).click()
+        admin.get_by_role("button", name="Disable portal login", exact=True).click()
         admin.get_by_text("Portal access disabled", exact=True).wait_for()
         assert user.evaluate("fetch('/api/portal').then(r => r.status)") == 401
         assert not errors, errors

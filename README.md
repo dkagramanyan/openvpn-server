@@ -356,10 +356,12 @@ Leave the router address empty to switch the counting off.
 ## Sign-in and the personal portal
 
 Administrators and clients use the same sign-in form, at `/` or `/portal`;
-each lands on its own page. Give a client a login under **Clients → client →
-Portal access**. The client signs in and sees step-by-step
-instructions for Apple relay and OpenVPN, its own relay activity, and a
-password form. It cannot see other clients, settings or logs; every
+each lands on its own page. A client gets its login (username = client name)
+and every new password from the Telegram bot (below); without Telegram, **New
+password** under **Clients → client → Telegram & portal** generates one and
+shows it once. Clients cannot choose their own password. The client signs in
+and sees step-by-step instructions for Apple relay and OpenVPN and its own
+relay activity. It cannot see other clients, settings or logs; every
 administrator API refuses a portal session. On the guest portal listener
 administrator accounts cannot sign in at all. A login stays bound to the client's current certificate:
 revocation, expiry or deletion ends it, a renewal through the UI keeps it.
@@ -367,8 +369,34 @@ Portal passwords are separate from profile passphrases and TOTP codes.
 
 Who reaches the portal: guests through the portal listener (above); full-access
 clients and trusted LAN networks through the gateway's regular HTTPS listener.
-From the open internet it is not reachable, so a first profile has to be handed
-over privately or on the LAN.
+From the open internet it is not reachable; a first profile goes out as a
+one-time link (from the bot or **Share link**).
+
+## Telegram bot
+
+Clients get access themselves from a Telegram bot: a one-time link to their
+OpenVPN profile, to their Apple relay profile (when relay profiles are on), a
+new portal password, and their status.
+
+1. Create a bot with [@BotFather](https://t.me/BotFather) (`/newbot`) and put
+   its token into `.env` as `OVPN_TELEGRAM_BOT_TOKEN`, then
+   `sudo docker compose up -d openvpn-ui`. The server needs outgoing HTTPS to
+   `api.telegram.org`: `curl -sI https://api.telegram.org` on the server shows
+   it. The bot polls; no port is opened. One token = one running UI: a second
+   copy polling the same token makes both fail with "Conflict".
+2. On a client page, **Telegram & portal**: enter the person's Telegram
+   username and tell them to open `t.me/<your bot>` and press Start.
+3. The first message from that username links its Telegram account to the
+   client. From then on only that account gets answers, even if the username is
+   later changed or taken by someone else. A new username from the admin
+   unlinks the old account.
+
+The bot answers only private chats and only linked accounts, at most 20 links or
+passwords an hour per account. Links work once and for one hour; they need the
+website hostname in Settings → Network and traefik 1.2.0 or later (see
+[One-time profile links](#one-time-profile-links)). A new password ends the
+client's earlier portal sign-ins. Everything the bot does is in the event log
+with the actor `telegram`.
 
 ## Upgrading to 2.5
 

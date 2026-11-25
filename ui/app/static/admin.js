@@ -3,22 +3,36 @@
 
 /* ------------------------------------------------------ portal accounts */
 async function portalAccessDialog(name) {
-  try {
-    const info = await api(`/api/clients/${encodeURIComponent(name)}/portal`);
-    const username = h('input', { class: 'input', value: info.username, autocomplete: 'off', 'aria-label': 'Portal username' });
-    const password = h('input', { class: 'input', type: 'password', autocomplete: 'new-password', 'aria-label': 'Portal password' });
-    const url = `/api/clients/${encodeURIComponent(name)}/portal`;
-    dialog({ title: 'Portal access · ' + name, body: h('div', { class: 'form' },
-      h('p', null, info.enabled ? 'This client can sign in to download their own profiles. Saving resets their password and signs out existing sessions.' : 'Create a login for this client to download their own OpenVPN and Apple relay profiles.'),
-      field('Username', username), field('New password', password, 'At least 8 characters. This password is for the website; the OpenVPN profile password is separate.')),
-      buttons: [
-        { label: 'Cancel', value: null },
-        ...(info.enabled ? [{ label: 'Disable access', cls: 'danger', onClick: async () => { try { await withToast(api(url, { method: 'DELETE' }), 'Portal access disabled'); return true; } catch (_) { return false; } } }] : []),
-        { label: 'Save login', cls: 'primary', onClick: async () => {
-          if (password.value.length < 8) { toast('Use at least 8 characters', 'err'); return false; }
-          try { await withToast(api(url, { method: 'PUT', body: { username: username.value.trim(), password: password.value } }), 'Portal login saved'); return true; } catch (_) { return false; }
-        } }] });
-  } catch (e) { toast(e.message, 'err'); }
+  const url = `/api/clients/${encodeURIComponent(name)}/portal`;
+  let info;
+  try { info = await api(url); } catch (e) { toast(e.message, 'err'); return; }
+  const telegram = h('input', { class: 'input', value: info.telegram ? '@' + info.telegram : '', placeholder: '@username', autocomplete: 'off', spellcheck: 'false', 'aria-label': 'Telegram username' });
+  const linkState = h('p', { class: 'small muted', style: 'margin:0' });
+  const login = h('div', { class: 'stack', style: 'gap:8px' });
+  const showTelegram = () => setChildren(linkState,
+    !info.bot ? 'The bot is off: set OVPN_TELEGRAM_BOT_TOKEN in .env and recreate the UI container.'
+      : !info.telegram ? `Without a username the bot does not answer this client. Bot: t.me/${info.bot_username || '…'}`
+      : info.telegram_linked ? `Linked to the Telegram account of ${info.telegram_name || '@' + info.telegram}. Only that account gets answers.`
+      : `Not linked yet: ask them to open t.me/${info.bot_username || '…'} and press Start.`);
+  const showLogin = password => setChildren(login,
+    h('p', { style: 'margin:0' }, info.enabled ? `Portal login: ${info.username}` : 'No portal login yet. The bot creates it when they ask for a password.'),
+    password ? h('div', { class: 'uri mono', 'aria-label': 'New portal password' }, password) : null,
+    password ? h('p', { class: 'small muted', style: 'margin:0' }, 'Shown only now. Earlier sign-ins of this login have ended.') : null,
+    h('div', { class: 'row' }, h('button', { class: 'btn', onClick: async () => {
+      try { const r = await withToast(api(url + '/password', { method: 'POST', body: {} }), 'New password issued'); info.enabled = true; info.username = r.username; showLogin(r.password); } catch (_) {}
+    } }, 'New password'),
+    info.enabled ? h('button', { class: 'btn danger', title: 'While a Telegram username is set, the bot gives them a new login when they ask', onClick: async () => {
+      try { await withToast(api(url, { method: 'DELETE' }), 'Portal access disabled'); info.enabled = false; showLogin(); } catch (_) {}
+    } }, 'Disable portal login') : null));
+  showTelegram(); showLogin();
+  dialog({ title: 'Telegram & portal · ' + name, body: h('div', { class: 'form' },
+    h('p', null, 'The client gets profile links and their portal password from the Telegram bot. To cut them off, revoke the client; a disabled portal login comes back when they ask the bot.'),
+    h('div', { class: 'row', style: 'align-items:flex-end' }, field('Telegram username', telegram),
+      h('button', { class: 'btn', onClick: async () => {
+        try { info = await withToast(api(`/api/clients/${encodeURIComponent(name)}/telegram`, { method: 'PUT', body: { username: telegram.value } }), 'Telegram username saved'); showTelegram(); } catch (_) {}
+      } }, 'Save')),
+    linkState, login),
+    buttons: [{ label: 'Done', cls: 'primary', value: true }] });
 }
 
 
@@ -411,7 +425,7 @@ function clientDetailView(el) {
     setChildren(actions, 
       c.state === 'valid' ? h('a', { class: 'btn primary', href: `/api/clients/${enc}/ovpn`, download: name + '.ovpn' }, icon('download'), 'OpenVPN config') : null,
       c.state === 'valid' ? relayButton(c) : null,
-      c.state === 'valid' ? act('Portal access', () => portalAccessDialog(name)) : null,
+      c.state === 'valid' ? act('Telegram & portal', () => portalAccessDialog(name)) : null,
       c.relay_available ? act('Revoke relay access', async () => { if (await confirmDialog('Revoke relay access', 'Installed Apple relay profiles will stop working. Download a new profile to enable access again.', 'Revoke', true)) { await withToast(api(`/api/clients/${enc}/relay`, { method: 'DELETE' }), 'Relay access revoked'); load(); } }, 'danger') : null,
       c.online ? act('Disconnect', async () => { if (await confirmDialog('Disconnect', `Disconnect all sessions of ${name}?`, 'Disconnect', true)) { await withToast(api(`/api/clients/${enc}/disconnect`, { method: 'POST', body: {} }), 'Disconnected'); } }) : null,
       c.state === 'valid' ? act(c.tfa ? 'Show 2FA code' : 'Enable 2FA', async () => {

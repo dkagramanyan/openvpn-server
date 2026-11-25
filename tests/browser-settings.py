@@ -89,13 +89,7 @@ def scenario(browser, portal=False):
         page.get_by_text('My relay activity',exact=True).click()
         page.get_by_text('Your connection activity cannot be loaded right now.',exact=False).wait_for()
         assert page.get_by_text('Forbidden',exact=True).count()==0
-        page.get_by_text('Change my password',exact=True).click()
-        page.get_by_label('Current password',exact=True).fill('current-password')
-        page.get_by_label('New password',exact=True).fill('another-password')
-        page.get_by_label('Repeat new password',exact=True).fill('another-password')
-        page.get_by_role('button',name='Change password',exact=True).click()
-        page.get_by_text('The gateway blocked this request.',exact=False).wait_for()
-        assert page.get_by_text('The string did not match the expected pattern.',exact=True).count()==0
+        page.get_by_text('For a new password, ask the administrator.',exact=True).wait_for()
         assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
         page.screenshot(path=os.path.join(SHOTS,'portal-mobile.png'),full_page=True)
     else:
