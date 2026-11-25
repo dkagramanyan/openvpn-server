@@ -57,6 +57,20 @@ def _state() -> dict:
     return state
 
 
+def panel(gateway: dict) -> dict | None:
+    """{"path", "backend", "url"} of the 3x-ui panel for the gateway, which routes its base path on
+    the OpenVPN hostname to this server (trusted networks only), or None before 3x-ui has started."""
+    try:
+        base = _state()["base_path"]
+    except PkiError:
+        return None
+    host = urllib.parse.urlsplit(gateway.get("openvpn_backend") or "").hostname
+    if not host:
+        return None
+    return {"path": base, "backend": f"http://{host}:{settings.xui_port}",
+            "url": f"https://{gateway['openvpn_host']}{base}" if gateway.get("openvpn_host") else None}
+
+
 def call(method: str, path: str, body: dict | None = None, form: dict | None = None, host: str | None = None):
     """The "obj" of a 3x-ui API answer. host: the Host header, which 3x-ui writes into share links."""
     state = _state()

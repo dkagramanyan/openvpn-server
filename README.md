@@ -382,10 +382,13 @@ The UI gives every client its own Xray key on one inbound and takes it away
 with the certificate.
 
 1. `sudo docker compose up -d xui`, then `sudo docker compose logs xui`: the
-   first start prints the panel login and address once. The panel listens on
-   this server only (`XUI_LISTEN=127.0.0.1`, port `XUI_PORT=2053`); open it
-   with `ssh -L 2053:127.0.0.1:2053 <server>` and the printed address. Its
-   subscription server is switched off at the first start.
+   first start prints the panel login and its random path once. Download the
+   gateway file (Settings → Gateway) and apply it on the gateway (traefik 1.3.0
+   or later): the panel then opens at `https://<OpenVPN hostname>/<panel path>/`
+   from trusted networks, and as **3x-ui ↗** in the sidebar. It listens on
+   `XUI_LISTEN` (default every address, port `XUI_PORT=2053`); set
+   `127.0.0.1` to keep it off the LAN and use `ssh -L 2053:127.0.0.1:2053`.
+   Its subscription server is switched off at the first start.
 2. In the panel, add an inbound: VLESS, TCP, security REALITY (pick a target
    with *Scan*, generate the keys), on a free port such as 8445. Forward that
    TCP port on the router to this server.
@@ -418,12 +421,15 @@ Clients get access themselves from a Telegram bot: a one-time link to their
 OpenVPN profile, to their Apple relay profile (when relay profiles are on), a
 new portal password, and their status.
 
-1. Create a bot with [@BotFather](https://t.me/BotFather) (`/newbot`) and put
-   its token into `.env` as `OVPN_TELEGRAM_BOT_TOKEN`, then
-   `sudo docker compose up -d openvpn-ui`. The server needs outgoing HTTPS to
-   `api.telegram.org`: `curl -sI https://api.telegram.org` on the server shows
-   it. The bot polls; no port is opened. One token = one running UI: a second
-   copy polling the same token makes both fail with "Conflict".
+1. Create a bot with [@BotFather](https://t.me/BotFather) (`/newbot`) and
+   paste its token in **Settings → Telegram** (or set `OVPN_TELEGRAM_BOT_TOKEN`
+   in `.env`; a token saved in the UI wins). Send `/start` to the bot from your
+   own account: it answers with your Telegram ID; enter it there as *Your chat
+   ID* and press *Send test message*. Access requests from people the bot does
+   not know, and newly linked accounts, are sent to that chat. The server needs
+   outgoing HTTPS to `api.telegram.org` (`curl -sI https://api.telegram.org`).
+   The bot polls; no port is opened. One token = one running UI: a second copy
+   polling the same token makes both fail with "Conflict".
 2. On a client page, **Telegram & portal**: enter the person's Telegram
    username and tell them to open `t.me/<your bot>` and press Start.
 3. The first message from that username links its Telegram account to the

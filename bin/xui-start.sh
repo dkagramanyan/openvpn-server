@@ -1,11 +1,11 @@
 #!/bin/sh
-# Entry point of the xui service (3x-ui). The panel listens on XUI_LISTEN only (this host by
-# default). On the first start it gets a random login and base path (printed once), its
+# Entry point of the xui service (3x-ui). The panel listens on XUI_LISTEN (every address by
+# default; the gateway serves it to trusted networks). On the first start it gets a random login and base path (printed once), its
 # subscription server is switched off, and an API token for the OpenVPN UI goes to
 # /etc/x-ui/openvpn-ui.json (./xui/openvpn-ui.json, mode 600).
 set -eu
 cd /app
-./x-ui setting -listenIP "${XUI_LISTEN:-127.0.0.1}" >/dev/null
+./x-ui setting -listenIP "${XUI_LISTEN:-0.0.0.0}" >/dev/null
 
 STATE=/etc/x-ui/openvpn-ui.json
 if [ ! -s "$STATE" ]; then
@@ -31,6 +31,6 @@ db.commit()"
     printf '{"base_path": "%s", "token": "%s"}\n' "$base" "$token" > "$STATE.tmp"
     mv "$STATE.tmp" "$STATE"
     echo "3x-ui panel login (shown only now): $user / $pass"
-    echo "3x-ui panel address: http://${XUI_LISTEN:-127.0.0.1}:${XUI_PORT:-2053}$base"
+    echo "3x-ui panel path: $base (https://<OpenVPN hostname>$base through the gateway, or http://<this server>:${XUI_PORT:-2053}$base)"
 fi
 exec /app/DockerEntrypoint.sh

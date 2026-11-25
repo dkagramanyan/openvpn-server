@@ -83,8 +83,9 @@ services:
     entrypoint: [/bin/sh, /opt/xui-start.sh]
     environment:
       XUI_PORT: ${XUI_PORT:-2053}
-      XUI_LISTEN: ${XUI_LISTEN:-127.0.0.1}   # panel address; 127.0.0.1 = reach it with ssh -L
+      XUI_LISTEN: ${XUI_LISTEN:-0.0.0.0}     # panel address: the gateway serves it on the OpenVPN hostname
       XUI_ENABLE_FAIL2BAN: "false"           # it would write iptables rules into the host
+      XUI_SKIP_HSTS: "true"                  # HTTPS is the gateway's; no HSTS for the shared hostname
     volumes:
       - ./bin/xui-start.sh:/opt/xui-start.sh:ro
       - ./xui:/etc/x-ui

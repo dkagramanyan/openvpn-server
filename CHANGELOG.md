@@ -1,6 +1,20 @@
 <!-- Network addresses in examples are synthetic; deployment-specific notes are omitted. -->
 # Changelog
 
+## 2.9.0 - 2026-11-26
+
+* **Settings → Telegram**: the bot token (never shown again; a saved token
+  wins over `OVPN_TELEGRAM_BOT_TOKEN`, a wrong one is refused) and your chat
+  ID, with *Send test message*. A new token applies without a restart.
+* **Admin notices**: people the bot does not know are told their Telegram ID,
+  and your chat hears about each of them (once an hour per person) and about
+  every newly linked account.
+* **The 3x-ui panel on the web**: the gateway file carries its random path and
+  address, and traefik 1.3.0 serves it at
+  `https://<OpenVPN hostname>/<panel path>/` to trusted networks; **3x-ui ↗**
+  in the sidebar. `XUI_LISTEN` now defaults to every address, and the panel
+  sends no HSTS for the shared hostname.
+
 ## 2.8.0 - 2026-11-26
 
 Xray through 3x-ui, as a third way in.

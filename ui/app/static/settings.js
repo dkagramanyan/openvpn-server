@@ -367,6 +367,7 @@ const SETTINGS_PANES = [
   { id: 'guests', title: 'Guests', hint: 'Portal and guest links', form: true, needs: ['gateway'] },
   { id: 'vpn', title: 'VPN network', hint: 'Subnets, pool, DNS, routes', form: true, needs: ['restart'] },
   { id: 'gateway', title: 'Gateway', hint: 'How Traefik reaches this server', form: true, needs: ['gateway'] },
+  { id: 'telegram', title: 'Telegram', hint: 'Bot token and your chat', needs: ['own'] },
   { id: 'xray', title: 'Xray', hint: '3x-ui inbound for client keys', needs: ['own'] },
   { id: 'router', title: 'Router', hint: 'Traffic by podkop section', needs: ['own'] },
   { id: 'account', title: 'Account', hint: 'Password, appearance, version', needs: ['own'] },
@@ -389,6 +390,7 @@ function settingsView(el) {
     const form = networkForm(network, relay, general);
     const panes = {
       ...form.panes,
+      telegram: telegramCard(),
       xray: xrayCard(),
       router: routerCard(),
       account: h('div', { class: 'stack' }, h('div', { class: 'grid two' }, passwordCard(), appearanceCard()),
@@ -535,6 +537,8 @@ function xrayCard() {
       info.inbounds.map(i => h('option', { value: String(i.id), selected: i.id === info.inbound_id }, `${i.remark || i.tag} · ${i.protocol}${i.security ? ' + ' + i.security : ''} · port ${i.port}`)));
     setChildren(body,
       info.error ? h('div', { class: 'notice', role: 'alert' }, info.error) : null,
+      info.panel_url ? h('p', { style: 'margin:0' }, h('a', { href: info.panel_url, target: '_blank', rel: 'noopener' }, 'Open the 3x-ui panel ↗'),
+        h('span', { class: 'small muted' }, ' — through the gateway, from trusted networks (download the gateway file and apply it once).')) : null,
       h('p', { class: 'small muted', style: 'margin:0' }, 'Create the inbound in the 3x-ui panel (VLESS + REALITY over TCP works best), forward its port on the router, then choose it here. ',
         'Clients get a key from Share link or the Telegram bot; it stops working when their certificate ends. Xray gives internet only: private ranges and this server’s networks are blocked for everyone.'),
       h('label', { class: 'check' }, on, 'Offer Xray keys to clients'),
@@ -544,7 +548,38 @@ function xrayCard() {
           await withToast(api('/api/xray/settings', { method: 'PUT', body: { enabled: on.checked, inbound_id: inbound.value ? Number(inbound.value) : null } }), 'Xray settings saved');
         } catch (_) {}
       } }, 'Save')),
-      h('p', { class: 'small muted', style: 'margin:0' }, 'The panel listens on this server only (XUI_LISTEN, port XUI_PORT). Its login is printed once in docker compose logs xui; reach it with ssh -L 2053:127.0.0.1:2053 <server>.'));
+      h('p', { class: 'small muted', style: 'margin:0' }, 'The panel login is printed once in docker compose logs xui. The panel listens on XUI_LISTEN, port XUI_PORT.'));
   })();
+  return body;
+}
+
+// The Telegram bot: its token (never shown again) and the admin chat that gets access requests.
+function telegramCard() {
+  const body = h('div', { class: 'stack' }, h('div', { class: 'small muted' }, 'Loading…'));
+  const render = info => {
+    const token = h('input', { class: 'input', type: 'password', autocomplete: 'off', spellcheck: 'false', 'aria-label': 'Bot token',
+      placeholder: info.configured ? (info.token_from_env ? 'From .env · paste one to replace it' : 'Saved · leave blank to keep it') : 'Paste the token from @BotFather' });
+    const chat = h('input', { class: 'input', inputmode: 'numeric', value: info.admin_chat_id ?? '', placeholder: 'e.g. 123456789', 'aria-label': 'Your chat ID' });
+    const save = async tokenValue => {
+      const id = chat.value.trim();
+      if (id && !/^-?\d+$/.test(id)) { toast('The chat ID is a number', 'err'); return; }
+      try {
+        render(await withToast(api('/api/telegram/settings', { method: 'PUT', body: { token: tokenValue, admin_chat_id: id ? Number(id) : null } }), 'Telegram settings saved'));
+      } catch (_) {}
+    };
+    setChildren(body,
+      h('p', { class: 'small muted', style: 'margin:0' }, info.configured
+        ? ['The bot ', info.bot_username ? h('a', { href: `https://t.me/${info.bot_username}`, target: '_blank', rel: 'noopener' }, '@' + info.bot_username) : '(connecting…)', ' is on. Clients write to it; you enter their username on the client page under Telegram & portal.']
+        : 'Create a bot with @BotFather (/newbot) and paste its token here. The server needs outgoing HTTPS to api.telegram.org.'),
+      field('Bot token', token),
+      field('Your chat ID', chat, 'Access requests and newly linked accounts go here. To find it, send /start to the bot from your own account: it answers with your Telegram ID. Press Start in the bot before testing.'),
+      h('div', { class: 'row' },
+        h('button', { class: 'btn primary', onClick: () => save(token.value.trim() ? token.value.trim() : null) }, 'Save'),
+        h('button', { class: 'btn', onClick: async () => { try { await withToast(api('/api/telegram/test', { method: 'POST', body: {} }), 'Test message sent'); } catch (_) {} } }, 'Send test message'),
+        info.configured && !info.token_from_env ? h('button', { class: 'btn danger', onClick: async () => {
+          if (await confirmDialog('Remove the bot token', 'The bot stops answering until a token is saved again.', 'Remove', true)) save('');
+        } }, 'Remove token') : null));
+  };
+  api('/api/telegram/settings').then(render, e => setChildren(body, h('div', { class: 'notice', role: 'alert' }, e.message)));
   return body;
 }

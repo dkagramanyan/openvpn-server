@@ -286,6 +286,7 @@ function sidebar() {
       link('clients', 'Clients', 'users', h('span', { class: 'pill', id: 'online-pill' }, live && (live.connected || live.relay_ready) ? onlineClients(live).size : '…')),
       link('sessions', 'Sessions', 'sessions'),
       link('relay', 'Relay', 'lock'),
+      state.user.xui_url ? h('a', { href: state.user.xui_url, target: '_blank', rel: 'noopener', title: 'The 3x-ui panel (Xray), in a new tab' }, icon('server'), h('span', { class: 'label' }, '3x-ui ↗')) : null,
       link('server', 'Server', 'server'),
       link('settings', 'Settings', 'settings')),
     h('div', { class: 'sidebar-foot' },

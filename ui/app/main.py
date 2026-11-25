@@ -72,9 +72,16 @@ def bot_link(name: str, kind: str) -> dict:
     return link
 
 
-bot = (telegram_bot.Bot(telegram_bot.Api(settings.telegram_token), db, link=bot_link,
-                        password=lambda name: issue_portal_password(name), info=bot_info)
-       if settings.telegram_token else None)
+def telegram_config() -> dict:
+    """Settings → Telegram; the token from OVPN_TELEGRAM_BOT_TOKEN until one is saved there."""
+    saved = json.loads(db.get_setting("telegram", "{}"))
+    return {"token": saved.get("token") or settings.telegram_token, "admin_chat_id": saved.get("admin_chat_id"),
+            "token_from_env": not saved.get("token") and bool(settings.telegram_token)}
+
+
+_tg = telegram_config()
+bot = telegram_bot.Bot(telegram_bot.Api(_tg["token"]) if _tg["token"] else None, db, link=bot_link,
+                       password=lambda name: issue_portal_password(name), info=bot_info, admin_chat=_tg["admin_chat_id"])
 relay_collector = relay_history.RelayCollector(db, collector.set_relay)
 section_collector = sections.SectionCollector(db)
 limiter = auth.LoginLimiter()
@@ -154,11 +161,9 @@ async def lifespan(_: FastAPI):
     relay_collector.start()
     section_collector.start()
     dog = watchdog.start()
-    if bot:
-        bot.start()
+    bot.start()
     yield
-    if bot:
-        bot.stop()
+    bot.stop()
     if dog:
         dog.stop()
     collector.stop()
@@ -367,6 +372,11 @@ class TfaEnforceBody(BaseModel):
 
 class AccessBody(BaseModel):
     guest: bool
+
+
+class TelegramSettingsBody(BaseModel):
+    token: str | None = Field(default=None, max_length=128)    # None keeps the saved token, "" removes it
+    admin_chat_id: int | None = None
 
 
 class XrayBody(BaseModel):
@@ -634,8 +644,15 @@ def login(body: LoginBody, request: Request, response: Response):
     db.add_event("login", None, row["username"], client_ip(request))
     response.set_cookie(COOKIE, token, max_age=settings.session_ttl, httponly=True, samesite="strict",
                         secure=cookie_secure(request), path="/")
+    admin = row["client_name"] is None
     return {"username": row["username"], "guest_sub": settings.guest_sub,
-            "role": "client" if row["client_name"] is not None else "admin", "client_name": row["client_name"]}
+            "role": "admin" if admin else "client", "client_name": row["client_name"], "xui_url": xui_url() if admin else None}
+
+
+def xui_url() -> str | None:
+    """Where the gateway serves the 3x-ui panel (next to this website), for the admin sidebar."""
+    xui = xray.panel(network.get_settings(db)["gateway"])
+    return xui["url"] if xui else None
 
 
 @app.post("/api/logout", dependencies=[Csrf])
@@ -650,7 +667,8 @@ def logout(request: Request, response: Response):
 @app.get("/api/portal/me")
 def me(user: dict[str, Any] = SignedIn):
     return {"username": user["username"], "version": __version__, "guest_sub": settings.guest_sub,
-            "role": user["role"], "client_name": user["client_name"]}
+            "role": user["role"], "client_name": user["client_name"],
+            "xui_url": xui_url() if user["role"] == "admin" else None}
 
 
 @app.post("/api/me/password", dependencies=[Csrf])
@@ -682,7 +700,7 @@ def portal_account(name: str, user: dict[str, Any] = Authed):
     return {"enabled": bool(row), "username": row["username"] if row else name,
             "telegram": tg.get("telegram") or "", "telegram_linked": tg.get("telegram_id") is not None,
             "telegram_name": tg.get("telegram_name") or "",
-            "bot": bool(bot), "bot_username": bot.username if bot else None}
+            "bot": bot.configured, "bot_username": bot.username}
 
 
 def issue_portal_password(name: str) -> tuple[str, str]:
@@ -760,7 +778,7 @@ def own_profile_info(request: Request, user: dict[str, Any] = SignedIn):
     guest = relay.is_guest(user["client_name"])
     return {"name": user["client_name"], "guest": guest, "expires_at": cert["not_after"],
             "links": network.guest_links() if guest else [],
-            "telegram_bot": bot.username if bot else None,
+            "telegram_bot": bot.username if bot.configured else None,
             "relay_available": relay.get_settings(db)["enabled"], "signed_profiles": bool(relay_services.signing_config(db)["url"]),
             "relay_download": {"url": "/api/portal/relay.mobileconfig", "csrf": profile_download_token(request, "/api/portal/relay.mobileconfig")}}
 
@@ -1131,6 +1149,41 @@ def get_relay_settings(user: dict[str, Any] = Authed):
     return relay.get_settings(db)
 
 
+@app.get("/api/telegram/settings")
+def get_telegram_settings(user: dict[str, Any] = Authed):
+    config = telegram_config()      # the token itself never goes back to the browser
+    return {"configured": bot.configured, "bot_username": bot.username, "token_from_env": config["token_from_env"],
+            "admin_chat_id": config["admin_chat_id"]}
+
+
+@app.put("/api/telegram/settings", dependencies=[Csrf])
+def set_telegram_settings(body: TelegramSettingsBody, user: dict[str, Any] = Authed):
+    saved = json.loads(db.get_setting("telegram", "{}"))
+    token = saved.get("token", "") if body.token is None else body.token.strip()
+    username = None
+    effective = token or settings.telegram_token
+    if effective:
+        try:        # a wrong token is refused here, not found out by the poller later
+            username = telegram_bot.Api(effective).call("getMe")["username"]
+        except telegram_bot.ApiError as exc:
+            raise HTTPException(400, f"Telegram refused this token ({exc})")
+    db.set_setting("telegram", json.dumps({"token": token, "admin_chat_id": body.admin_chat_id}))
+    bot.configure(telegram_bot.Api(effective) if effective else None, body.admin_chat_id, username)
+    event("telegram_settings_changed", user, None, "token changed" if body.token is not None else None)
+    return get_telegram_settings(user)
+
+
+@app.post("/api/telegram/test", dependencies=[Csrf])
+def test_telegram(user: dict[str, Any] = Authed):
+    if not bot.configured or bot.admin_chat is None:
+        raise HTTPException(400, "Save a bot token and your chat ID first")
+    try:
+        bot.send(bot.admin_chat, "Test message from the access server: notifications arrive here.")
+    except telegram_bot.ApiError as exc:
+        raise HTTPException(400, f"Telegram did not deliver it ({exc}). Open the bot and press Start first.")
+    return {"sent": True}
+
+
 @app.get("/api/xray/settings")
 def get_xray_settings(user: dict[str, Any] = Authed):
     """The saved choice, and what 3x-ui offers (or why it cannot be asked)."""
@@ -1138,7 +1191,8 @@ def get_xray_settings(user: dict[str, Any] = Authed):
         inbounds, error = xray.inbounds(), None
     except PkiError as exc:
         inbounds, error = [], str(exc)
-    return {**xray.get_settings(db), "inbounds": inbounds, "error": error}
+    xui = xray.panel(network.get_settings(db)["gateway"])
+    return {**xray.get_settings(db), "inbounds": inbounds, "error": error, "panel_url": xui["url"] if xui else None}
 
 
 @app.put("/api/xray/settings", dependencies=[Csrf])
@@ -1639,7 +1693,11 @@ def check_guest_access(user: dict[str, Any] = Authed):
 
 @app.get("/api/network/traefik.json")
 def download_gateway_network(user: dict[str, Any] = Authed):
-    return JSONResponse(network.export_gateway(db), headers={"Cache-Control": "no-store",
+    exported = network.export_gateway(db)
+    xui = xray.panel(network.get_settings(db)["gateway"])
+    if xui:         # the gateway routes the 3x-ui panel next to the OpenVPN website
+        exported["xui_panel"] = {"path": xui["path"], "backend": xui["backend"]}
+    return JSONResponse(exported, headers={"Cache-Control": "no-store",
         "Content-Disposition": 'attachment; filename="network.private.json"'})
 
 

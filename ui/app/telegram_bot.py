@@ -63,13 +63,22 @@ class Bot:
     """link(name, kind) -> {"url", "expires_at", "public"}; password(name) -> (username, password);
     info(name) -> {"valid", "guest", "expires_at", "relay", "portal_url"}."""
 
-    def __init__(self, api: Api, db, link: Callable, password: Callable, info: Callable):
-        self.api, self.db = api, db
+    def __init__(self, api: Api | None, db, link: Callable, password: Callable, info: Callable, admin_chat: int | None = None):
+        self.api, self.db, self.admin_chat = api, db, admin_chat
         self.link, self.password, self.info = link, password, info
         self.username: str | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._recent: dict[int, collections.deque] = {}
+        self._asked: dict[int, float] = {}          # when an unknown account was last reported to the admin
+
+    @property
+    def configured(self) -> bool:
+        return self.api is not None
+
+    def configure(self, api: Api | None, admin_chat: int | None, username: str | None = None) -> None:
+        """A new token or admin chat, from Settings → Telegram. The poller switches after its current poll."""
+        self.api, self.admin_chat, self.username = api, admin_chat, username
 
     # -- lifecycle --------------------------------------------------------------
     def start(self) -> None:
@@ -80,17 +89,25 @@ class Bot:
         self._stop.set()
 
     def run(self) -> None:
-        offset, wait = None, 5
+        offset, wait, polling = None, 5, None
         while not self._stop.is_set():
+            api = self.api
+            if api is None:                 # no token yet
+                self._stop.wait(5)
+                continue
+            if api is not polling:          # a new token: its own updates
+                offset, polling = None, api
             try:
                 if self.username is None:
-                    self.username = self.api.call("getMe")["username"]
+                    self.username = api.call("getMe")["username"]
                     log.info("Telegram bot @%s is polling", self.username)
                 params = {"timeout": 50, "allowed_updates": ["message"]}
                 if offset is not None:
                     params["offset"] = offset
-                updates = self.api.call("getUpdates", timeout=60, **params)
+                updates = api.call("getUpdates", timeout=60, **params)
                 wait = 5
+                if self.api is not api:     # replaced during the poll: these belong to the old bot
+                    continue
             except Exception as exc:     # ApiError, or anything unforeseen: the bot keeps polling
                 log.warning("Telegram: %s; retrying in %d s", exc, wait)
                 self._stop.wait(wait)
@@ -117,6 +134,14 @@ class Bot:
                                       "resize_keyboard": True, "is_persistent": True}
         self.api.call("sendMessage", **params)
 
+    def notify_admin(self, text: str) -> None:
+        if self.admin_chat is None:
+            return
+        try:
+            self.send(self.admin_chat, text)
+        except ApiError as exc:
+            log.warning("Telegram: the admin chat cannot be reached: %s", exc)
+
     def client_for(self, sender: dict) -> str | None:
         """The client bound to this Telegram account; binds it on first contact by username."""
         row = self.db.one("SELECT name FROM clients WHERE telegram_id = ?", (sender["id"],))
@@ -132,6 +157,8 @@ class Bot:
                                  (sender["id"], display, username)).fetchone()
             if bound:
                 self.db.add_event("telegram_linked", bound["name"], "telegram", f"@{username} ({sender['id']})", conn=conn)
+        if bound:
+            self.notify_admin(f"@{username} ({display or 'no name'}) is now linked to the client {bound['name']}.")
         return bound["name"] if bound else None
 
     def allowed(self, telegram_id: int) -> bool:
@@ -153,7 +180,13 @@ class Bot:
         if name is None:
             self.send(chat, "This Telegram account has no access yet. Ask the administrator to add your username"
                       + (f" @{sender['username']}." if sender.get("username")
-                         else ". First set a username in Telegram: Settings → My profile → Username."))
+                         else ". First set a username in Telegram: Settings → My profile → Username.")
+                      + f"\nYour Telegram ID: {sender['id']}")
+            if sender["id"] != self.admin_chat and time.monotonic() - self._asked.get(sender["id"], -3600) >= 3600:
+                self._asked[sender["id"]] = time.monotonic()
+                who = " ".join(filter(None, (sender.get("first_name"), sender.get("last_name")))) or "no name"
+                self.notify_admin(f"Access request from {'@' + sender['username'] if sender.get('username') else 'an account without a username'} "
+                                  f"({who}, ID {sender['id']}). To let them in, enter the username on the client page under Telegram & portal.")
             return
         info = self.info(name)
         menu = [["OpenVPN"] + (["Apple relay"] if info["relay"] else []) + (["Xray"] if info["xray"] else []),

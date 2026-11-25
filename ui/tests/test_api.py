@@ -1642,3 +1642,79 @@ def test_xray_rule_sits_after_the_api_rule_and_is_written_once(monkeypatch):
     assert "panel/api/server/restartXrayService" in calls
     calls.clear()
     assert xray.ensure_rule("in-8445-tcp") is False and calls == ["panel/api/xray/"]    # unchanged: no restart
+
+
+def test_telegram_token_and_admin_chat_are_set_in_the_ui(client, monkeypatch):
+    from app import main, telegram_bot
+    sent, known = [], {"123:GOOD": "access_bot", "456:OTHER": "other_bot"}
+    def call(self, method, timeout=15, **params):
+        token = self._url.rsplit("/bot", 1)[1].rstrip("/")
+        if token not in known:
+            raise telegram_bot.ApiError(f"{method}: Unauthorized")
+        if method == "getMe":
+            return {"username": known[token]}
+        sent.append((token, params))
+        return {}
+    monkeypatch.setattr(telegram_bot.Api, "call", call)
+    bot = telegram_bot.Bot(None, db, link=main.bot_link, password=main.issue_portal_password, info=main.bot_info)
+    monkeypatch.setattr(main, "bot", bot)
+    monkeypatch.setattr(main.settings, "telegram_token", "")
+    old = db.get_setting("telegram")
+    try:
+        assert client.get("/api/telegram/settings").json() == {"configured": False, "bot_username": None, "token_from_env": False, "admin_chat_id": None}
+        assert client.post("/api/telegram/test", headers=H).status_code == 400
+        r = client.put("/api/telegram/settings", json={"token": "999:BAD", "admin_chat_id": None}, headers=H)
+        assert r.status_code == 400 and "refused" in r.json()["detail"] and not bot.configured
+        r = client.put("/api/telegram/settings", json={"token": "123:GOOD", "admin_chat_id": 4242}, headers=H)
+        assert r.status_code == 200 and r.json() == {"configured": True, "bot_username": "access_bot", "token_from_env": False, "admin_chat_id": 4242}
+        assert "123:GOOD" not in r.text and "123:GOOD" not in client.get("/api/telegram/settings").text
+        assert bot.configured and bot.admin_chat == 4242
+        assert client.post("/api/telegram/test", headers=H).status_code == 200 and sent[-1][1]["chat_id"] == 4242
+        # a blank token keeps the saved one; the chat can change alone
+        assert client.put("/api/telegram/settings", json={"token": None, "admin_chat_id": 77}, headers=H).json()["bot_username"] == "access_bot"
+        assert json.loads(db.get_setting("telegram")) == {"token": "123:GOOD", "admin_chat_id": 77}
+        # the .env token is the fallback once the saved one is removed
+        monkeypatch.setattr(main.settings, "telegram_token", "456:OTHER")
+        r = client.put("/api/telegram/settings", json={"token": "", "admin_chat_id": 77}, headers=H).json()
+        assert r["token_from_env"] is True and r["bot_username"] == "other_bot"
+        assert main.telegram_config()["token"] == "456:OTHER"
+    finally:
+        if old is None:
+            db.execute("DELETE FROM settings WHERE key = 'telegram'")
+        else:
+            db.set_setting("telegram", old)
+
+
+def test_unknown_telegram_accounts_learn_their_id_and_the_admin_hears_once(client, telegram):
+    bot, api = telegram
+    bot.admin_chat = 4242
+    bot.handle(tg("/start", sender=5555, username="stranger"))
+    reply, notice = api.sent[-2], api.sent[-1]
+    assert reply["chat_id"] == 5555 and "Your Telegram ID: 5555" in reply["text"]
+    assert notice["chat_id"] == 4242 and "@stranger" in notice["text"] and "5555" in notice["text"]
+    sent = len(api.sent)
+    bot.handle(tg("hello", sender=5555, username="stranger"))
+    assert len(api.sent) == sent + 1                  # only the reply: the admin heard within the hour
+    bot.handle(tg("/start", sender=4242, username="the_admin"))
+    assert api.sent[-1]["chat_id"] == 4242 and "4242" in api.text and len(api.sent) == sent + 2   # the admin learns their own ID
+    assert client.put("/api/clients/alice/telegram", json={"username": "stranger"}, headers=H).status_code == 200
+    bot.handle(tg("/start", sender=5555, username="stranger"))
+    assert any(m["chat_id"] == 4242 and "linked to the client alice" in m["text"] for m in api.sent[-2:])
+
+
+def test_the_3x_ui_panel_goes_into_the_gateway_file_and_the_sidebar(client, monkeypatch):
+    from app import main, xray
+    gateway = {"openvpn_host": "openvpn.example.test", "openvpn_backend": "http://192.0.2.20:8080"}
+    state = TMP / "xui" / "openvpn-ui.json"
+    assert xray.panel(gateway) is None                # 3x-ui has not started: no route, no link
+    monkeypatch.setattr(main.network, "export_gateway", lambda db=None: {"version": 2})
+    monkeypatch.setattr(main.network, "get_settings", lambda db=None: {"gateway": gateway})
+    assert "xui_panel" not in client.get("/api/network/traefik.json").json()
+    state.parent.mkdir(exist_ok=True)
+    state.write_text(json.dumps({"base_path": "/AbC123xyz/", "token": "t"}))
+    try:
+        assert client.get("/api/network/traefik.json").json()["xui_panel"] == {"path": "/AbC123xyz/", "backend": "http://192.0.2.20:2053"}
+        assert client.get("/api/me").json()["xui_url"] == "https://openvpn.example.test/AbC123xyz/"
+        assert client.get("/api/xray/settings").json()["panel_url"] == "https://openvpn.example.test/AbC123xyz/"
+    finally:
+        state.unlink()
