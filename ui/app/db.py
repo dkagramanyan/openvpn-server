@@ -303,6 +303,8 @@ class Database:
             # 2.4: the numeric destination a relay flow dialled, and whether its bytes were
             # counted by section. Rows saved before have no address: they count as done.
             conn.execute("ALTER TABLE relay_flows ADD COLUMN IF NOT EXISTS address TEXT")
+            # 2.6: a one-time link carries the OpenVPN profile or the Apple relay profile.
+            conn.execute("ALTER TABLE share_tokens ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'openvpn'")
             if not conn.execute("SELECT 1 FROM information_schema.columns WHERE table_schema = ? AND "
                                 "table_name = 'relay_flows' AND column_name = 'sectioned'", (schema,)).fetchone():
                 conn.execute("ALTER TABLE relay_flows ADD COLUMN sectioned BOOLEAN NOT NULL DEFAULT true")

@@ -682,33 +682,26 @@ UDP did not get through on the client's network within 10 s.
 
 ### One-time profile links
 
-**Share link** on a client page makes a link that hands out the profile once
-and expires (1 h to 7 days). The link itself (`https://.../p/<token>`) opens a
-small page with two buttons, *Open in OpenVPN Connect* and *Download*; looking
+**Share link** on a client page makes a link that hands out one profile once
+and expires (1 h to 7 days): the OpenVPN profile, or, when Apple relay profiles
+are offered, the relay profile. The link itself (`https://.../p/<token>`)
+opens a small page: *Open in OpenVPN Connect* and *Download* for OpenVPN,
+*Install the profile* for the relay (open it in Safari on the device). Looking
 at the page does not use the link up, so it can be sent through a messenger
 that fetches links for a preview. The profile is behind
-`/p/<token>/download`, once. The QR code holds the
+`/p/<token>/download`, once. For OpenVPN the QR code holds the
 `openvpn://import-profile/https://.../p/<token>/download` form: scanning it on
 a phone opens OpenVPN Connect and imports the profile. A link is spent only
-when the profile was really delivered. Only the path `/p/` needs to be
-public. Set `OVPN_PROFILE_BASE_URL` to the public address and let your proxy
-forward just that path to the UI, e.g. with Traefik:
+when the profile was really delivered.
 
-```yaml
-http:
-  routers:
-    ovpn-profiles:
-      rule: Host(`vpn.example.com`) && PathPrefix(`/p/`)
-      service: ovpn-ui
-      tls: { certResolver: letsencrypt }
-  services:
-    ovpn-ui:
-      loadBalancer: { servers: [{ url: "http://192.0.2.30:8080" }] }
-```
-
-With another reverse proxy, forward the `/p/` path to the UI backend. Set the
-trusted proxy CIDRs in Settings to the
-proxy's address so failed attempts are rate limited per visitor, not per proxy.
+Links use `https://<website hostname>` from Settings → Network
+(`OVPN_PROFILE_BASE_URL` overrides it). The gateway in
+[traefik](https://github.com/dkagramanyan/traefik) 1.2 routes `/p/` of that
+hostname from anywhere and keeps the rest of the website for trusted networks.
+Guests connected to the VPN can open links too. With another reverse proxy,
+forward only the `/p/` path to the UI and set the trusted proxy CIDRs in
+Settings to the proxy's address, so failed attempts are rate limited per
+visitor, not per proxy.
 
 ## CLI
 

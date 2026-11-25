@@ -15,7 +15,7 @@ import subprocess
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Literal
 from urllib.parse import urlsplit, parse_qs
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
@@ -359,6 +359,7 @@ class RouterKeyBody(BaseModel):
 
 class ShareBody(BaseModel):
     hours: int = Field(default=24, ge=1, le=24 * 30)
+    kind: Literal["openvpn", "relay"] = "openvpn"
 
 
 class ControlChannelBody(BaseModel):
@@ -1228,37 +1229,53 @@ def set_access(name: str, body: AccessBody, user: dict[str, Any] = Authed):
 
 @app.post("/api/clients/{name}/share", dependencies=[Csrf])
 def share_profile(name: str, body: ShareBody, request: Request, user: dict[str, Any] = Authed):
-    """A one-time download link for the profile, also as openvpn://import-profile/ link and QR code."""
+    """A one-time link to the OpenVPN or the Apple relay profile, with a QR code."""
     row = find_client(name)
     if row["state"] != "valid":
         raise HTTPException(400, "Only a client with a valid certificate can be shared")
+    link = create_share_link(name, body.kind, body.hours, user["username"], request)
+    event("profile_link_created", user, name, f"{body.kind}, valid {body.hours} h")
+    return {**link, "qr_svg": pki.qr_svg(link["import_url"] or link["url"])}
+
+
+def create_share_link(name: str, kind: str, hours: int, created_by: str, request: Request | None = None) -> dict:
+    """{"url", "import_url", "expires_at", "public"}: a one-time link to one profile of a valid client."""
+    if kind == "relay" and not relay.get_settings(db)["enabled"]:
+        raise HTTPException(400, "Apple relay profiles are not offered (Settings → Apple relay)")
     token = secrets.token_urlsafe(24)
     now = int(time.time())
-    db.execute("INSERT INTO share_tokens (token_hash, client_name, created_at, expires_at, created_by) "
-               "VALUES (?, ?, ?, ?, ?)", (auth.token_hash(token), name, now, now + body.hours * 3600, user["username"]))
-    url = f"{share_base(request)}/p/{token}"
-    import_url = f"openvpn://import-profile/{url}/download"
-    event("profile_link_created", user, name, f"valid {body.hours} h")
-    return {"url": url, "import_url": import_url, "expires_at": now + body.hours * 3600,
-            "public": bool(settings.profile_base_url), "qr_svg": pki.qr_svg(import_url)}
+    db.execute("INSERT INTO share_tokens (token_hash, client_name, created_at, expires_at, created_by, kind) "
+               "VALUES (?, ?, ?, ?, ?, ?)", (auth.token_hash(token), name, now, now + hours * 3600, created_by, kind))
+    base, public = share_base(request)
+    url = f"{base}/p/{token}"
+    return {"url": url, "import_url": f"openvpn://import-profile/{url}/download" if kind == "openvpn" else "",
+            "expires_at": now + hours * 3600, "public": public, "kind": kind}
 
 
-def share_base(request: Request) -> str:
-    return settings.profile_base_url or str(request.base_url).rstrip("/")
+def share_base(request: Request | None = None) -> tuple[str, bool]:
+    """(base address of one-time links, whether it is a public one). OVPN_PROFILE_BASE_URL, else the
+    website hostname of Settings → Network (the gateway routes /p/ there from anywhere), else the
+    address the admin is using."""
+    if settings.profile_base_url:
+        return settings.profile_base_url, True
+    host = network.get_settings(db)["gateway"]["openvpn_host"]
+    if host:
+        return "https://" + host, True
+    return (str(request.base_url).rstrip("/") if request else ""), False
 
 
-def shared_client(token: str, request: Request) -> str:
-    """The client a one-time link belongs to. Wrong links from one address are slowed down."""
+def shared_link(token: str, request: Request) -> tuple[str, str]:
+    """(client, kind) of a one-time link. Wrong links from one address are slowed down."""
     key = f"share|{client_ip(request)}"
     wait = limiter.attempt(key)
     if wait:
         raise HTTPException(429, f"Too many attempts, try again in {wait}s", headers={"Retry-After": str(wait)})
-    row = db.one("SELECT client_name FROM share_tokens WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?",
+    row = db.one("SELECT client_name, kind FROM share_tokens WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?",
                  (auth.token_hash(token), int(time.time())))
     if row is None or not (settings.pki_dir / "issued" / f"{row['client_name']}.crt").exists():
         raise HTTPException(404, "This link is invalid, expired or already used")
     limiter.success(key)
-    return row["client_name"]
+    return row["client_name"], row["kind"]
 
 
 SHARE_CSS = ("body{font:17px/1.5 system-ui,sans-serif;max-width:26rem;margin:12vh auto;padding:0 20px;"
@@ -1266,12 +1283,18 @@ SHARE_CSS = ("body{font:17px/1.5 system-ui,sans-serif;max-width:26rem;margin:12v
              "border-radius:8px;text-align:center;text-decoration:none;font-weight:600;color:#fff;background:#1f6feb}"
              "a+a{color:#1f6feb;background:none;border:1px solid}"
              "@media(prefers-color-scheme:dark){body{color:#e6e8eb;background:#111418}}")
-SHARE_PAGE = ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
+SHARE_HEAD = ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
               '<meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex">'
-              "<title>OpenVPN profile</title><style>" + SHARE_CSS + "</style></head><body><h1>OpenVPN profile</h1>"
-              "<p>Open this page on the device that will use the VPN. The profile can be fetched once.</p>"
-              '<a href="IMPORT_URL">Open in OpenVPN Connect</a><a href="DOWNLOAD_URL">Download the .ovpn file</a>'
-              "</body></html>")
+              "<title>TITLE</title><style>" + SHARE_CSS + "</style></head><body><h1>TITLE</h1>")
+SHARE_PAGES = {
+    "openvpn": SHARE_HEAD.replace("TITLE", "OpenVPN profile")
+    + "<p>Open this page on the device that will use the VPN. The profile can be fetched once.</p>"
+      '<a href="IMPORT_URL">Open in OpenVPN Connect</a><a href="DOWNLOAD_URL">Download the .ovpn file</a></body></html>',
+    "relay": SHARE_HEAD.replace("TITLE", "Apple relay profile")
+    + "<p>Open this page in Safari on the iPhone, iPad or Mac that will use the relay. The profile can be fetched once.</p>"
+      '<a href="DOWNLOAD_URL">Install the profile</a>'
+      "<p>Then open Settings → Profile Downloaded and tap Install.</p></body></html>",
+}
 SHARE_CSP = ("default-src 'none'; style-src 'sha256-" + base64.b64encode(hashlib.sha256(SHARE_CSS.encode()).digest()).decode()
              + "'; frame-ancestors 'none'; base-uri 'none'")
 
@@ -1281,9 +1304,9 @@ def shared_profile_page(token: str, request: Request):
     """Public: the page behind a one-time link. It only offers the profile, so that a messenger
     fetching the link for a preview does not use the link up. /p/ is the only path meant to be
     exposed by a proxy."""
-    shared_client(token, request)
-    url = f"{share_base(request)}/p/{token}/download"
-    page = SHARE_PAGE.replace("IMPORT_URL", html.escape("openvpn://import-profile/" + url, quote=True)).replace(
+    _, kind = shared_link(token, request)
+    url = f"{share_base(request)[0]}/p/{token}/download"
+    page = SHARE_PAGES[kind].replace("IMPORT_URL", html.escape("openvpn://import-profile/" + url, quote=True)).replace(
         "DOWNLOAD_URL", html.escape(url, quote=True))
     return HTMLResponse(page, headers={"Content-Security-Policy": SHARE_CSP})
 
@@ -1291,8 +1314,17 @@ def shared_profile_page(token: str, request: Request):
 @app.get("/p/{token}/download")
 def shared_profile(token: str, request: Request):
     """Public: the profile itself, once."""
-    name = shared_client(token, request)
-    content = pki.build_profile(name)       # before the link is spent: a failure here leaves it usable
+    name, kind = shared_link(token, request)
+    # Built before the link is spent: a failure here leaves it usable.
+    if kind == "relay":
+        try:
+            content = relay.profile(db, name)
+        except PkiError:
+            if relay_services.signing_config(db)["required"] or relay_services.signing_config(db)["url"]:
+                raise HTTPException(503, "The profile is temporarily unavailable. Please retry in a minute.")
+            raise
+    else:
+        content = pki.build_profile(name)
     now = int(time.time())
     with db.tx() as conn:
         spent = conn.execute("UPDATE share_tokens SET used_at = ? WHERE token_hash = ? AND used_at IS NULL",
@@ -1301,6 +1333,9 @@ def shared_profile(token: str, request: Request):
             db.add_event("profile_link_used", name, None, client_ip(request), conn=conn)
     if not spent:       # two requests at once: the other one got it
         raise HTTPException(404, "This link is invalid, expired or already used")
+    if kind == "relay":
+        return Response(content, media_type="application/x-apple-aspen-config",
+                        headers={"Content-Disposition": f'attachment; filename="{name}-relay.mobileconfig"'})
     return PlainTextResponse(content, media_type="application/x-openvpn-profile",
                              headers={"Content-Disposition": f'attachment; filename="{name}.ovpn"'})
 

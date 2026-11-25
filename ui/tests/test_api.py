@@ -396,6 +396,8 @@ def test_share_link_is_single_use(client):
             assert "<cert>" not in r.text and "alice" not in r.text
             assert f'href="{link["url"]}/download"' in r.text and f'href="{link["import_url"]}"' in r.text
             assert "script-src" not in r.headers["content-security-policy"] and r.headers["cache-control"] == "no-store"
+        # a guest connected through the portal listener can open the link too
+        assert client.get(path, headers={"X-OpenVPN-Portal-Only": "1"}).status_code == 200
         # a profile that cannot be built leaves the link usable
         from app import pki
         build = pki.build_profile
@@ -1378,3 +1380,49 @@ def test_portal_sees_only_its_own_sections(client, portal):
     assert "dave" not in response.text and "secret-section" not in response.text
     assert any(s["section"] == "main" for s in response.json()["sections"])
     assert portal.get("/api/sections").status_code == 403 and portal.get("/api/router").status_code == 403
+
+
+def test_relay_share_link_is_single_use(client, configured):
+    from app.main import limiter
+    assert client.post("/api/clients/alice/share", json={"kind": "other"}, headers=H).status_code == 422
+    r = client.post("/api/clients/alice/share", json={"hours": 2, "kind": "relay"}, headers=H)
+    assert r.status_code == 200, r.text
+    link = r.json()
+    assert link["kind"] == "relay" and link["import_url"] == "" and "<svg" in link["qr_svg"]
+    path = "/p/" + link["url"].rsplit("/p/", 1)[1]
+    cookies = dict(client.cookies)
+    client.cookies.clear()
+    try:
+        page = client.get(path)
+        assert page.status_code == 200 and "openvpn://" not in page.text and f'href="{link["url"]}/download"' in page.text
+        r = client.get(path + "/download")
+        assert r.status_code == 200 and r.headers["content-type"] == "application/x-apple-aspen-config"
+        assert 'filename="alice-relay.mobileconfig"' in r.headers["content-disposition"]
+        assert plistlib.loads(r.content)["PayloadContent"][0]["Relays"]
+        assert client.get(path + "/download").status_code == 404
+    finally:
+        limiter._state.clear()
+        client.cookies.update(cookies)
+
+
+def test_relay_share_link_needs_the_relay_enabled(client):
+    old = relay.get_settings(db)
+    db.set_setting("apple_relay", json.dumps({**old, "enabled": False}))
+    try:
+        r = client.post("/api/clients/alice/share", json={"kind": "relay"}, headers=H)
+        assert r.status_code == 400 and "relay" in r.json()["detail"]
+    finally:
+        db.set_setting("apple_relay", json.dumps(old))
+
+
+def test_share_links_use_the_public_website_hostname(client, monkeypatch):
+    from app import main
+    monkeypatch.setattr(main.settings, "profile_base_url", "")
+    monkeypatch.setattr(main.network, "get_settings", lambda db=None: {"gateway": {"openvpn_host": "openvpn.example.test"}})
+    link = client.post("/api/clients/alice/share", json={}, headers=H).json()
+    assert link["url"].startswith("https://openvpn.example.test/p/") and link["public"] is True
+    monkeypatch.setattr(main.network, "get_settings", lambda db=None: {"gateway": {"openvpn_host": ""}})
+    link = client.post("/api/clients/alice/share", json={}, headers=H).json()
+    assert link["url"].startswith("http://testserver/p/") and link["public"] is False
+    monkeypatch.setattr(main.settings, "profile_base_url", "https://vpn.example.test")
+    assert client.post("/api/clients/alice/share", json={}, headers=H).json()["url"].startswith("https://vpn.example.test/p/")

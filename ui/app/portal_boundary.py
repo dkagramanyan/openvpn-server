@@ -3,7 +3,8 @@ from starlette.responses import JSONResponse, RedirectResponse
 
 
 def portal_path(path):
-    return path in ('/portal', '/api/portal') or path.startswith(('/api/portal/', '/static/'))
+    # /p/ = one-time profile links: a guest may open a link sent to them while connected.
+    return path in ('/portal', '/api/portal') or path.startswith(('/api/portal/', '/static/', '/p/'))
 
 
 class PortalBoundary:

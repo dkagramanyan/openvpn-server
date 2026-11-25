@@ -1,6 +1,22 @@
 <!-- Network addresses in examples are synthetic; deployment-specific notes are omitted. -->
 # Changelog
 
+## 2.6.0 - 2026-11-26
+
+One-time profile links that work for people outside the network.
+
+* **Links use the public website hostname.** They are built on
+  `https://<website hostname>` from Settings → Network; `OVPN_PROFILE_BASE_URL`
+  still overrides it. Before, without that variable, a link carried the
+  address the admin happened to use (often a LAN address), which other people
+  could not open. Needs traefik 1.2.0, which routes `/p/` of that hostname
+  from anywhere.
+* **Relay profiles can be shared.** Share link offers OpenVPN or Apple relay
+  when relay profiles are on. A relay link opens a page with *Install the
+  profile* and hands out the signed `.mobileconfig` once.
+* **Guests connected to the VPN can open links.** The guest portal listener
+  refused `/p/`.
+
 ## 2.5.2 - 2026-11-21
 
 Two relay changes aimed at long waits on phones (not yet confirmed on a phone).
