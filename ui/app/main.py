@@ -62,8 +62,9 @@ maintenance = Maintenance(db, [lambda: pki.ensure_crl_fresh(), backup.ensure_rec
 def bot_info(name: str) -> dict:
     cert = relay.eligible(name)
     gateway = network.get_settings(db)["gateway"]
+    config = relay.get_settings(db)
     return {"valid": bool(cert), "guest": relay.is_guest(name), "expires_at": cert["not_after"] if cert else None,
-            "relay": relay.get_settings(db)["enabled"], "xray": xray.enabled(db), "portal_url": f"https://{gateway['openvpn_host']}/portal" if gateway["openvpn_host"] else "the website of this server"}
+            "relay": config["enabled"], "xray": xray.enabled(db), "configs": (config["enabled"] and config["devices"]) or xray.enabled(db), "portal_url": f"https://{gateway['openvpn_host']}/portal" if gateway["openvpn_host"] else "the website of this server"}
 
 
 def bot_link(name: str, kind: str) -> dict:
@@ -72,6 +73,25 @@ def bot_link(name: str, kind: str) -> dict:
     link = create_share_link(name, kind, 1, "telegram")
     db.add_event("profile_link_created", name, "telegram", f"{kind}, valid 1 h")
     return link
+
+
+def bot_configs(name: str) -> dict:
+    """The client's relay devices and Xray keys for "Мои подключения", oldest first. key: what the
+    bot's buttons carry (64 bytes at most): the device id, or the part of the Xray key after "~"."""
+    items = [{"kind": "relay", "id": d["id"], "key": d["id"], "state": d["state"],
+              "since": d["enrolled_at"] or d["created_at"], "last_seen": d["last_seen"]}
+             for d in relay_devices.listing(db, name) if d["state"] in ("active", "waiting")]
+    items += [{"kind": "xray", "id": k["id"], "key": k["id"].partition("~")[2] or "-", "state": "active",
+               "since": k["created_at"], "last_seen": None} for k in xray.keys(db, name)]
+    items.sort(key=lambda item: item["since"])
+    return {"used": configs.used(db, name), "limit": configs.limit(db, name), "items": items}
+
+
+def bot_remove_config(name: str, kind: str, key: str) -> None:
+    if kind == "relay":
+        relay_devices.revoke(db, name, key)
+    elif kind == "xray":
+        xray.remove_key(db, name, name if key == "-" else f"{name}~{key}")
 
 
 def telegram_config() -> dict:
@@ -83,7 +103,8 @@ def telegram_config() -> dict:
 
 _tg = telegram_config()
 bot = telegram_bot.Bot(telegram_bot.Api(_tg["token"]) if _tg["token"] else None, db, link=bot_link,
-                       password=lambda name: issue_portal_password(name), info=bot_info, admin_chat=_tg["admin_chat_id"])
+                       password=lambda name: issue_portal_password(name), info=bot_info, admin_chat=_tg["admin_chat_id"],
+                       configs=bot_configs, remove=bot_remove_config)
 relay_collector = relay_history.RelayCollector(db, collector.set_relay)
 section_collector = sections.SectionCollector(db)
 limiter = auth.LoginLimiter()

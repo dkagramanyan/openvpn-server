@@ -1445,8 +1445,12 @@ def test_share_links_use_the_public_website_hostname(client, monkeypatch):
 class FakeTelegram:
     def __init__(self):
         self.sent = []
+        self.answered = []
 
     def call(self, method, http_timeout=15, **params):
+        if method == "answerCallbackQuery":
+            self.answered.append(params["callback_query_id"])
+            return True
         assert method == "sendMessage"
         self.sent.append(params)
         return {}
@@ -1467,7 +1471,8 @@ def telegram(client, monkeypatch):
     from app.main import limiter
     monkeypatch.setattr(main.settings, "profile_base_url", "https://vpn.example.test")
     api = FakeTelegram()
-    bot = telegram_bot.Bot(api, db, link=main.bot_link, password=main.issue_portal_password, info=main.bot_info)
+    bot = telegram_bot.Bot(api, db, link=main.bot_link, password=main.issue_portal_password, info=main.bot_info,
+                           configs=main.bot_configs, remove=main.bot_remove_config)
     bot.username = "access_bot"
     monkeypatch.setattr(main, "bot", bot)
     yield bot, api
@@ -2123,3 +2128,52 @@ def test_bot_says_when_the_number_is_used_up(client, panel, telegram):
     client.post("/api/clients/alice/xray-keys", json={}, headers=H)
     bot.handle(tg("/xray"))
     assert "сколько разрешено" in api.text and "/p/" not in api.text
+
+
+def press(data, sender=1001, username="Alice_TG"):
+    return {"id": "cb-" + data, "data": data, "from": {"id": sender, "username": username, "first_name": "Alice"},
+            "message": {"chat": {"id": sender, "type": "private"}}}
+
+
+def test_bot_lists_configs_and_removes_one_after_asking(client, panel, telegram, tmp_path, monkeypatch):
+    from app.settings import settings
+    monkeypatch.setattr(settings, "profile_base_url", ACME_BASE)     # the telegram fixture sets its own
+    bot, api = telegram
+    client.put("/api/clients/alice/telegram", json={"username": "@alice_tg"}, headers=H)
+    bot.handle(tg("/start"))
+    assert "Мои подключения" in [b["text"] for row in api.sent[-1]["reply_markup"]["keyboard"] for b in row]
+    _, code, device = bound_download(client)
+    assert Phone(client, tmp_path / "phone").enrol(code, "relay-device-" + device)[0].status_code == 200
+    client.post("/api/clients/alice/xray-keys", json={}, headers=H)
+    bot.handle(tg("Мои подключения"))
+    message = api.sent[-1]
+    assert "2 из 2" in message["text"] and "1. Apple Relay — установлен" in message["text"] and "2. Xray — выдан" in message["text"]
+    buttons = [b for row in message["reply_markup"]["inline_keyboard"] for b in row]
+    assert [b["text"] for b in buttons] == ["Удалить 1", "Удалить 2"]
+    assert all(len(b["callback_data"].encode()) <= 64 for b in buttons)
+    # The bot asks first; "Нет" keeps everything.
+    bot.handle_button(press(buttons[1]["callback_data"]))
+    confirm = [b for row in api.sent[-1]["reply_markup"]["inline_keyboard"] for b in row]
+    assert "Удалить Xray" in api.sent[-1]["text"] and [b["text"] for b in confirm] == ["Да, удалить", "Нет"]
+    bot.handle_button(press("keep"))
+    assert "ничего не удалено" in api.text and len(panel.clients) == 1
+    # Someone else's button data cannot remove alice's config.
+    bot.handle_button(press(confirm[0]["callback_data"], sender=2002, username="mallory_tg"))
+    assert len(panel.clients) == 1
+    bot.handle_button(press(confirm[0]["callback_data"]))
+    assert panel.clients == {} and "1 из 2" in api.text
+    assert client.post("/api/clients/alice/xray-keys", json={}, headers=H).status_code == 200      # room again
+    # The relay device too: removed, it stops working.
+    bot.handle_button(press(f"rm:relay:{device}"))
+    assert client.get("/api/clients/alice/relay-devices").json()["devices"][0]["state"] == "revoked"
+    bot.handle_button(press(f"rm:relay:{device}"))
+    assert "Этого подключения уже нет" in "".join(m["text"] for m in api.sent[-2:])
+    assert api.answered
+
+
+def test_bot_hides_configs_when_nothing_is_counted(client, configured, telegram):
+    bot, api = telegram
+    client.put("/api/clients/alice/telegram", json={"username": "@alice_tg"}, headers=H)
+    bot.handle(tg("/configs"))
+    labels = [b["text"] for row in api.sent[-1]["reply_markup"]["keyboard"] for b in row]
+    assert "Мои подключения" not in labels and "Привет" in api.text

@@ -510,6 +510,14 @@ website hostname in Settings → Network and traefik 1.2.0 or later (see
 client's earlier portal sign-ins. Everything the bot does is in the event log
 with the actor `telegram`.
 
+**Мои подключения** (`/configs`, shown when relay profiles are bound to one
+device or Xray is on) lists the person's Apple relay devices and Xray keys with
+"N из K", when each was installed or issued and last seen. Each has a
+*Удалить* button; after a confirmation the config stops working on its device
+and its place is free for a new one, without asking you. A removal counts
+toward the 20 actions an hour and is in the event log
+(`config_removed_by_client`).
+
 ## Upgrading to 2.10
 
 Nothing changes until you switch on one device per profile. To use it:

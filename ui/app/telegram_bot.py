@@ -25,18 +25,20 @@ ACTIONS_PER_HOUR = 20       # links and passwords one Telegram account may ask f
 
 # Menu buttons. Earlier keyboards (English labels, labels with emoji) and slash commands still work.
 BUTTONS = {"openvpn": "OpenVPN", "relay": "Apple Relay", "xray": "Xray",
-           "password": "Пароль от сайта", "status": "Мой доступ", "help": "Помощь"}
+           "password": "Пароль от сайта", "status": "Мой доступ", "configs": "Мои подключения", "help": "Помощь"}
 ALIASES = {**{label.lower(): action for action, label in BUTTONS.items()},
            "🔐 openvpn": "openvpn", "/openvpn": "openvpn", "🍏 apple relay": "relay", "/relay": "relay",
            "🚀 xray": "xray", "/xray": "xray", "portal password": "password", "🔑 пароль от портала": "password",
            "/password": "password", "status": "status", "ℹ️ мой доступ": "status", "/status": "status",
-           "❓ помощь": "help", "/start": "help", "/help": "help"}
+           "❓ помощь": "help", "/start": "help", "/help": "help", "/configs": "configs"}
 COMMANDS = [{"command": "start", "description": "Меню"},
             {"command": "openvpn", "description": "Подключить OpenVPN"},
             {"command": "relay", "description": "Подключить Apple Relay (iPhone, iPad, Mac)"},
             {"command": "xray", "description": "Подключить Xray"},
             {"command": "password", "description": "Новый пароль от сайта"},
-            {"command": "status", "description": "Мой доступ"}]
+            {"command": "status", "description": "Мой доступ"},
+            {"command": "configs", "description": "Мои подключения: посмотреть и удалить"}]
+KINDS = {"relay": "Apple Relay", "xray": "Xray"}
 
 LINK_STEPS = {
     "openvpn": ("Вот ссылка на OpenVPN:\n{url}\n\n"
@@ -94,11 +96,15 @@ class Api:
 
 class Bot:
     """link(name, kind) -> {"url", "expires_at", "public"}; password(name) -> (username, password);
-    info(name) -> {"valid", "guest", "expires_at", "relay", "portal_url"}."""
+    info(name) -> {"valid", "guest", "expires_at", "relay", "xray", "configs", "portal_url"};
+    configs(name) -> {"used", "limit", "items": [{"kind", "id", "key", "state", "since", "last_seen"}]};
+    remove(name, kind, key) -> bool: the client's relay device or Xray key ends."""
 
-    def __init__(self, api: Api | None, db, link: Callable, password: Callable, info: Callable, admin_chat: int | None = None):
+    def __init__(self, api: Api | None, db, link: Callable, password: Callable, info: Callable, admin_chat: int | None = None,
+                 configs: Callable | None = None, remove: Callable | None = None):
         self.api, self.db, self.admin_chat = api, db, admin_chat
         self.link, self.password, self.info = link, password, info
+        self.configs, self.remove = configs, remove
         self.username: str | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -138,7 +144,7 @@ class Bot:
                         api.call("setMyCommands", commands=COMMANDS)
                     except ApiError as exc:
                         log.warning("Telegram: the command menu was not set: %s", exc)
-                params = {"timeout": 50, "allowed_updates": ["message"]}
+                params = {"timeout": 50, "allowed_updates": ["message", "callback_query"]}
                 if offset is not None:
                     params["offset"] = offset
                 updates = api.call("getUpdates", http_timeout=60, **params)
@@ -153,10 +159,14 @@ class Bot:
             for update in updates:
                 offset = update["update_id"] + 1
                 try:
-                    self.handle(update.get("message"))
+                    if update.get("callback_query"):
+                        self.handle_button(update["callback_query"])
+                    else:
+                        self.handle(update.get("message"))
                 except Exception:       # one bad message must not stop the bot
                     log.exception("Telegram: update %s failed", update["update_id"])
-                    chat = ((update.get("message") or {}).get("chat") or {}).get("id")
+                    chat = ((update.get("message") or (update.get("callback_query") or {}).get("message") or {})
+                            .get("chat") or {}).get("id")
                     try:
                         if chat:
                             self.send(chat, "Не получилось выполнить запрос. Попробуйте ещё раз через минуту.")
@@ -169,6 +179,13 @@ class Bot:
         if keyboard:
             params["reply_markup"] = {"keyboard": [[{"text": t} for t in row] for row in keyboard],
                                       "resize_keyboard": True, "is_persistent": True}
+        self.api.call("sendMessage", **params)
+
+    def send_buttons(self, chat_id: int, text: str, buttons: list[list[tuple[str, str]]]) -> None:
+        """A message with buttons under it (inline keyboard): (label, callback data) per button."""
+        params = {"chat_id": chat_id, "text": text, "link_preview_options": {"is_disabled": True}}
+        if buttons:
+            params["reply_markup"] = {"inline_keyboard": [[{"text": t, "callback_data": d} for t, d in row] for row in buttons]}
         self.api.call("sendMessage", **params)
 
     def notify_admin(self, text: str) -> None:
@@ -218,10 +235,10 @@ class Bot:
             self.unknown(chat, sender)
             return
         info = self.info(name)
-        menu = [[BUTTONS["openvpn"]] + ([BUTTONS["relay"]] if info["relay"] else []) + ([BUTTONS["xray"]] if info["xray"] else []),
-                [BUTTONS["password"], BUTTONS["status"]], [BUTTONS["help"]]]
+        menu = self.menu(info)
         action = ALIASES.get(text.split("@", 1)[0].lower(), "help")
-        if (action == "relay" and not info["relay"]) or (action == "xray" and not info["xray"]):
+        if (action == "relay" and not info["relay"]) or (action == "xray" and not info["xray"]) or \
+                (action == "configs" and not self.has_configs(info)):
             action = "help"
         if not info["valid"] and action not in ("help", "status"):
             self.send(chat, "Ваш доступ закончился или отозван. Напишите администратору.", menu)
@@ -237,6 +254,8 @@ class Bot:
             self.send(chat, f"Логин: {username}\nПароль: {password}\n\n"
                       f"Сайт: {info['portal_url']} (открывается только с включённым VPN). "
                       "Старый пароль больше не работает. Сохраните новый и удалите это сообщение.", menu)
+        elif action == "configs":
+            self.list_configs(chat, name)
         elif action == "status":
             expires = time.strftime("%d.%m.%Y", time.gmtime(info["expires_at"])) if info["expires_at"] else "неизвестно"
             if info["valid"]:
@@ -251,7 +270,81 @@ class Bot:
                       + ("Apple Relay — для iPhone, iPad и Mac, без приложений.\n" if info["relay"] else "")
                       + ("Xray — если OpenVPN не подключается.\n" if info["xray"] else "")
                       + "\n«Пароль от сайта» пришлёт новый пароль для личного кабинета, "
-                      "«Мой доступ» покажет, до какого числа он действует.", menu)
+                      "«Мой доступ» покажет, до какого числа он действует."
+                      + ("\n«Мои подключения» покажет ваши подключения Apple Relay и Xray: там можно удалить "
+                         "ненужное, чтобы получить новое." if self.has_configs(info) else ""), menu)
+
+    def has_configs(self, info: dict) -> bool:
+        return self.configs is not None and bool(info.get("configs"))
+
+    def menu(self, info: dict) -> list[list[str]]:
+        return [[BUTTONS["openvpn"]] + ([BUTTONS["relay"]] if info["relay"] else []) + ([BUTTONS["xray"]] if info["xray"] else []),
+                [BUTTONS["password"], BUTTONS["status"]],
+                ([BUTTONS["configs"]] if self.has_configs(info) else []) + [BUTTONS["help"]]]
+
+    # -- my configs: see them, remove one to make room --------------------------------
+    def list_configs(self, chat: int, name: str) -> None:
+        data = self.configs(name)
+        items = data["items"]
+        lines = [f"Ваши подключения: {data['used']} из {data['limit']}."]
+        if not items:
+            lines.append("\nПока ни одного. Получите Apple Relay или Xray кнопкой внизу.")
+            self.send(chat, "\n".join(lines))
+            return
+        for i, item in enumerate(items, 1):
+            day = time.strftime("%d.%m.%Y", time.localtime(item["since"]))
+            if item["state"] == "waiting":
+                state = f"скачан {day}, ещё не установлен"
+            elif item["kind"] == "relay":
+                state = f"установлен {day}"
+            else:
+                state = f"выдан {day}"
+            if item.get("last_seen"):
+                state += ", был в сети " + time.strftime("%d.%m.%Y", time.localtime(item["last_seen"]))
+            lines.append(f"\n{i}. {KINDS[item['kind']]} — {state}")
+        lines.append("\n\nКаждое подключение работает на одном устройстве. Чтобы получить новое, когда места нет, "
+                     "удалите ненужное: на том устройстве оно перестанет работать.")
+        buttons = [(f"Удалить {i}", f"ask:{item['kind']}:{item['key']}") for i, item in enumerate(items, 1)]
+        self.send_buttons(chat, "".join(lines), [buttons[i:i + 3] for i in range(0, len(buttons), 3)])
+
+    def handle_button(self, query: dict) -> None:
+        """A press on a button under a message: data "ask:<kind>:<key>", "rm:<kind>:<key>" or "keep"."""
+        try:
+            self.api.call("answerCallbackQuery", callback_query_id=query["id"])
+        except ApiError:
+            pass
+        message, sender = query.get("message") or {}, query.get("from") or {}
+        chat = (message.get("chat") or {}).get("id")
+        if not chat or (message.get("chat") or {}).get("type") != "private" or "id" not in sender:
+            return
+        name = self.client_for(sender)
+        if name is None:
+            self.unknown(chat, sender)
+            return
+        if self.configs is None:
+            return
+        verb, _, rest = str(query.get("data") or "").partition(":")
+        kind, _, key = rest.partition(":")
+        if verb == "keep":
+            self.send(chat, "Хорошо, ничего не удалено.", self.menu(self.info(name)))
+            return
+        item = next((i for i in self.configs(name)["items"] if i["kind"] == kind and i["key"] == key), None)
+        if item is None:
+            self.send(chat, "Этого подключения уже нет.", self.menu(self.info(name)))
+            self.list_configs(chat, name)
+            return
+        if verb == "ask":
+            self.send_buttons(chat, f"Удалить {KINDS[kind]} от {time.strftime('%d.%m.%Y', time.localtime(item['since']))}? "
+                              "На устройстве с ним доступ пропадёт.",
+                              [[("Да, удалить", f"rm:{kind}:{key}"), ("Нет", "keep")]])
+        elif verb == "rm":
+            if not self.allowed(sender["id"]):
+                self.send(chat, "Слишком много запросов. Попробуйте через час.", self.menu(self.info(name)))
+                return
+            self.remove(name, kind, key)
+            self.db.add_event("config_removed_by_client", name, "telegram", f"{kind} {item['id']}")
+            self.send(chat, "Удалено. Теперь можно получить новое подключение кнопкой внизу.", self.menu(self.info(name)))
+            self.list_configs(chat, name)
 
     def unknown(self, chat: int, sender: dict) -> None:
         """An account the bot does not know: what to tell the administrator, and a note to the admin chat."""

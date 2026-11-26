@@ -1,6 +1,13 @@
 <!-- Network addresses in examples are synthetic; deployment-specific notes are omitted. -->
 # Changelog
 
+## 2.12.0 - 2026-11-27
+
+* **Bot: «Мои подключения».** A person sees their Apple relay devices and Xray
+  keys ("2 из 2", installed or issued when, last seen) and removes one with
+  *Удалить* and a confirmation, which frees its place for a new one. The
+  button shows when relay profiles are bound to one device or Xray is on.
+
 ## 2.11.0 - 2026-11-27
 
 **One number of configs per client**, for device-bound Apple relay profiles and
