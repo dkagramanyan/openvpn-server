@@ -1416,8 +1416,17 @@ async def acme_post(resource: str, request: Request):
 def acme_handle(resource: str, body: bytes):
     if resource == "new-account":
         payload, jwk, account = acme.verify(body, resource, new_account=True)
-        return acme_reply({"status": "valid"}, 201 if not (payload or {}).get("onlyReturnExisting") else 200, location=account)
-    payload, jwk, _ = acme.verify(body, resource)
+        # RFC 8555 7.1.2: an account object has its status and its "orders" URL (required).
+        return acme_reply({"status": "valid", "orders": account + "/orders"},
+                          201 if not (payload or {}).get("onlyReturnExisting") else 200, location=account)
+    payload, jwk, account = acme.verify(body, resource)
+    if resource.startswith("acct/"):
+        # The account (POST-as-GET or an update) and its order list; nothing is kept per account.
+        if acme.url(resource) == account:
+            return acme_reply({"status": "valid", "orders": account + "/orders"}, location=account)
+        if acme.url(resource) == account + "/orders":
+            return acme_reply({"orders": []})
+        raise relay_devices.AcmeError(403, "unauthorized", "Not this account")
     if resource == "new-order":
         row = acme.new_order(payload, jwk)
         return acme_reply(acme.order(row), 201, location=acme.url("order/" + row["id"]))

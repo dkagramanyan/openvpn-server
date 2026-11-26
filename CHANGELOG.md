@@ -1,6 +1,13 @@
 <!-- Network addresses in examples are synthetic; deployment-specific notes are omitted. -->
 # Changelog
 
+## 2.12.2 - 2026-11-27
+
+* **ACME account answer per RFC 8555**: the account object now carries its
+  required `orders` URL, and the account and its order list can be read back.
+  An iPhone installing a one-device relay profile reported "failed to
+  establish account".
+
 ## 2.12.1 - 2026-11-27
 
 * **One-time links no longer die on the phone's second fetch.** iOS downloads a

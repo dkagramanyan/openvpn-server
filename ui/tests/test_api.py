@@ -1875,6 +1875,11 @@ class Phone:
         response = self.post("/acme/new-account", {"termsOfServiceAgreed": True})
         assert response.status_code == 201, response.text
         self.kid = response.headers["location"]
+        # RFC 8555: the account object carries its "orders" URL, and the account can be read back.
+        assert response.json() == {"status": "valid", "orders": self.kid + "/orders"}
+        account = self.post(self.kid.removeprefix(ACME_BASE), None)
+        assert account.status_code == 200 and account.json()["orders"] == self.kid + "/orders"
+        assert self.post(self.kid.removeprefix(ACME_BASE) + "/orders", None).json() == {"orders": []}
         response = self.post("/acme/new-order", {"identifiers": [{"type": "permanent-identifier", "value": code}]})
         if response.status_code != 201:
             return response, None
