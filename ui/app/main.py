@@ -1605,18 +1605,66 @@ def share_base(request: Request | None = None) -> tuple[str, bool]:
     return (str(request.base_url).rstrip("/") if request else ""), False
 
 
+# A spent link keeps handing out the same file for a few minutes: iOS fetches a relay profile twice
+# (Safari, then the profile installer), and a page closed by mistake can be opened again.
+SHARE_GRACE = 600
+
+
 def shared_link(token: str, request: Request) -> tuple[str, str]:
-    """(client, kind) of a one-time link. Wrong links from one address are slowed down."""
+    """(client, kind) of a one-time link that is unused, or spent less than SHARE_GRACE ago.
+    Wrong links from one address are slowed down."""
     key = f"share|{client_ip(request)}"
     wait = limiter.attempt(key)
     if wait:
         raise HTTPException(429, f"Too many attempts, try again in {wait}s", headers={"Retry-After": str(wait)})
-    row = db.one("SELECT client_name, kind FROM share_tokens WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?",
-                 (auth.token_hash(token), int(time.time())))
+    now = int(time.time())
+    row = db.one("SELECT client_name, kind FROM share_tokens WHERE token_hash = ? AND "
+                 "((used_at IS NULL AND expires_at > ?) OR served_until >= ?)", (auth.token_hash(token), now, now))
     if row is None or not (settings.pki_dir / "issued" / f"{row['client_name']}.crt").exists():
         raise HTTPException(404, "This link is invalid, expired or already used")
     limiter.success(key)
     return row["client_name"], row["kind"]
+
+
+def share_content(token: str, name: str, kind: str, request: Request) -> bytes:
+    """The file behind a link: made once, by the request that spends the link; the same bytes to
+    every request within SHARE_GRACE. A failure leaves the link unused."""
+    token_hash = auth.token_hash(token)
+    now = int(time.time())
+    with db.tx() as conn:
+        claimed = conn.execute("UPDATE share_tokens SET used_at = ?, served_until = ? WHERE token_hash = ? "
+                               "AND used_at IS NULL AND expires_at > ?", (now, now + SHARE_GRACE, token_hash, now)).rowcount
+        if claimed:         # in the same transaction: a link is never spent without a trace
+            db.add_event("profile_link_used", name, None, client_ip(request), conn=conn)
+    if not claimed:         # spent already: wait for what the first request made (it may still be signing)
+        for _ in range(60):
+            row = db.one("SELECT content FROM share_tokens WHERE token_hash = ? AND served_until >= ?",
+                         (token_hash, int(time.time())))
+            if row is None:
+                break
+            if row["content"] is not None:
+                return bytes(row["content"])
+            time.sleep(0.5)
+        raise HTTPException(404, "This link is invalid, expired or already used")
+    try:
+        if kind == "xray":
+            content = xray.link(db, name).encode()      # a new key: one slot of the client's configs
+        elif kind == "relay":
+            try:
+                content = relay.profile(db, name)
+            except relay_devices.DeviceLimit:
+                raise
+            except PkiError:
+                if relay_services.signing_config(db)["required"] or relay_services.signing_config(db)["url"]:
+                    raise HTTPException(503, "The profile is temporarily unavailable. Please retry in a minute.")
+                raise
+        else:
+            content = pki.build_profile(name).encode()
+    except BaseException:
+        db.execute("UPDATE share_tokens SET used_at = NULL, served_until = NULL WHERE token_hash = ?", (token_hash,))
+        raise
+    db.execute("UPDATE share_tokens SET content = ? WHERE token_hash = ?", (content, token_hash))
+    return content
 
 
 SHARE_CSS = ("body{font:17px/1.5 system-ui,sans-serif;max-width:26rem;margin:12vh auto;padding:0 20px;"
@@ -1653,7 +1701,7 @@ XRAY_KEY_HEAD = (SHARE_HEAD.replace("TITLE", "Ключ Xray")
                    "<li>Скопируйте ключ ниже целиком.</li>"
                    "<li>В приложении нажмите «+» → «Импорт из буфера обмена» и подключитесь.</li></ol>"
                    "<p>Или отсканируйте QR-код приложением на другом устройстве.</p>")
-XRAY_KEY_TAIL = "<p>Ключ личный, не пересылайте его. Эту страницу больше нельзя открыть.</p></body></html>"
+XRAY_KEY_TAIL = "<p>Ключ личный, не пересылайте его. Через 10 минут эта страница перестанет открываться.</p></body></html>"
 SHARE_ERRORS = {
     404: ("Ссылка недействительна", "Она уже использована или прошёл час. Запросите новую ссылку в боте или у администратора."),
     429: ("Слишком много попыток", "Подождите немного и откройте ссылку снова."),
@@ -1702,38 +1750,18 @@ def shared_profile_page(token: str, request: Request):
 @app.get("/p/{token}/download")
 @share_errors
 def shared_profile(token: str, request: Request):
-    """Public: the profile itself, once."""
+    """Public: the profile itself, once (the same file again for SHARE_GRACE seconds)."""
     name, kind = shared_link(token, request)
-    # Built before the link is spent: a failure here leaves it usable.
+    content = share_content(token, name, kind, request)
     if kind == "xray":
-        content = xray.link(db, name)       # a new key: one slot of the client's configs
-    elif kind == "relay":
-        try:
-            content = relay.profile(db, name)
-        except relay_devices.DeviceLimit:
-            raise
-        except PkiError:
-            if relay_services.signing_config(db)["required"] or relay_services.signing_config(db)["url"]:
-                raise HTTPException(503, "The profile is temporarily unavailable. Please retry in a minute.")
-            raise
-    else:
-        content = pki.build_profile(name)
-    now = int(time.time())
-    with db.tx() as conn:
-        spent = conn.execute("UPDATE share_tokens SET used_at = ? WHERE token_hash = ? AND used_at IS NULL",
-                             (now, auth.token_hash(token))).rowcount
-        if spent:           # in the same transaction: a link is never spent without a trace
-            db.add_event("profile_link_used", name, None, client_ip(request), conn=conn)
-    if not spent:       # two requests at once: the other one got it
-        raise HTTPException(404, "This link is invalid, expired or already used")
-    if kind == "xray":
+        content = content.decode()
         page = (XRAY_KEY_HEAD + '<textarea readonly rows="6" aria-label="Ключ Xray">' + html.escape(content) + "</textarea>"
                 + pki.qr_svg(content, inline=True) + XRAY_KEY_TAIL)
         return HTMLResponse(page, headers={"Content-Security-Policy": SHARE_CSP})
     if kind == "relay":
         return Response(content, media_type="application/x-apple-aspen-config",
                         headers={"Content-Disposition": f'attachment; filename="{name}-relay.mobileconfig"'})
-    return PlainTextResponse(content, media_type="application/x-openvpn-profile",
+    return PlainTextResponse(content.decode(), media_type="application/x-openvpn-profile",
                              headers={"Content-Disposition": f'attachment; filename="{name}.ovpn"'})
 
 

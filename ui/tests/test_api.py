@@ -411,6 +411,8 @@ def test_share_link_is_single_use(client):
         r = client.get(path + "/download")
         assert r.status_code == 200 and "<cert>" in r.text and r.headers["cache-control"] == "no-store"
         assert 'filename="alice.ovpn"' in r.headers["content-disposition"]
+        assert client.get(path + "/download").text == r.text            # the same file for a few minutes
+        db.execute("UPDATE share_tokens SET served_until = 1")
         assert client.get(path + "/download").status_code == 404        # used
         assert client.get(path).status_code == 404
         assert client.get("/p/not-a-token").status_code == 404
@@ -1413,7 +1415,13 @@ def test_relay_share_link_is_single_use(client, configured):
         assert r.status_code == 200 and r.headers["content-type"] == "application/x-apple-aspen-config"
         assert 'filename="alice-relay.mobileconfig"' in r.headers["content-disposition"]
         assert plistlib.loads(r.content)["PayloadContent"][0]["Relays"]
-        assert client.get(path + "/download").status_code == 404
+        # iOS fetches a profile twice (Safari, then the installer): the same file for a few minutes...
+        again = client.get(path + "/download")
+        assert again.status_code == 200 and again.content == r.content
+        assert client.get(path).status_code == 200
+        # ...then the link is dead.
+        db.execute("UPDATE share_tokens SET served_until = 1")
+        assert client.get(path + "/download").status_code == 404 and client.get(path).status_code == 404
     finally:
         limiter._state.clear()
         client.cookies.update(cookies)
@@ -1604,6 +1612,8 @@ def test_xray_share_link_shows_the_key_once(client, xray_on):
         assert key.status_code == 200 and key.headers["content-type"].startswith("text/html")
         assert "vless://uuid@vpn.example.test:8445?pbk=QRkey&amp;sid=1#alice&lt;x&gt;" in key.text   # escaped, and "QR" in a key is kept
         assert "<svg" in key.text and "<?xml" not in key.text and "script-src" not in key.headers["content-security-policy"]
+        assert client.get(path + "/download").text == key.text        # the same key for a few minutes
+        db.execute("UPDATE share_tokens SET served_until = 1")
         used = client.get(path + "/download")
         assert used.status_code == 404 and "Ссылка недействительна" in used.text     # a page, not an API error
     finally:
@@ -2177,3 +2187,30 @@ def test_bot_hides_configs_when_nothing_is_counted(client, configured, telegram)
     bot.handle(tg("/configs"))
     labels = [b["text"] for row in api.sent[-1]["reply_markup"]["keyboard"] for b in row]
     assert "Мои подключения" not in labels and "Привет" in api.text
+
+
+def test_a_spent_link_gives_the_same_config_without_a_second_slot(client, panel):
+    from app import auth, main
+    link = client.post("/api/clients/alice/share", json={"kind": "xray"}, headers=H).json()["url"]
+    first = client.get(urlsplit_path(link) + "/download")
+    second = client.get(urlsplit_path(link) + "/download")
+    assert first.status_code == second.status_code == 200 and first.text == second.text and "vless://" in first.text
+    assert len(panel.clients) == 1 and client.get("/api/clients/alice/relay-devices").json()["used"] == 1
+    relay_link = client.post("/api/clients/alice/share", json={"kind": "relay"}, headers=H).json()["url"]
+    a = client.get(urlsplit_path(relay_link) + "/download")
+    b = client.get(urlsplit_path(relay_link) + "/download")
+    assert a.status_code == b.status_code == 200 and a.content == b.content
+    assert len([d for d in client.get("/api/clients/alice/relay-devices").json()["devices"] if d["state"] == "waiting"]) == 1
+    # A link that could not be served stays unused: the next try works.
+    full = client.post("/api/clients/alice/share", json={"kind": "xray"}, headers=H)
+    assert full.status_code == 409
+
+
+def test_a_failed_download_leaves_the_link_usable(client, panel, monkeypatch):
+    from app import xray
+    link = client.post("/api/clients/alice/share", json={"kind": "xray"}, headers=H).json()["url"]
+    real = xray.link
+    monkeypatch.setattr(xray, "link", lambda db, name: (_ for _ in ()).throw(pki.PkiError("3x-ui is not reachable")))
+    assert client.get(urlsplit_path(link) + "/download").status_code == 400
+    monkeypatch.setattr(xray, "link", real)
+    assert client.get(urlsplit_path(link) + "/download").status_code == 200 and len(panel.clients) == 1

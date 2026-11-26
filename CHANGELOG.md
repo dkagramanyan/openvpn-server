@@ -1,6 +1,15 @@
 <!-- Network addresses in examples are synthetic; deployment-specific notes are omitted. -->
 # Changelog
 
+## 2.12.1 - 2026-11-27
+
+* **One-time links no longer die on the phone's second fetch.** iOS downloads a
+  relay profile twice (Safari, then the profile installer); the second request
+  found the link used and the phone said it had expired. A used link now hands
+  out the same file for 10 minutes: the same relay profile (no second device),
+  the same Xray key page (no second key), the same OpenVPN file. Then it is
+  dead as before. A download that fails leaves the link unused.
+
 ## 2.12.0 - 2026-11-27
 
 * **Bot: «Мои подключения».** A person sees their Apple relay devices and Xray

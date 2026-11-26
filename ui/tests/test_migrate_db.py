@@ -53,7 +53,7 @@ def test_import_preserves_every_table_accounts_credentials_history_and_source(tm
             if table.startswith('traffic_'):        # legacy traffic is OpenVPN traffic
                 rows = [{**row, 'source': 'vpn'} for row in rows]
             if table == 'share_tokens':             # legacy links are OpenVPN profile links
-                rows = [{**row, 'kind': 'openvpn'} for row in rows]
+                rows = [{**row, 'kind': 'openvpn', 'content': None, 'served_until': None} for row in rows]
             if table == 'clients':                  # no Telegram usernames before 2.7, no own config number before 2.11
                 rows = [{**row, 'telegram': None, 'telegram_id': None, 'telegram_name': None, 'config_limit': None} for row in rows]
             assert result['imported'][table] == len(rows)

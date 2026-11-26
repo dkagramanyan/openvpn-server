@@ -851,7 +851,9 @@ that fetches links for a preview. The profile is behind
 `/p/<token>/download`, once. For OpenVPN the QR code holds the
 `openvpn://import-profile/https://.../p/<token>/download` form: scanning it on
 a phone opens OpenVPN Connect and imports the profile. A link is spent only
-when the profile was really delivered.
+when the profile was really delivered. A spent link hands out the same file
+for 10 more minutes (iOS fetches a relay profile twice: Safari, then the
+profile installer), without a new relay device or Xray key; then it is dead.
 
 Links use `https://<website hostname>` from Settings → Network
 (`OVPN_PROFILE_BASE_URL` overrides it). The gateway in

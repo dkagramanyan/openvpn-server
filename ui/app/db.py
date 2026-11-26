@@ -330,6 +330,9 @@ class Database:
             conn.execute("ALTER TABLE relay_flows ADD COLUMN IF NOT EXISTS address TEXT")
             # 2.6: a one-time link carries the OpenVPN profile or the Apple relay profile.
             conn.execute("ALTER TABLE share_tokens ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'openvpn'")
+            # 2.12.1: what a spent link handed out, kept for a few minutes: phones fetch a profile twice.
+            conn.execute("ALTER TABLE share_tokens ADD COLUMN IF NOT EXISTS content BYTEA")
+            conn.execute("ALTER TABLE share_tokens ADD COLUMN IF NOT EXISTS served_until BIGINT")
             # 2.7: the client's Telegram username (lower case, no "@"), and the account that claimed it.
             for column, kind in (("telegram", "TEXT"), ("telegram_id", "BIGINT"), ("telegram_name", "TEXT")):
                 conn.execute(f"ALTER TABLE clients ADD COLUMN IF NOT EXISTS {column} {kind}")
@@ -521,7 +524,8 @@ class Database:
             conn.execute("DELETE FROM traffic_hour WHERE ts < ?", (cutoff,))
             conn.execute("DELETE FROM web_sessions WHERE expires_at < ?", (now,))
             conn.execute("DELETE FROM rejections WHERE day < ?", (now - HOUR_RETENTION,))
-            conn.execute("DELETE FROM share_tokens WHERE expires_at < ?", (now,))
+            conn.execute("DELETE FROM share_tokens WHERE expires_at < ? AND (served_until IS NULL OR served_until < ?)", (now, now))
+            conn.execute("UPDATE share_tokens SET content = NULL WHERE content IS NOT NULL AND served_until < ?", (now,))
             conn.execute("DELETE FROM events WHERE ts < ?", (now - EVENT_RETENTION,))
             conn.execute("DELETE FROM relay_flows WHERE ts < ?", (now - RELAY_FLOW_RETENTION,))
             conn.execute("DELETE FROM section_domains WHERE ts < ?", (now - SECTION_DOMAIN_RETENTION,))
