@@ -1,6 +1,30 @@
 <!-- Network addresses in examples are synthetic; deployment-specific notes are omitted. -->
 # Changelog
 
+## 2.10.0 - 2026-11-27
+
+**Apple relay profiles that work on one device only** (Settings → Apple relay,
+off by default; README, *One device per profile*). Tested on iOS 18.7 with
+`tests/iphone/`.
+
+* A bound profile makes the device create its key in the Secure Enclave and
+  fetch a certificate from this server over ACME (`/acme/` on the website
+  hostname) with a one-time code. A copy of the file is refused on any other
+  device, and iOS then installs nothing of it.
+* The relay asks every direct TLS connection for a client certificate and the
+  policy service accepts a bound profile's credential only together with its
+  device's certificate.
+* **Devices per client** (default 5); the client page lists each device with
+  when it was last seen, and removes one; the older, unbound profiles of a
+  client can be revoked on their own.
+* One-time links and the personal portal say when a client has as many
+  devices as allowed.
+* The profile signer signs bound profiles for its own ACME directory only
+  (`PROFILE_SIGNER_ACME_DIRECTORY`, Traefik 1.4.0). Switching the option on
+  checks the signer and the public `/acme/` route first.
+* `RELAY_CLIENT_CERTS` (`APPLE_RELAY_CLIENT_CERTS` in `.env`): `request`
+  (default), `off`, or `log` for test instances.
+
 ## 2.9.6 - 2026-11-27
 
 * **Builds no longer read runtime folders.** `config/acme/` (the relay

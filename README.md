@@ -208,7 +208,8 @@ Setup:
 
 How it behaves:
 
-* **Credentials** - one per client, reused by every download. **Revoke relay
+* **Credentials** - one per client, reused by every download (unless profiles
+  are bound to one device, see below). **Revoke relay
   access** on the client page invalidates installed profiles without touching
   OpenVPN; certificate revocation, expiry and deletion end relay access too.
   A renewal through the UI keeps the credential.
@@ -292,6 +293,45 @@ gateway), the certificate's names and days left, and every relay session shows
 `h3` or `h2`. `APPLE_RELAY_HTTP2_TLS_BIND=off` sends HTTP/2 through the gateway
 again (TCP 8443 forwarded to the gateway, as before 2.5);
 `APPLE_RELAY_TRANSPORT=http2` or `http3` alone still work as before.
+
+### One device per profile
+
+With **Settings → Apple relay → Each new profile works on one device only**,
+every relay download (client page, personal portal, one-time link, Telegram
+bot) is a new *device*, and a copy of the file works nowhere else:
+
+* The profile carries an ACME payload (`com.apple.security.acme`) with a
+  one-time code and `HardwareBound`: while it installs, the device makes its
+  own key in the Secure Enclave and fetches a certificate from this server at
+  `https://<website hostname>/acme/` (the gateway routes `/acme/` here from
+  anywhere, Traefik 1.4.0). The relay payload logs in with that identity
+  (`PayloadCertificateUUID`) and the credential `device:<id>`.
+* A code gives one certificate. A second device installing the same file is
+  refused, and iOS installs nothing of the profile ("forbidden"). The same
+  device asking again (a dropped connection) gets the same certificate.
+* The relay asks every direct TLS connection (HTTP/2 and HTTP/3) for a client
+  certificate and gives its SHA-256 to the policy service, which accepts
+  `device:<id>` only with that device's certificate: the header copied out of
+  the file opens nothing.
+* **Devices per client** (5 by default) caps how many installed devices a
+  client may have; a further download or install is refused with a message to
+  ask the administrator. A profile that is not installed within 7 days expires.
+* The client page lists the devices (installed, waiting, revoked) with when
+  each was last seen; **Remove** stops one. Installing a new profile on the
+  same phone takes a new slot: remove the old device. **Revoke relay access**
+  stops all of them.
+* Profiles installed earlier (one shared credential) keep working until you
+  **Revoke** them in the same list. A device-bound profile has the same
+  identifier as the client's earlier profile, so installing it replaces that
+  one on the phone.
+
+Tested on iOS 18.7 (`tests/iphone/`). It needs the relay's own TLS (TCP/UDP
+8443 straight to this server): through the gateway's TLS termination
+(port 8444) no device certificate arrives, so bound profiles cannot log in
+there. Switching it on checks first that the gateway's signer accepts such
+profiles and that `https://<website hostname>/acme/directory` answers; update
+the gateway to Traefik 1.4.0 before. `RELAY_CLIENT_CERTS=off` stops the relay
+asking for certificates (bound profiles then cannot log in).
 
 ## Traffic by podkop section
 
@@ -443,6 +483,17 @@ website hostname in Settings → Network and traefik 1.2.0 or later (see
 [One-time profile links](#one-time-profile-links)). A new password ends the
 client's earlier portal sign-ins. Everything the bot does is in the event log
 with the actor `telegram`.
+
+## Upgrading to 2.10
+
+Nothing changes until you switch on one device per profile. To use it:
+
+1. On the gateway: Traefik 1.4.0 (`git pull`, `./manage setup`, then
+   `sudo docker compose --profile profile-signing up -d --build`). If your
+   `.env` there pins `PROFILE_SIGNER_SOURCE`, delete that line or set it to the
+   revision in `.env.example`.
+2. Here: `git pull && sudo docker compose up -d --build`.
+3. **Settings → Apple relay → Each new profile works on one device only**, save.
 
 ## Upgrading to 2.5
 

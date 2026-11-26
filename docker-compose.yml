@@ -31,6 +31,8 @@ services:
       RELAY_UDP_REFUSED: ${APPLE_RELAY_UDP_REFUSED:-198.18.0.0/15}
       RELAY_NETWORK_CONFIG: /etc/relay-network/proxies.conf
       RELAY_AUTH_URL: ${APPLE_RELAY_AUTH_URL:-http://127.0.0.1:8447/api/relay/authorize}
+      # Ask every direct TLS connection for a client certificate (device-bound profiles); "off" never asks.
+      RELAY_CLIENT_CERTS: ${APPLE_RELAY_CLIENT_CERTS:-request}
     # The certificate for HTTP/3 and direct HTTP/2 (relay-cert keeps it renewed).
     volumes:
       - ${APPLE_RELAY_TLS_DIR:-./relay-tls}:/tls:ro

@@ -479,6 +479,7 @@ function clientDetailView(el) {
       c.rejections.length ? card('Rejected OpenVPN connection attempts · last 30 days', rejectionsTable(c.rejections, false)) : '',
       sectionsBox.card,
       card('Sessions · last 100', sessionsTable(c.sessions, false), h('a', { class: 'btn sm', href: '#/sessions/' + enc }, 'Every session')),
+      c.relay_available ? relayDevicesCard(name) : '',
       flowsCard);
     sectionsBox.load();
     const dailyOpts = () => ({ ts: c.daily.map(p => p.ts), series: [{ label: 'Download', cls: 's1', values: c.daily.map(p => trafficOf(p, 'out', src)) }, { label: 'Upload', cls: 's2', values: c.daily.map(p => trafficOf(p, 'in', src)) }], fmtY: v => fmtBytes(v, 0), fmtX: fmtDate, fmtXFull: fmtDate, height: 220, aria: 'Daily traffic' });
@@ -488,6 +489,41 @@ function clientDetailView(el) {
   }
   load();
   return { onLive: live => { if (!c) return; const v = onlineClients(live).get(name), via = v ? ['vpn', 'relay'].filter(k => v[k]) : []; if (via.join() !== (c.online_via || []).join()) load(); } };
+}
+// The client's Apple relay profiles: each device-bound one (one device each) and the older
+// unbound profiles, which share one credential.
+function relayDevicesCard(name) {
+  const enc = encodeURIComponent(name);
+  const body = h('div', null, h('div', { class: 'small muted' }, 'Loading…'));
+  const STATE = { active: 'installed', waiting: 'downloaded, not installed yet', expired: 'never installed (expired)', revoked: 'revoked' };
+  async function load() {
+    let r;
+    try { r = await api(`/api/clients/${enc}/relay-devices`); } catch (e) { body.replaceChildren(h('div', { class: 'small muted' }, e.message)); return; }
+    const active = r.devices.filter(d => d.state === 'active').length;
+    const rows = r.devices.filter(d => d.state !== 'expired').map(d => h('tr', null,
+      h('td', { class: 'mono small' }, d.id),
+      h('td', null, h('span', { class: 'badge ' + (d.state === 'active' ? 'valid' : d.state === 'revoked' ? 'revoked' : 'plain') }, STATE[d.state])),
+      h('td', null, fmtDateTime(d.enrolled_at || d.created_at)),
+      h('td', null, d.last_seen ? fmtAgo(d.last_seen) : '—'),
+      h('td', null, d.state === 'active' || d.state === 'waiting' ? h('button', { class: 'btn sm danger', onClick: async () => {
+        if (await confirmDialog('Remove device', `The relay stops working on this device of ${name} (${d.id}).`, 'Remove', true)) {
+          await withToast(api(`/api/clients/${enc}/relay-devices/${encodeURIComponent(d.id)}`, { method: 'DELETE' }), 'Device removed'); load();
+        } } }, 'Remove') : '')));
+    body.replaceChildren(
+      h('p', { class: 'small muted', style: 'margin:0 0 10px' }, r.bound
+        ? `Each new profile works on one device: ${active} of ${r.limit} in use.`
+        : 'New profiles are not bound to a device (Settings → Apple relay).'),
+      rows.length ? h('div', { class: 'table-wrap' }, h('table', { class: 'tbl' },
+        h('thead', null, h('tr', null, ['Device', 'State', 'Since', 'Last seen', ''].map(t => h('th', null, t)))), h('tbody', null, rows))) : '',
+      r.shared ? h('div', { class: 'row', style: 'margin-top:10px;gap:10px;align-items:center' },
+        h('span', { class: 'small' }, 'Profiles without device binding (one shared credential, works on any device): active.'),
+        h('button', { class: 'btn sm danger', onClick: async () => {
+          if (await confirmDialog('Revoke unbound profiles', `Every relay profile of ${name} without device binding stops working. Device-bound profiles keep working.`, 'Revoke', true)) {
+            await withToast(api(`/api/clients/${enc}/relay-shared`, { method: 'DELETE' }), 'Unbound profiles revoked'); load();
+          } } }, 'Revoke')) : '');
+  }
+  load();
+  return card('Apple relay devices', body);
 }
 // The client's Apple relay connections: the open ones, then the saved log with its destinations.
 function relayFlowsCard(name) {
