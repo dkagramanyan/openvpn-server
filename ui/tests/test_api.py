@@ -1444,7 +1444,7 @@ class FakeTelegram:
     def __init__(self):
         self.sent = []
 
-    def call(self, method, timeout=15, **params):
+    def call(self, method, http_timeout=15, **params):
         assert method == "sendMessage"
         self.sent.append(params)
         return {}
@@ -1540,7 +1540,7 @@ def test_telegram_api_errors_never_carry_the_token():
     from app import telegram_bot
     api = telegram_bot.Api("123:SECRET-TOKEN", base="http://127.0.0.1:9")
     with pytest.raises(telegram_bot.ApiError) as error:
-        api.call("getMe", timeout=2)
+        api.call("getMe", http_timeout=2)
     assert "SECRET" not in str(error.value)
 
 
@@ -1647,7 +1647,7 @@ def test_xray_rule_sits_after_the_api_rule_and_is_written_once(monkeypatch):
 def test_telegram_token_and_admin_chat_are_set_in_the_ui(client, monkeypatch):
     from app import main, telegram_bot
     sent, known = [], {"123:GOOD": "access_bot", "456:OTHER": "other_bot"}
-    def call(self, method, timeout=15, **params):
+    def call(self, method, http_timeout=15, **params):
         token = self._url.rsplit("/bot", 1)[1].rstrip("/")
         if token not in known:
             raise telegram_bot.ApiError(f"{method}: Unauthorized")
@@ -1718,3 +1718,64 @@ def test_the_3x_ui_panel_goes_into_the_gateway_file_and_the_sidebar(client, monk
         assert client.get("/api/xray/settings").json()["panel_url"] == "https://openvpn.example.test/AbC123xyz/"
     finally:
         state.unlink()
+
+
+def test_telegram_bot_polls_and_answers_over_real_http():
+    """The real Api and polling loop against a local stand-in for api.telegram.org: getUpdates
+    carries its own "timeout" (the long poll), which must not collide with the HTTP timeout."""
+    import http.server
+    import threading
+    import time
+    from app import telegram_bot
+    seen, first = [], [True]
+
+    class Telegram(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])) or b"{}")
+            method = self.path.rsplit("/", 1)[1]
+            seen.append((method, body))
+            if method == "getMe":
+                result = {"username": "access_bot"}
+            elif method == "getUpdates":
+                result = [{"update_id": 7, "message": {"chat": {"id": 5, "type": "private"}, "text": "/start",
+                                                       "from": {"id": 5, "username": "stranger"}}}] if first[0] else []
+                first[0] = False
+            else:
+                result = {}
+            data = json.dumps({"ok": True, "result": result}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Telegram)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    import contextlib
+    import types
+
+    class NoClients:           # no client has this Telegram account or username
+        def one(self, *args):
+            return None
+
+        @contextlib.contextmanager
+        def tx(self):
+            yield types.SimpleNamespace(execute=lambda *args: types.SimpleNamespace(fetchone=lambda: None))
+    bot = telegram_bot.Bot(telegram_bot.Api("123:ABC", base=f"http://127.0.0.1:{server.server_port}"), NoClients(),
+                           link=None, password=None, info=None)
+    bot.start()
+    try:
+        for _ in range(50):
+            if any(method == "sendMessage" for method, _ in seen):
+                break
+            time.sleep(0.1)
+    finally:
+        bot.stop()
+        server.shutdown()
+    polls = [body for method, body in seen if method == "getUpdates"]
+    assert polls and polls[0]["timeout"] == 50
+    replies = [body for method, body in seen if method == "sendMessage"]
+    assert replies and replies[0]["chat_id"] == 5 and "Your Telegram ID: 5" in replies[0]["text"]

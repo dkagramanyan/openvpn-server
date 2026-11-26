@@ -1,6 +1,14 @@
 <!-- Network addresses in examples are synthetic; deployment-specific notes are omitted. -->
 # Changelog
 
+## 2.9.1 - 2026-11-26
+
+* **The Telegram bot answers.** Its polling request passed Telegram's
+  long-poll `timeout` and the HTTP timeout under the same name, so every
+  `getUpdates` failed (log: `got multiple values for keyword argument
+  'timeout'`) and the bot never saw a message. Saving the token worked because
+  that check uses `getMe`. A test now runs the real polling loop over HTTP.
+
 ## 2.9.0 - 2026-11-26
 
 * **Settings → Telegram**: the bot token (never shown again; a saved token

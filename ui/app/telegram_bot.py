@@ -41,11 +41,12 @@ class Api:
     def __init__(self, token: str, base: str = "https://api.telegram.org"):
         self._url = f"{base.rstrip('/')}/bot{token}/"
 
-    def call(self, method: str, timeout: float = 15, **params):
+    def call(self, method: str, http_timeout: float = 15, **params):
+        # http_timeout, not timeout: "timeout" is a parameter of getUpdates itself (the long poll).
         request = urllib.request.Request(self._url + method, data=json.dumps(params).encode(),
                                          headers={"Content-Type": "application/json"})
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with urllib.request.urlopen(request, timeout=http_timeout) as response:
                 body = json.load(response)
         except urllib.error.HTTPError as exc:
             try:
@@ -104,7 +105,7 @@ class Bot:
                 params = {"timeout": 50, "allowed_updates": ["message"]}
                 if offset is not None:
                     params["offset"] = offset
-                updates = api.call("getUpdates", timeout=60, **params)
+                updates = api.call("getUpdates", http_timeout=60, **params)
                 wait = 5
                 if self.api is not api:     # replaced during the poll: these belong to the old bot
                     continue
