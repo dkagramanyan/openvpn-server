@@ -1,6 +1,14 @@
 <!-- Network addresses in examples are synthetic; deployment-specific notes are omitted. -->
 # Changelog
 
+## 2.9.6 - 2026-11-27
+
+* **Builds no longer read runtime folders.** `config/acme/` (the relay
+  certificate's ACME account keys), `config/router/` and `xui/` are left out of
+  the Docker build context. Before, building an image as a user who cannot read
+  them stopped with "open config/acme/accounts: permission denied", and the
+  keys went into the build context of every image.
+
 ## 2.9.5 - 2026-11-27
 
 A test for binding an Apple relay profile to one iPhone (`tests/iphone/`, see its

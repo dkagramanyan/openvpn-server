@@ -20,4 +20,7 @@ ui/tests/
 tests/
 
 config/network/
+config/acme/
+config/router/
+xui/
 *.private.json
