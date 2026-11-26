@@ -1486,7 +1486,7 @@ def test_telegram_bot_binds_a_username_once_then_trusts_the_id(client, configure
     bot.handle(tg("/start"))                                      # usernames match without regard to case
     assert "учётная запись: alice" in api.text
     assert [b["text"] for row in api.sent[-1]["reply_markup"]["keyboard"] for b in row] == [
-        "🔐 OpenVPN", "🍏 Apple Relay", "🔑 Пароль от портала", "ℹ️ Мой доступ", "❓ Помощь"]
+        "OpenVPN", "Apple Relay", "Пароль от сайта", "Мой доступ", "Помощь"]
     info = client.get("/api/clients/alice/portal").json()
     assert info["telegram_linked"] and info["telegram_name"] == "Alice"
     assert any(e["kind"] == "telegram_linked" for e in client.get("/api/events").json()["events"])
@@ -1496,9 +1496,9 @@ def test_telegram_bot_binds_a_username_once_then_trusts_the_id(client, configure
     # The bound account keeps working after it changes its username.
     bot.handle(tg("OpenVPN", username="renamed"))
     url = re.search(r"https://vpn\.example\.test(/p/\S+)", api.text)
-    assert url and "OpenVPN Connect" in api.text and "1. " in api.text and "одноразовая" in api.text
+    assert url and "OpenVPN Connect" in api.text and "1. " in api.text and "один час и один раз" in api.text
     assert "<cert>" in client.get(url.group(1) + "/download").text
-    bot.handle(tg("🍏 Apple Relay"))                             # the new button
+    bot.handle(tg("🍏 Apple Relay"))                             # a button of 2.9.2 still works
     assert "Safari" in api.text
     url = re.search(r"https://vpn\.example\.test(/p/\S+)", api.text)
     assert plistlib.loads(client.get(url.group(1) + "/download").content)["PayloadContent"][0]["Relays"]
@@ -1617,7 +1617,7 @@ def test_telegram_bot_offers_xray_when_on(client, telegram, xray_on):
     bot, api = telegram
     assert client.put("/api/clients/alice/telegram", json={"username": "alice_tg"}, headers=H).status_code == 200
     bot.handle(tg("/start"))
-    assert "🚀 Xray" in [b["text"] for row in api.sent[-1]["reply_markup"]["keyboard"] for b in row]
+    assert "Xray" in [b["text"] for row in api.sent[-1]["reply_markup"]["keyboard"] for b in row]
     bot.handle(tg("🚀 Xray"))
     assert "/p/" in api.text and "Показать мой ключ" in api.text and "v2RayTun" in api.text
 

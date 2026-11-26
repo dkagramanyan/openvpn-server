@@ -22,47 +22,47 @@ log = logging.getLogger("telegram")
 USERNAME = re.compile(r"^[a-z0-9_]{5,32}$")
 ACTIONS_PER_HOUR = 20       # links and passwords one Telegram account may ask for
 
-# Menu buttons. Older keyboards (English labels) and slash commands still work.
-BUTTONS = {"openvpn": "🔐 OpenVPN", "relay": "🍏 Apple Relay", "xray": "🚀 Xray",
-           "password": "🔑 Пароль от портала", "status": "ℹ️ Мой доступ", "help": "❓ Помощь"}
+# Menu buttons. Earlier keyboards (English labels, labels with emoji) and slash commands still work.
+BUTTONS = {"openvpn": "OpenVPN", "relay": "Apple Relay", "xray": "Xray",
+           "password": "Пароль от сайта", "status": "Мой доступ", "help": "Помощь"}
 ALIASES = {**{label.lower(): action for action, label in BUTTONS.items()},
-           "openvpn": "openvpn", "/openvpn": "openvpn", "apple relay": "relay", "/relay": "relay",
-           "xray": "xray", "/xray": "xray", "portal password": "password", "/password": "password",
-           "status": "status", "/status": "status", "/start": "help", "/help": "help"}
-COMMANDS = [{"command": "start", "description": "Главное меню"},
-            {"command": "openvpn", "description": "Ссылка на профиль OpenVPN"},
-            {"command": "relay", "description": "Профиль Apple Relay (iPhone, iPad, Mac)"},
-            {"command": "xray", "description": "Ключ Xray"},
-            {"command": "password", "description": "Новый пароль от личного кабинета"},
+           "🔐 openvpn": "openvpn", "/openvpn": "openvpn", "🍏 apple relay": "relay", "/relay": "relay",
+           "🚀 xray": "xray", "/xray": "xray", "portal password": "password", "🔑 пароль от портала": "password",
+           "/password": "password", "status": "status", "ℹ️ мой доступ": "status", "/status": "status",
+           "❓ помощь": "help", "/start": "help", "/help": "help"}
+COMMANDS = [{"command": "start", "description": "Меню"},
+            {"command": "openvpn", "description": "Подключить OpenVPN"},
+            {"command": "relay", "description": "Подключить Apple Relay (iPhone, iPad, Mac)"},
+            {"command": "xray", "description": "Подключить Xray"},
+            {"command": "password", "description": "Новый пароль от сайта"},
             {"command": "status", "description": "Мой доступ"}]
 
 LINK_STEPS = {
-    "openvpn": ("🔐 Ваша ссылка на профиль OpenVPN:\n{url}\n\n"
-                "Как подключиться:\n"
-                "1. Установите приложение OpenVPN Connect: App Store (iPhone, Mac), Google Play (Android) "
-                "или openvpn.net/client (Windows, Linux).\n"
-                "2. Откройте ссылку выше на том же устройстве.\n"
-                "3. Нажмите «Открыть в OpenVPN Connect» — приложение добавит профиль. Если не сработало, "
-                "нажмите «Скачать файл .ovpn» и откройте файл в OpenVPN Connect.\n"
-                "4. В приложении включите переключатель рядом с профилем."),
-    "relay": ("🍏 Ваша ссылка на профиль Apple Relay:\n{url}\n\n"
-              "Как подключиться (iPhone, iPad, Mac), приложение не нужно:\n"
-              "1. Откройте ссылку в Safari, а не внутри Telegram: нажмите на ссылку и выберите «Открыть в Safari» "
-              "(значок компаса или «…» вверху).\n"
-              "2. Нажмите «Установить профиль» и разрешите загрузку.\n"
-              "3. Откройте Настройки → «Профиль загружен» (вверху списка) → «Установить». "
-              "На Mac: Системные настройки → Профили.\n"
-              "4. Готово: защита включается сама."),
-    "xray": ("🚀 Ваша ссылка на ключ Xray:\n{url}\n\n"
-             "Как подключиться:\n"
-             "1. Установите приложение: v2RayTun или Streisand (iPhone, Mac), v2RayTun или v2rayNG (Android), "
-             "Hiddify (Windows, macOS, Linux).\n"
+    "openvpn": ("Профиль OpenVPN:\n{url}\n\n"
+                "1. Установите приложение OpenVPN Connect из App Store или Google Play. "
+                "Для компьютера оно лежит на openvpn.net/client.\n"
+                "2. Откройте ссылку на том устройстве, где нужен VPN.\n"
+                "3. Нажмите «Открыть в OpenVPN Connect». Приложение спросит, добавить ли профиль. Согласитесь.\n"
+                "4. Включите переключатель рядом с профилем. Когда он позеленеет, VPN работает.\n\n"
+                "Если на шаге 3 ничего не произошло, нажмите на той же странице «Скачать файл .ovpn» "
+                "и откройте скачанный файл в OpenVPN Connect."),
+    "relay": ("Профиль Apple Relay:\n{url}\n\n"
+              "1. Откройте ссылку в Safari. Если она открылась внутри Telegram, нажмите значок Safari (компас) "
+              "в углу экрана: в окне Telegram профиль не установится.\n"
+              "2. На странице нажмите «Установить профиль», затем «Разрешить».\n"
+              "3. Откройте «Настройки». Вверху появится строка «Профиль загружен». Нажмите на неё, "
+              "затем «Установить», и введите код-пароль телефона.\n"
+              "4. Больше ничего включать не нужно: интернет на этом устройстве идёт через сервер.\n\n"
+              "На Mac после шага 2 откройте «Системные настройки», наберите в поиске «Профили» и установите профиль там."),
+    "xray": ("Ключ Xray:\n{url}\n\n"
+             "1. Установите приложение v2RayTun на телефон. Для компьютера подойдёт Hiddify.\n"
              "2. Откройте ссылку и нажмите «Показать мой ключ».\n"
-             "3. Скопируйте ключ целиком (он начинается с vless://).\n"
-             "4. В приложении нажмите «+» → «Импорт из буфера обмена» и подключитесь.\n\n"
-             "Ключ показывается один раз — не закрывайте страницу, пока не добавите его в приложение."),
+             "3. Скопируйте ключ целиком. Он начинается с vless://\n"
+             "4. В v2RayTun нажмите «+» в углу экрана и выберите «Импорт из буфера обмена».\n"
+             "5. Нажмите кнопку подключения.\n\n"
+             "Страница с ключом открывается один раз. Не закрывайте её, пока не выполните шаг 4."),
 }
-ONCE = "\n\nСсылка одноразовая и действует 1 час. Не получилось — просто запросите новую."
+ONCE = "\n\nСсылка работает один час и один раз. Если не успели, нажмите кнопку снова, бот пришлёт новую."
 
 
 def normalize(username: str) -> str:
@@ -169,7 +169,7 @@ class Bot:
                     chat = ((update.get("message") or {}).get("chat") or {}).get("id")
                     try:
                         if chat:
-                            self.send(chat, "Что-то пошло не так. Попробуйте ещё раз позже или напишите администратору.")
+                            self.send(chat, "Не получилось выполнить запрос. Попробуйте ещё раз через минуту.")
                     except ApiError:
                         pass
 
@@ -205,7 +205,7 @@ class Bot:
             if bound:
                 self.db.add_event("telegram_linked", bound["name"], "telegram", f"@{username} ({sender['id']})", conn=conn)
         if bound:
-            self.notify_admin(f"✅ @{username} ({display or 'без имени'}) привязан к клиенту {bound['name']}.")
+            self.notify_admin(f"@{username} ({display or 'без имени'}) привязан к клиенту {bound['name']}.")
         return bound["name"] if bound else None
 
     def allowed(self, telegram_id: int) -> bool:
@@ -234,60 +234,58 @@ class Bot:
         if (action == "relay" and not info["relay"]) or (action == "xray" and not info["xray"]):
             action = "help"
         if not info["valid"] and action not in ("help", "status"):
-            self.send(chat, "⛔️ Ваш доступ закончился или отозван. Чтобы продлить его, напишите администратору.", menu)
+            self.send(chat, "Ваш доступ закончился или отозван. Напишите администратору.", menu)
             return
         if action in ("openvpn", "relay", "xray"):
             self.send_link(chat, sender["id"], name, action, menu)
         elif action == "password":
             if not self.allowed(sender["id"]):
-                self.send(chat, "Слишком много запросов. Попробуйте снова через час.", menu)
+                self.send(chat, "Слишком много запросов. Попробуйте через час.", menu)
                 return
             username, password = self.password(name)
             self.db.add_event("portal_password_issued", name, "telegram")
-            self.send(chat, f"🔑 Вход в личный кабинет\n\nЛогин: {username}\nПароль: {password}\n\n"
-                      f"Сайт: {info['portal_url']}\nОн открывается только при включённом VPN.\n\n"
-                      "Старый пароль больше не действует. Сохраните новый (например, в менеджере паролей) "
-                      "и удалите это сообщение.", menu)
+            self.send(chat, f"Вход на сайт {info['portal_url']}\n\nЛогин: {username}\nПароль: {password}\n\n"
+                      "Сайт открывается только при включённом VPN. Прежний пароль больше не работает. "
+                      "Сохраните новый пароль и удалите это сообщение.", menu)
         elif action == "status":
             expires = time.strftime("%d.%m.%Y", time.gmtime(info["expires_at"])) if info["expires_at"] else "неизвестно"
-            self.send(chat, f"ℹ️ Ваш доступ\n\nУчётная запись: {name}\n"
-                      f"Тип: {'гостевой — только интернет' if info['guest'] else 'полный — интернет и домашняя сеть'}\n"
-                      f"Состояние: {'действует' if info['valid'] else 'закончился или отозван'}\n"
-                      f"Действует до: {expires}", menu)
+            if info["valid"]:
+                access = "гостевой, только интернет" if info["guest"] else "полный, интернет и домашняя сеть"
+                self.send(chat, f"Учётная запись: {name}\nДоступ: {access}\nДействует до: {expires}", menu)
+            else:
+                self.send(chat, f"Учётная запись: {name}\nДоступ закончился или отозван. Напишите администратору.", menu)
         else:
-            self.send(chat, f"👋 Здравствуйте! Это бот для подключения к VPN. Ваша учётная запись: {name}.\n\n"
-                      "Выберите способ подключения кнопкой внизу:\n\n"
-                      "🔐 OpenVPN — для любых устройств: iPhone, Android, Windows, macOS, Linux. "
-                      "Нужно приложение OpenVPN Connect.\n"
-                      + ("🍏 Apple Relay — для iPhone, iPad и Mac, без приложений: ставится профилем в настройках.\n"
-                         if info["relay"] else "")
-                      + ("🚀 Xray — если OpenVPN не подключается (например, в мобильной сети). "
-                         "Нужно приложение v2RayTun, Streisand, v2rayNG или Hiddify.\n" if info["xray"] else "")
-                      + "\n🔑 Пароль от портала — новый пароль для личного кабинета на сайте.\n"
-                      "ℹ️ Мой доступ — какой у вас доступ и до какого числа.\n\n"
-                      "Каждая ссылка одноразовая и действует 1 час.", menu)
+            first = "Apple Relay" if info["relay"] else "OpenVPN"
+            self.send(chat, f"Здравствуйте. Этот бот выдаёт доступ к VPN. Ваша учётная запись: {name}.\n\n"
+                      "Нажмите кнопку внизу, и бот пришлёт ссылку и порядок действий.\n\n"
+                      "OpenVPN работает на любом устройстве. Нужно бесплатное приложение OpenVPN Connect.\n"
+                      + ("Apple Relay работает на iPhone, iPad и Mac. Приложение не нужно.\n" if info["relay"] else "")
+                      + ("Xray пригодится, если OpenVPN не подключается. Нужно приложение v2RayTun.\n" if info["xray"] else "")
+                      + (f"\nНа iPhone начните с {first}, на других устройствах с OpenVPN.\n" if info["relay"] else "")
+                      + "\n«Пароль от сайта» выдаёт новый пароль для личного кабинета.\n"
+                      "«Мой доступ» показывает, до какого числа действует доступ.", menu)
 
     def unknown(self, chat: int, sender: dict) -> None:
         """An account the bot does not know: what to tell the administrator, and a note to the admin chat."""
         if sender.get("username"):
-            how = f"Сообщите администратору ваше имя пользователя: @{sender['username']}\nПосле этого снова нажмите /start."
+            how = f"Напишите администратору своё имя в Telegram: @{sender['username']}\nКогда он добавит вас, нажмите /start."
         else:
-            how = ("Сначала задайте имя пользователя в Telegram: Настройки → Мой профиль → Имя пользователя. "
-                   "Затем сообщите его администратору и снова нажмите /start.")
-        self.send(chat, f"У этого аккаунта Telegram пока нет доступа.\n\n{how}\n\nВаш Telegram ID: {sender['id']}")
+            how = ("У вашего аккаунта нет имени пользователя. Задайте его: Настройки Telegram, «Мой профиль», "
+                   "«Имя пользователя». Потом напишите это имя администратору и нажмите /start.")
+        self.send(chat, f"У этого аккаунта пока нет доступа.\n\n{how}\n\nВаш Telegram ID: {sender['id']}")
         if sender["id"] != self.admin_chat and time.monotonic() - self._asked.get(sender["id"], -3600) >= 3600:
             self._asked[sender["id"]] = time.monotonic()
             who = " ".join(filter(None, (sender.get("first_name"), sender.get("last_name")))) or "без имени"
             account = "@" + sender["username"] if sender.get("username") else "аккаунт без имени пользователя"
-            self.notify_admin(f"🙋 Запрос доступа: {account} ({who}, ID {sender['id']}).\n"
-                              "Чтобы дать доступ, впишите имя пользователя на странице клиента в разделе «Telegram & portal».")
+            self.notify_admin(f"Запрос доступа: {account} ({who}, ID {sender['id']}).\n"
+                              "Чтобы дать доступ, впишите имя пользователя на странице клиента, раздел «Telegram & portal».")
 
     def send_link(self, chat: int, telegram_id: int, name: str, kind: str, menu) -> None:
         if not self.allowed(telegram_id):
-            self.send(chat, "Слишком много запросов. Попробуйте снова через час.", menu)
+            self.send(chat, "Слишком много запросов. Попробуйте через час.", menu)
             return
         link = self.link(name, kind)
         if not link["public"]:
-            self.send(chat, "Ссылки пока недоступны: администратор ещё не настроил адрес сайта. Попробуйте позже.", menu)
+            self.send(chat, "Ссылки пока не работают: администратор не указал адрес сайта.", menu)
             return
         self.send(chat, LINK_STEPS[kind].format(url=link["url"]) + ONCE, menu)

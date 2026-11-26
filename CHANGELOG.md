@@ -1,6 +1,14 @@
 <!-- Network addresses in examples are synthetic; deployment-specific notes are omitted. -->
 # Changelog
 
+## 2.9.3 - 2026-11-27
+
+* **Bot texts rewritten in plain Russian.** No emoji; one action per step,
+  naming what the person sees on the screen; what to do when a step fails
+  (OpenVPN: download the file; Apple Relay: open in Safari, not inside
+  Telegram). Buttons are now OpenVPN, Apple Relay, Xray, «Пароль от сайта»,
+  «Мой доступ», «Помощь»; the buttons of 2.9.2 and the English ones still work.
+
 ## 2.9.2 - 2026-11-26
 
 The Telegram bot and the pages of one-time links speak Russian, step by step.
