@@ -158,6 +158,8 @@ func serveHTTP2Context(ctx context.Context, listener net.Listener, handler http.
 						return
 					}
 					_ = tc.SetDeadline(time.Time{})
+					state := tc.ConnectionState()
+					logClientCert("http2", conn.RemoteAddr().String(), &state)
 				}
 				server.ServeConn(conn, &http2.ServeConnOpts{Handler: handler, BaseConfig: base})
 			}()

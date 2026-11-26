@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 )
@@ -114,6 +115,10 @@ func (s *relayServer) authorizeBackend(ctx context.Context, token string) (polic
 				}
 				if err := p.compile(); err != nil {
 					return p, errAuthUnavailable
+				}
+				// A test instance on another port serves the same credentials under its own origin.
+				if origin := os.Getenv("RELAY_TEST_ORIGIN"); origin != "" {
+					p.URL = origin
 				}
 				return p, nil
 			}

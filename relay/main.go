@@ -81,6 +81,7 @@ func (s *relayServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	flow := s.activity.begin()
 	defer flow.finish()
 	r = r.WithContext(context.WithValue(r.Context(), flowKey{}, flow))
+	logClientCertRequest(r)
 	if flow != nil {
 		flow.event.Transport = "http3"
 		if r.ProtoMajor == 2 {
@@ -353,7 +354,7 @@ func main() {
 		}
 		return handler.checkReadiness(ctx)
 	}
-	admin, err := handler.activity.listen("127.0.0.1:8446")
+	admin, err := handler.activity.listen(env("RELAY_ADMIN_BIND", "127.0.0.1:8446"))
 	if err != nil {
 		log.Fatal(err)
 	}

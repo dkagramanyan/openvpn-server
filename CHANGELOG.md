@@ -1,6 +1,20 @@
 <!-- Network addresses in examples are synthetic; deployment-specific notes are omitted. -->
 # Changelog
 
+## 2.9.5 - 2026-11-27
+
+A test for binding an Apple relay profile to one iPhone (`tests/iphone/`, see its
+README). Nothing changes for installed profiles or the running relay.
+
+* **Relay: three switches for a second, test instance** (all off by default):
+  `RELAY_CLIENT_CERTS=log` asks each connection for a client certificate and
+  logs what it presented (HTTP/2 and HTTP/3), `RELAY_ADMIN_BIND` moves the status
+  listener off 127.0.0.1:8446, `RELAY_TEST_ORIGIN` serves the same credentials
+  under the test instance's own address.
+* **`tests/iphone/run.sh`** starts that relay on 8463 and a throwaway ACME server
+  on 8464, builds test profiles (token, PKCS#12, ACME with a Secure Enclave key,
+  ACME with attestation) and collects what the phone did into a report.
+
 ## 2.9.4 - 2026-11-27
 
 * **Shorter bot replies.** Each link comes with two or three plain sentences

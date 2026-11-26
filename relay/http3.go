@@ -26,8 +26,9 @@ import (
 // (for example while it is being replaced) keeps the previous one in use.
 // tlsConfig serves the relay's certificate for the given ALPN protocols.
 func (c *certificateFiles) tlsConfig(protocols ...string) *tls.Config {
-	return &tls.Config{MinVersion: tls.VersionTLS12, NextProtos: protocols,
-		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return c.get() }}
+	return &tls.Config{MinVersion: tls.VersionTLS12, NextProtos: protocols, ClientAuth: clientCertMode(),
+		SessionTicketsDisabled: clientCertMode() != tls.NoClientCert,
+		GetCertificate:         func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return c.get() }}
 }
 
 // details of the certificate in use, for the status page: names, expiry, issuer.
@@ -110,8 +111,9 @@ func (s *relayServer) http3Server(certificate func() (*tls.Certificate, error)) 
 		streams = int64(s.quota.maximum)
 	}
 	return &http3.Server{Handler: s, EnableDatagrams: true, MaxHeaderBytes: 8192,
-		TLSConfig: http3.ConfigureTLSConfig(&tls.Config{MinVersion: tls.VersionTLS13,
-			GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return certificate() }}),
+		TLSConfig: http3.ConfigureTLSConfig(&tls.Config{MinVersion: tls.VersionTLS13, ClientAuth: clientCertMode(),
+			SessionTicketsDisabled: clientCertMode() != tls.NoClientCert,
+			GetCertificate:         func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return certificate() }}),
 		QUICConfig: &quic.Config{KeepAlivePeriod: 20 * time.Second, MaxIdleTimeout: 90 * time.Second,
 			MaxIncomingStreams:         streams,
 			InitialStreamReceiveWindow: 1 << 20, MaxStreamReceiveWindow: 8 << 20,

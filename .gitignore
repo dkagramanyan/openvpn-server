@@ -17,3 +17,4 @@ config/client.conf.bak
 config/router/
 config/acme/
 xui/
+tests/iphone/report.tar.gz
