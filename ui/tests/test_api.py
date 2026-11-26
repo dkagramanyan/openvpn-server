@@ -1478,45 +1478,47 @@ def test_telegram_bot_binds_a_username_once_then_trusts_the_id(client, configure
     from fastapi.testclient import TestClient
     bot, api = telegram
     bot.handle(tg("/start"))
-    assert "no access" in api.text and "@Alice_TG" in api.text
+    assert "нет доступа" in api.text and "@Alice_TG" in api.text
     assert client.put("/api/clients/alice/telegram", json={"username": "not valid"}, headers=H).status_code == 400
     r = client.put("/api/clients/alice/telegram", json={"username": "@alice_tg"}, headers=H)
     assert r.status_code == 200 and r.json()["telegram"] == "alice_tg" and not r.json()["telegram_linked"]
     assert r.json()["bot_username"] == "access_bot"
     bot.handle(tg("/start"))                                      # usernames match without regard to case
-    assert "account alice" in api.text
-    assert [b["text"] for row in api.sent[-1]["reply_markup"]["keyboard"] for b in row] == ["OpenVPN", "Apple relay", "Portal password", "Status"]
+    assert "учётная запись: alice" in api.text
+    assert [b["text"] for row in api.sent[-1]["reply_markup"]["keyboard"] for b in row] == [
+        "🔐 OpenVPN", "🍏 Apple Relay", "🔑 Пароль от портала", "ℹ️ Мой доступ", "❓ Помощь"]
     info = client.get("/api/clients/alice/portal").json()
     assert info["telegram_linked"] and info["telegram_name"] == "Alice"
     assert any(e["kind"] == "telegram_linked" for e in client.get("/api/events").json()["events"])
     # Someone who takes the username later is not the bound account.
     bot.handle(tg("/start", sender=2002))
-    assert "no access" in api.text
+    assert "нет доступа" in api.text
     # The bound account keeps working after it changes its username.
     bot.handle(tg("OpenVPN", username="renamed"))
     url = re.search(r"https://vpn\.example\.test(/p/\S+)", api.text)
-    assert url and "OpenVPN Connect" in api.text
+    assert url and "OpenVPN Connect" in api.text and "1. " in api.text and "одноразовая" in api.text
     assert "<cert>" in client.get(url.group(1) + "/download").text
-    bot.handle(tg("/relay"))
+    bot.handle(tg("🍏 Apple Relay"))                             # the new button
+    assert "Safari" in api.text
     url = re.search(r"https://vpn\.example\.test(/p/\S+)", api.text)
     assert plistlib.loads(client.get(url.group(1) + "/download").content)["PayloadContent"][0]["Relays"]
-    bot.handle(tg("Portal password"))
-    login = dict(re.findall(r"(Username|Password): (\S+)", api.text))
+    bot.handle(tg("Portal password"))                             # an old English button still works
+    login = dict(re.findall(r"(Логин|Пароль): (\S+)", api.text))
     browser = TestClient(app)
     try:
-        assert browser.post("/api/portal/login", json={"username": login["Username"], "password": login["Password"]}, headers=H).status_code == 200
+        assert browser.post("/api/portal/login", json={"username": login["Логин"], "password": login["Пароль"]}, headers=H).status_code == 200
         assert browser.get("/api/portal").json()["telegram_bot"] == "access_bot"
     finally:
         browser.close()
-    bot.handle(tg("Status"))
-    assert "Account: alice" in api.text and "Access: full" in api.text
+    bot.handle(tg("ℹ️ Мой доступ"))
+    assert "Учётная запись: alice" in api.text and "полный" in api.text and "Действует до: 01.01.2036" in api.text
     sent = len(api.sent)
     bot.handle(tg("Status", kind="group"))                       # groups are ignored
     assert len(api.sent) == sent
     # A new username from the admin unbinds the old account.
     assert not client.put("/api/clients/alice/telegram", json={"username": "someone_else"}, headers=H).json()["telegram_linked"]
     bot.handle(tg("Status"))
-    assert "no access" in api.text
+    assert "нет доступа" in api.text
 
 
 def test_telegram_bot_refuses_ended_access_and_limits_requests(client, telegram, monkeypatch):
@@ -1530,10 +1532,10 @@ def test_telegram_bot_refuses_ended_access_and_limits_requests(client, telegram,
         bot.handle(tg("OpenVPN"))
         assert "/p/" in api.text
     bot.handle(tg("OpenVPN"))
-    assert "Too many requests" in api.text
+    assert "Слишком много запросов" in api.text
     monkeypatch.setattr(relay, "eligible", lambda name: None)
     bot.handle(tg("Portal password"))
-    assert "expired or was revoked" in api.text
+    assert "закончился или отозван" in api.text
 
 
 def test_telegram_api_errors_never_carry_the_token():
@@ -1567,7 +1569,7 @@ def test_telegram_bot_makes_no_link_without_a_public_address(client, telegram, m
     assert client.put("/api/clients/alice/telegram", json={"username": "alice_tg"}, headers=H).status_code == 200
     before = db.one("SELECT count(*) AS n FROM share_tokens")["n"]
     bot.handle(tg("OpenVPN"))
-    assert "website hostname" in api.text and db.one("SELECT count(*) AS n FROM share_tokens")["n"] == before
+    assert "адрес сайта" in api.text and db.one("SELECT count(*) AS n FROM share_tokens")["n"] == before
 
 
 @pytest.fixture
@@ -1590,12 +1592,13 @@ def test_xray_share_link_shows_the_key_once(client, xray_on):
     path = "/p/" + r.json()["url"].rsplit("/p/", 1)[1]
     try:
         page = client.get(path)
-        assert page.status_code == 200 and "Show my key" in page.text and "vless://" not in page.text
+        assert page.status_code == 200 and "Показать мой ключ" in page.text and "vless://" not in page.text
         key = client.get(path + "/download")
         assert key.status_code == 200 and key.headers["content-type"].startswith("text/html")
         assert "vless://uuid@vpn.example.test:8445?pbk=QRkey&amp;sid=1#alice&lt;x&gt;" in key.text   # escaped, and "QR" in a key is kept
         assert "<svg" in key.text and "<?xml" not in key.text and "script-src" not in key.headers["content-security-policy"]
-        assert client.get(path + "/download").status_code == 404
+        used = client.get(path + "/download")
+        assert used.status_code == 404 and "Ссылка недействительна" in used.text     # a page, not an API error
     finally:
         limiter._state.clear()
     assert client.get("/api/clients/alice").json()["xray_available"] is True
@@ -1614,9 +1617,9 @@ def test_telegram_bot_offers_xray_when_on(client, telegram, xray_on):
     bot, api = telegram
     assert client.put("/api/clients/alice/telegram", json={"username": "alice_tg"}, headers=H).status_code == 200
     bot.handle(tg("/start"))
-    assert "Xray" in [b["text"] for row in api.sent[-1]["reply_markup"]["keyboard"] for b in row]
-    bot.handle(tg("Xray"))
-    assert "/p/" in api.text and "shows your key" in api.text
+    assert "🚀 Xray" in [b["text"] for row in api.sent[-1]["reply_markup"]["keyboard"] for b in row]
+    bot.handle(tg("🚀 Xray"))
+    assert "/p/" in api.text and "Показать мой ключ" in api.text and "v2RayTun" in api.text
 
 
 def test_xray_rule_sits_after_the_api_rule_and_is_written_once(monkeypatch):
@@ -1690,7 +1693,7 @@ def test_unknown_telegram_accounts_learn_their_id_and_the_admin_hears_once(clien
     bot.admin_chat = 4242
     bot.handle(tg("/start", sender=5555, username="stranger"))
     reply, notice = api.sent[-2], api.sent[-1]
-    assert reply["chat_id"] == 5555 and "Your Telegram ID: 5555" in reply["text"]
+    assert reply["chat_id"] == 5555 and "Ваш Telegram ID: 5555" in reply["text"]
     assert notice["chat_id"] == 4242 and "@stranger" in notice["text"] and "5555" in notice["text"]
     sent = len(api.sent)
     bot.handle(tg("hello", sender=5555, username="stranger"))
@@ -1699,7 +1702,7 @@ def test_unknown_telegram_accounts_learn_their_id_and_the_admin_hears_once(clien
     assert api.sent[-1]["chat_id"] == 4242 and "4242" in api.text and len(api.sent) == sent + 2   # the admin learns their own ID
     assert client.put("/api/clients/alice/telegram", json={"username": "stranger"}, headers=H).status_code == 200
     bot.handle(tg("/start", sender=5555, username="stranger"))
-    assert any(m["chat_id"] == 4242 and "linked to the client alice" in m["text"] for m in api.sent[-2:])
+    assert any(m["chat_id"] == 4242 and "привязан к клиенту alice" in m["text"] for m in api.sent[-2:])
 
 
 def test_the_3x_ui_panel_goes_into_the_gateway_file_and_the_sidebar(client, monkeypatch):
@@ -1778,4 +1781,5 @@ def test_telegram_bot_polls_and_answers_over_real_http():
     polls = [body for method, body in seen if method == "getUpdates"]
     assert polls and polls[0]["timeout"] == 50
     replies = [body for method, body in seen if method == "sendMessage"]
-    assert replies and replies[0]["chat_id"] == 5 and "Your Telegram ID: 5" in replies[0]["text"]
+    assert replies and replies[0]["chat_id"] == 5 and "Ваш Telegram ID: 5" in replies[0]["text"]
+    assert any(method == "setMyCommands" for method, _ in seen)              # the "/" menu with Russian descriptions

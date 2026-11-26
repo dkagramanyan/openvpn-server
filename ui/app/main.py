@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import datetime
+import functools
 import hashlib
 import hmac
 import html
@@ -1178,7 +1179,7 @@ def test_telegram(user: dict[str, Any] = Authed):
     if not bot.configured or bot.admin_chat is None:
         raise HTTPException(400, "Save a bot token and your chat ID first")
     try:
-        bot.send(bot.admin_chat, "Test message from the access server: notifications arrive here.")
+        bot.send(bot.admin_chat, "✅ Тестовое сообщение от сервера доступа: уведомления приходят сюда.")
     except telegram_bot.ApiError as exc:
         raise HTTPException(400, f"Telegram did not deliver it ({exc}). Open the bot and press Start first.")
     return {"sent": True}
@@ -1436,31 +1437,63 @@ SHARE_CSS = ("body{font:17px/1.5 system-ui,sans-serif;max-width:26rem;margin:12v
              "textarea{width:100%;box-sizing:border-box;font:13px/1.4 ui-monospace,monospace;padding:8px}"
              "svg{display:block;width:100%;max-width:18rem;margin:16px auto;background:#fff}"
              "@media(prefers-color-scheme:dark){body{color:#e6e8eb;background:#111418}}")
-SHARE_HEAD = ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
+SHARE_HEAD = ('<!doctype html><html lang="ru"><head><meta charset="utf-8">'
               '<meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex">'
               "<title>TITLE</title><style>" + SHARE_CSS + "</style></head><body><h1>TITLE</h1>")
+# The pages behind one-time links are for the people who get them: Russian, step by step.
 SHARE_PAGES = {
-    "openvpn": SHARE_HEAD.replace("TITLE", "OpenVPN profile")
-    + "<p>Open this page on the device that will use the VPN. The profile can be fetched once.</p>"
-      '<a href="IMPORT_URL">Open in OpenVPN Connect</a><a href="DOWNLOAD_URL">Download the .ovpn file</a></body></html>',
-    "relay": SHARE_HEAD.replace("TITLE", "Apple relay profile")
-    + "<p>Open this page in Safari on the iPhone, iPad or Mac that will use the relay. The profile can be fetched once.</p>"
-      '<a href="DOWNLOAD_URL">Install the profile</a>'
-      "<p>Then open Settings → Profile Downloaded and tap Install.</p></body></html>",
-    "xray": SHARE_HEAD.replace("TITLE", "Xray key")
-    + "<p>Open this page on the device that will use it. The key is shown once: keep the next page open "
-      "until it is imported.</p><a href=\"DOWNLOAD_URL\">Show my key</a></body></html>",
+    "openvpn": SHARE_HEAD.replace("TITLE", "Профиль OpenVPN")
+    + "<p>Откройте эту страницу на том устройстве, где будет работать VPN. "
+      "Сначала установите приложение OpenVPN Connect.</p>"
+      '<a href="IMPORT_URL">Открыть в OpenVPN Connect</a><a href="DOWNLOAD_URL">Скачать файл .ovpn</a>'
+      "<p>Если кнопка «Открыть» не сработала, скачайте файл и откройте его в OpenVPN Connect. "
+      "Профиль выдаётся один раз.</p></body></html>",
+    "relay": SHARE_HEAD.replace("TITLE", "Профиль Apple Relay")
+    + "<p>Откройте эту страницу в Safari на iPhone, iPad или Mac, где будет работать защита.</p>"
+      '<a href="DOWNLOAD_URL">Установить профиль</a>'
+      "<p>Затем откройте Настройки → «Профиль загружен» → «Установить». На Mac: Системные настройки → Профили. "
+      "Профиль выдаётся один раз.</p></body></html>",
+    "xray": SHARE_HEAD.replace("TITLE", "Ключ Xray")
+    + "<p>Откройте эту страницу на том устройстве, где будет работать Xray. Ключ покажется один раз — "
+      "не закрывайте следующую страницу, пока не добавите его в приложение.</p>"
+      '<a href="DOWNLOAD_URL">Показать мой ключ</a></body></html>',
 }
-XRAY_KEY_HEAD = (SHARE_HEAD.replace("TITLE", "Xray key")
-                 + "<p>Install an Xray app: v2RayTun or Streisand (iPhone, Mac), v2RayTun or v2rayNG (Android), "
-                   "Hiddify (Windows, macOS, Linux). Copy the key below and import it from the clipboard, "
-                   "or scan the code with the app on another device.</p>")
-XRAY_KEY_TAIL = "<p>The key is personal: do not share it. This page cannot be opened again.</p></body></html>"
+XRAY_KEY_HEAD = (SHARE_HEAD.replace("TITLE", "Ключ Xray")
+                 + "<ol><li>Установите приложение: v2RayTun или Streisand (iPhone, Mac), v2RayTun или v2rayNG (Android), "
+                   "Hiddify (Windows, macOS, Linux).</li>"
+                   "<li>Скопируйте ключ ниже целиком.</li>"
+                   "<li>В приложении нажмите «+» → «Импорт из буфера обмена» и подключитесь.</li></ol>"
+                   "<p>Или отсканируйте QR-код приложением на другом устройстве.</p>")
+XRAY_KEY_TAIL = "<p>Ключ личный — не пересылайте его. Эту страницу больше нельзя открыть.</p></body></html>"
+SHARE_ERRORS = {
+    404: ("Ссылка недействительна", "Она уже использована или прошёл час. Запросите новую ссылку в боте или у администратора."),
+    429: ("Слишком много попыток", "Подождите немного и откройте ссылку снова."),
+}
+SHARE_FAILED = ("Профиль сейчас не готов", "Попробуйте ещё раз через минуту. Если не получится — напишите администратору.")
+
+
+def share_errors(handler):
+    """A failed one-time link shows a short page in the recipient's language, not an API error."""
+    @functools.wraps(handler)
+    def page(token: str, request: Request):
+        try:
+            return handler(token, request)
+        except HTTPException as exc:
+            status, headers = exc.status_code, dict(exc.headers or {})
+        except PkiError:
+            status, headers = 400, {}
+        title, text = SHARE_ERRORS.get(status, SHARE_FAILED)
+        return HTMLResponse(SHARE_HEAD.replace("TITLE", title) + f"<p>{text}</p></body></html>", status_code=status,
+                            headers={**headers, "Content-Security-Policy": SHARE_CSP})
+    return page
+
+
 SHARE_CSP = ("default-src 'none'; style-src 'sha256-" + base64.b64encode(hashlib.sha256(SHARE_CSS.encode()).digest()).decode()
              + "'; frame-ancestors 'none'; base-uri 'none'")
 
 
 @app.get("/p/{token}")
+@share_errors
 def shared_profile_page(token: str, request: Request):
     """Public: the page behind a one-time link. It only offers the profile, so that a messenger
     fetching the link for a preview does not use the link up. /p/ is the only path meant to be
@@ -1473,6 +1506,7 @@ def shared_profile_page(token: str, request: Request):
 
 
 @app.get("/p/{token}/download")
+@share_errors
 def shared_profile(token: str, request: Request):
     """Public: the profile itself, once."""
     name, kind = shared_link(token, request)
@@ -1497,7 +1531,7 @@ def shared_profile(token: str, request: Request):
     if not spent:       # two requests at once: the other one got it
         raise HTTPException(404, "This link is invalid, expired or already used")
     if kind == "xray":
-        page = (XRAY_KEY_HEAD + '<textarea readonly rows="6" aria-label="Xray key">' + html.escape(content) + "</textarea>"
+        page = (XRAY_KEY_HEAD + '<textarea readonly rows="6" aria-label="Ключ Xray">' + html.escape(content) + "</textarea>"
                 + pki.qr_svg(content, inline=True) + XRAY_KEY_TAIL)
         return HTMLResponse(page, headers={"Content-Security-Policy": SHARE_CSP})
     if kind == "relay":

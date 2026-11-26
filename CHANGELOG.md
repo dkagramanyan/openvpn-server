@@ -1,6 +1,20 @@
 <!-- Network addresses in examples are synthetic; deployment-specific notes are omitted. -->
 # Changelog
 
+## 2.9.2 - 2026-11-26
+
+The Telegram bot and the pages of one-time links speak Russian, step by step.
+
+* **Bot**: Russian menu (🔐 OpenVPN, 🍏 Apple Relay, 🚀 Xray, 🔑 Пароль от
+  портала, ℹ️ Мой доступ, ❓ Помощь), a welcome that says which method suits
+  which device, and numbered steps with each link (which app, what to tap,
+  Safari for Apple Relay). Telegram's "/" menu lists the commands in Russian.
+  Old English buttons and the slash commands keep working. Admin notices and
+  the test message are Russian too.
+* **Link pages** (OpenVPN, Apple Relay, Xray key) are Russian, with the steps.
+  A used, expired or unknown link shows a short page ("Ссылка
+  недействительна…") instead of an API error.
+
 ## 2.9.1 - 2026-11-26
 
 * **The Telegram bot answers.** Its polling request passed Telegram's
