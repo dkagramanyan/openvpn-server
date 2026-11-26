@@ -1,6 +1,12 @@
 <!-- Network addresses in examples are synthetic; deployment-specific notes are omitted. -->
 # Changelog
 
+## 2.9.4 - 2026-11-27
+
+* **Shorter bot replies.** Each link comes with two or three plain sentences
+  instead of a numbered list; the greeting, password and "no access" replies
+  are shorter too.
+
 ## 2.9.3 - 2026-11-27
 
 * **Bot texts rewritten in plain Russian.** No emoji; one action per step,

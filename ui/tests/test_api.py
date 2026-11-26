@@ -1484,7 +1484,7 @@ def test_telegram_bot_binds_a_username_once_then_trusts_the_id(client, configure
     assert r.status_code == 200 and r.json()["telegram"] == "alice_tg" and not r.json()["telegram_linked"]
     assert r.json()["bot_username"] == "access_bot"
     bot.handle(tg("/start"))                                      # usernames match without regard to case
-    assert "учётная запись: alice" in api.text
+    assert "получить доступ" in api.text
     assert [b["text"] for row in api.sent[-1]["reply_markup"]["keyboard"] for b in row] == [
         "OpenVPN", "Apple Relay", "Пароль от сайта", "Мой доступ", "Помощь"]
     info = client.get("/api/clients/alice/portal").json()
@@ -1496,7 +1496,7 @@ def test_telegram_bot_binds_a_username_once_then_trusts_the_id(client, configure
     # The bound account keeps working after it changes its username.
     bot.handle(tg("OpenVPN", username="renamed"))
     url = re.search(r"https://vpn\.example\.test(/p/\S+)", api.text)
-    assert url and "OpenVPN Connect" in api.text and "1. " in api.text and "один час и один раз" in api.text
+    assert url and "OpenVPN Connect" in api.text and "одноразовая" in api.text
     assert "<cert>" in client.get(url.group(1) + "/download").text
     bot.handle(tg("🍏 Apple Relay"))                             # a button of 2.9.2 still works
     assert "Safari" in api.text
@@ -1619,7 +1619,7 @@ def test_telegram_bot_offers_xray_when_on(client, telegram, xray_on):
     bot.handle(tg("/start"))
     assert "Xray" in [b["text"] for row in api.sent[-1]["reply_markup"]["keyboard"] for b in row]
     bot.handle(tg("🚀 Xray"))
-    assert "/p/" in api.text and "Показать мой ключ" in api.text and "v2RayTun" in api.text
+    assert "/p/" in api.text and "Показать мой ключ" in api.text and "v2RayTun" in api.text and len(api.text) < 600
 
 
 def test_xray_rule_sits_after_the_api_rule_and_is_written_once(monkeypatch):
