@@ -25,9 +25,10 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.exception_handlers import request_validation_exception_handler, http_exception_handler
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
-from . import __version__, auth, backup, guest_check, pki, relay, relay_services, relay_history, sections, telegram_bot, watchdog, xray, network, network_discovery
+from . import __version__, auth, backup, guest_check, pki, relay, relay_devices, relay_services, relay_history, sections, telegram_bot, watchdog, xray, network, network_discovery
 from .collector import Collector, Maintenance
 from .db import Database, HOUR_RETENTION, MINUTE_RETENTION, RELAY_FLOW_RETENTION, _TRAFFIC_UNION, empty_point
 from .mgmt import Management, ManagementError
@@ -202,6 +203,13 @@ async def validation_error(request: Request, exc: RequestValidationError):
     if request.url.path == "/api/relay/signing":
         return JSONResponse({"detail": "Invalid signing settings"}, status_code=422, headers={"Cache-Control": "no-store"})
     return await request_validation_exception_handler(request, exc)
+
+
+@app.exception_handler(relay_devices.DeviceLimit)
+async def device_limit_error(request: Request, exc: relay_devices.DeviceLimit):
+    if getattr(request.state, "native_profile_download", False):
+        return profile_download_error(str(exc), 409, request.url.path.startswith("/api/portal/"))
+    return JSONResponse({"detail": str(exc)}, status_code=409)
 
 
 @app.exception_handler(PkiError)
@@ -812,8 +820,8 @@ def own_relay_status(user: dict[str, Any] = SignedIn):
     # Filter again at the trust boundary, even when an older backend ignores
     # the client query. Never send another client's destinations to this login.
     return {"ready": bool(status.get("ready")), "policy_ready": status.get("policy_ready", False),
-            "sessions": relay_history.sessions(db, client=name, credential=relay.credential_id(db, name)),
-            "flows": relay_history.flows(db, name, credential=relay.credential_id(db, name), limit=100)[1],
+            "sessions": relay_history.sessions(db, client=name, credential=relay.credential_ids(db, name)),
+            "flows": relay_history.flows(db, name, credential=relay.credential_ids(db, name), limit=100)[1],
             **{key: [row for row in status.get(key, []) if row.get("client") == name]
                for key in ("clients", "active", "events")}}
 
@@ -825,6 +833,8 @@ def own_relay_profile(user: dict[str, Any] = SignedIn):
     name = user["client_name"]
     try:
         content = relay.profile(db, name)
+    except relay_devices.DeviceLimit:
+        raise
     except PkiError:
         if relay_services.signing_config(db)["required"] or relay_services.signing_config(db)["url"]:
             raise HTTPException(503, "Signed relay profiles are temporarily unavailable. Please retry or contact the administrator.")
@@ -1224,6 +1234,8 @@ def save_relay_signing(body: relay_services.SigningSettings, user: dict[str, Any
 
 @app.put("/api/relay/settings", dependencies=[Csrf])
 def put_relay_settings(body: relay.RelaySettings, user: dict[str, Any] = Authed):
+    if body.devices and "devices" in body.model_fields_set and not relay.get_settings(db)["devices"]:
+        relay.device_self_test(db, {**relay.get_settings(db), **body.model_dump(exclude_unset=True)})
     config = relay.save_settings(db, body)
     event("relay_settings_changed", user)
     return config
@@ -1251,6 +1263,118 @@ def revoke_relay(name: str, user: dict[str, Any] = Authed):
     relay.revoke(db, name)
     event("relay_access_revoked", user, name)
     return {"ok": True}
+
+
+@app.get("/api/clients/{name}/relay-devices")
+def relay_device_list(name: str, user: dict[str, Any] = Authed):
+    """The client's device-bound relay profiles, and whether its unbound profiles still work."""
+    find_client(name)
+    config = relay.get_settings(db)
+    return {"bound": config["devices"], "limit": config["device_limit"], "shared": relay.has_shared(db, name),
+            "devices": relay_devices.listing(db, name)}
+
+
+@app.delete("/api/clients/{name}/relay-devices/{device}", dependencies=[Csrf])
+def revoke_relay_device(name: str, device: str, user: dict[str, Any] = Authed):
+    find_client(name)
+    if not relay_devices.revoke(db, name, device) and not any(d["id"] == device for d in relay_devices.listing(db, name)):
+        raise HTTPException(404, "No such device")
+    event("relay_device_revoked", user, name, device)
+    return {"ok": True}
+
+
+@app.delete("/api/clients/{name}/relay-shared", dependencies=[Csrf])
+def revoke_relay_shared(name: str, user: dict[str, Any] = Authed):
+    """Profiles without device binding stop working; device-bound ones keep working."""
+    find_client(name)
+    relay.revoke_shared(db, name)
+    event("relay_shared_revoked", user, name)
+    return {"ok": True}
+
+
+# -- ACME for device-bound relay profiles (public, like /p/) ------------------------------------
+acme = relay_devices.Acme(db, lambda: relay.acme_base(db))
+ACME_BODY = 64 * 1024
+
+
+def acme_reply(body, status=200, location=None, link=None, content_type="application/json"):
+    headers = {"Replay-Nonce": acme.nonce(), "Cache-Control": "no-store",
+               "Link": f'<{acme.url("directory")}>;rel="index"'}
+    if location:
+        headers["Location"] = location
+    if link:
+        headers["Link"] += f', <{link}>;rel="up"'
+    if isinstance(body, bytes):
+        return Response(body, status_code=status, media_type=content_type, headers=headers)
+    return JSONResponse(body, status_code=status, headers=headers)
+
+
+def acme_problem(exc: relay_devices.AcmeError):
+    response = acme_reply({"type": "urn:ietf:params:acme:error:" + exc.kind, "detail": exc.detail}, exc.status)
+    response.headers["Content-Type"] = "application/problem+json"
+    return response
+
+
+def acme_ready():
+    if not relay.acme_base(db):
+        raise HTTPException(404, "Not found")
+
+
+@app.get("/acme/directory")
+def acme_directory():
+    acme_ready()
+    return JSONResponse(acme.directory(), headers={"Cache-Control": "no-store"})
+
+
+@app.api_route("/acme/new-nonce", methods=["GET", "HEAD"])
+def acme_new_nonce(request: Request):
+    acme_ready()
+    return Response(status_code=200 if request.method == "HEAD" else 204,
+                    headers={"Replay-Nonce": acme.nonce(), "Cache-Control": "no-store",
+                             "Link": f'<{acme.url("directory")}>;rel="index"'})
+
+
+@app.post("/acme/{resource:path}")
+async def acme_post(resource: str, request: Request):
+    acme_ready()
+    if int(request.headers.get("content-length") or 0) > ACME_BODY:
+        return acme_problem(relay_devices.AcmeError(413, "malformed", "Request too large"))
+    body = await request.body()
+    if len(body) > ACME_BODY:
+        return acme_problem(relay_devices.AcmeError(413, "malformed", "Request too large"))
+    try:
+        return await run_in_threadpool(acme_handle, resource, body)
+    except relay_devices.AcmeError as exc:
+        return acme_problem(exc)
+    except PkiError:
+        return acme_problem(relay_devices.AcmeError(500, "serverInternal", "Enrolment failed; try again"))
+
+
+def acme_handle(resource: str, body: bytes):
+    limit = relay.get_settings(db)["device_limit"]
+    if resource == "new-account":
+        payload, jwk, account = acme.verify(body, resource, new_account=True)
+        return acme_reply({"status": "valid"}, 201 if not (payload or {}).get("onlyReturnExisting") else 200, location=account)
+    payload, jwk, _ = acme.verify(body, resource)
+    if resource == "new-order":
+        row = acme.new_order(payload, jwk, limit)
+        return acme_reply(acme.order(row), 201, location=acme.url("order/" + row["id"]))
+    kind, _, rest = resource.partition("/")
+    if kind == "order" and rest.endswith("/finalize"):
+        row = acme.finalize(acme.device(rest[:-len("/finalize")]), payload, jwk, limit)
+        return acme_reply(acme.order(row), location=acme.url("order/" + row["id"]))
+    if kind in ("order", "authz", "chall", "cert") and "/" not in rest:
+        row = acme.device(rest)
+        if kind == "order":
+            acme.owned(row, jwk)
+            return acme_reply(acme.order(row), location=acme.url("order/" + row["id"]))
+        if kind == "authz":
+            acme.owned(row, jwk)
+            return acme_reply(acme.authz(row))
+        if kind == "chall":
+            return acme_reply(acme.answer(row, jwk), link=acme.url("authz/" + row["id"]))
+        return acme_reply(acme.certificate(row, jwk), content_type="application/pem-certificate-chain")
+    raise relay_devices.AcmeError(404, "malformed", "Unknown resource")
 
 
 @app.post("/api/relay/authorize")
@@ -1326,6 +1450,7 @@ def delete_client(name: str, user: dict[str, Any] = Authed):
     pki.remove_client(name)
     disable_portal(name)
     relay.revoke(db, name)
+    relay_devices.forget(db, name)     # a new client with this name starts without them
     drop_share_links(name)
     xray.forget(db, name)
     serials = [row["cert"]["serial"]] + [h["serial"] for h in row["history"]]
@@ -1469,6 +1594,8 @@ SHARE_ERRORS = {
     404: ("Ссылка недействительна", "Она уже использована или прошёл час. Запросите новую ссылку в боте или у администратора."),
     429: ("Слишком много попыток", "Подождите немного и откройте ссылку снова."),
 }
+SHARE_LIMIT = ("Слишком много устройств", "Профиль Apple Relay работает только на одном устройстве, и у вас их уже "
+               "столько, сколько разрешено. Попросите администратора удалить старое устройство и откройте ссылку снова.")
 SHARE_FAILED = ("Профиль сейчас не готов", "Попробуйте ещё раз через минуту. Если не получится — напишите администратору.")
 
 
@@ -1480,9 +1607,11 @@ def share_errors(handler):
             return handler(token, request)
         except HTTPException as exc:
             status, headers = exc.status_code, dict(exc.headers or {})
+        except relay_devices.DeviceLimit:
+            status, headers = 409, {}
         except PkiError:
             status, headers = 400, {}
-        title, text = SHARE_ERRORS.get(status, SHARE_FAILED)
+        title, text = SHARE_LIMIT if status == 409 else SHARE_ERRORS.get(status, SHARE_FAILED)
         return HTMLResponse(SHARE_HEAD.replace("TITLE", title) + f"<p>{text}</p></body></html>", status_code=status,
                             headers={**headers, "Content-Security-Policy": SHARE_CSP})
     return page
@@ -1516,6 +1645,8 @@ def shared_profile(token: str, request: Request):
     elif kind == "relay":
         try:
             content = relay.profile(db, name)
+        except relay_devices.DeviceLimit:
+            raise
         except PkiError:
             if relay_services.signing_config(db)["required"] or relay_services.signing_config(db)["url"]:
                 raise HTTPException(503, "The profile is temporarily unavailable. Please retry in a minute.")
@@ -1702,6 +1833,9 @@ class NetworkUpdate(network.NetworkSettings):
 def put_network_settings(body: NetworkUpdate, user: dict[str, Any] = Authed):
     # Validate every part before changing anything.
     relay_config = relay.validate_settings(body.relay_settings) if body.relay_settings is not None else None
+    if (relay_config is not None and body.relay_settings.devices and "devices" in body.relay_settings.model_fields_set
+            and not relay.get_settings(db)["devices"]):
+        relay.device_self_test(db, {**relay.get_settings(db), **body.relay_settings.model_dump(exclude_unset=True)})
     if relay_config is not None:
         body.gateway.relay_public_url = relay_config["url"]
     if body.remote is not None:

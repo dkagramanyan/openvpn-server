@@ -164,6 +164,8 @@ def test_every_route_needs_a_session_and_every_change_the_csrf_header(client):
     from fastapi.routing import APIRoute
     from app.main import app, limiter
     public = {"/healthz", "/", "/portal", "/p/{token}", "/p/{token}/download"}
+    # ACME for device-bound relay profiles: phones authenticate with signed requests (JWS), not sessions.
+    acme = {"/acme/directory", "/acme/new-nonce", "/acme/{resource:path}"}
     cookies = dict(client.cookies)
     seen = 0
     try:
@@ -174,13 +176,13 @@ def test_every_route_needs_a_session_and_every_change_the_csrf_header(client):
             for method in route.methods:
                 seen += 1
                 client.cookies.update(cookies)
-                if method != "GET":     # no header: refused whoever asks
+                if method != "GET" and route.path not in acme:     # no header: refused whoever asks
                     assert client.request(method, path, json={}).status_code == 403, (method, path)
                 client.cookies.clear()
                 r = client.request(method, path, json={}, headers=H)
                 if route.path == "/api/relay/authorize":
                     assert r.status_code == 403  # machine endpoint requires a relay bearer credential
-                elif route.path in public or route.path in ("/api/logout", "/api/portal/logout"):
+                elif route.path in public or route.path in acme or route.path in ("/api/logout", "/api/portal/logout"):
                     assert r.status_code != 401, (method, path)
                 elif route.path in ("/api/login", "/api/portal/login"):
                     assert r.status_code == 422, (method, path)      # an empty body
@@ -1783,3 +1785,214 @@ def test_telegram_bot_polls_and_answers_over_real_http():
     replies = [body for method, body in seen if method == "sendMessage"]
     assert replies and replies[0]["chat_id"] == 5 and "Ваш Telegram ID: 5" in replies[0]["text"]
     assert any(method == "setMyCommands" for method, _ in seen)              # the "/" menu with Russian descriptions
+
+
+# -- device-bound relay profiles (2.10) -------------------------------------------------------
+# An ACME client that does what iOS 18.7 did (tests/iphone): HTTP/1.1, ES256 with kid, one
+# permanent-identifier, an empty device-attest-01 answer, a POST-as-GET of the order after
+# finalize, a P-256 CSR with key usage and extended key usage. Keys and signatures come from
+# the openssl command line; the DER handling here is independent of the server's.
+import base64 as _b64  # noqa: E402
+
+ACME_BASE = "https://vpn.example.com"
+
+
+def _b64u(data):
+    return _b64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def _der_ints(sig):
+    """(r, s) from a DER ECDSA signature."""
+    assert sig[0] == 0x30
+    i = 2 if sig[1] < 0x80 else 2 + (sig[1] & 0x7F)
+    out = []
+    for _ in range(2):
+        assert sig[i] == 0x02
+        n = sig[i + 1]
+        out.append(int.from_bytes(sig[i + 2:i + 2 + n], "big"))
+        i += 2 + n
+    return out
+
+
+class Phone:
+    def __init__(self, client, tmp):
+        self.client, self.tmp = client, Path(tmp)
+        self.tmp.mkdir(parents=True, exist_ok=True)
+        self.key = self.tmp / "account.pem"
+        ossl("ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", str(self.key))
+        spki = subprocess.run(["openssl", "ec", "-in", str(self.key), "-pubout", "-outform", "DER"],
+                              check=True, capture_output=True).stdout
+        point = spki[-64:]
+        self.jwk = {"kty": "EC", "crv": "P-256", "x": _b64u(point[:32]), "y": _b64u(point[32:])}
+        self.kid = None
+        self.device_key = self.tmp / "device.pem"
+        ossl("ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", str(self.device_key))
+
+    def nonce(self):
+        response = self.client.head("/acme/new-nonce")
+        assert response.status_code == 200
+        return response.headers["replay-nonce"]
+
+    def post(self, path, payload, *, nonce=None, url=None, sign_with=None):
+        protected = {"alg": "ES256", "nonce": nonce or self.nonce(), "url": url or ACME_BASE + path}
+        if self.kid:
+            protected["kid"] = self.kid
+        else:
+            protected["jwk"] = self.jwk
+        p64 = _b64u(json.dumps(protected).encode())
+        body64 = "" if payload is None else _b64u(json.dumps(payload).encode())
+        der = subprocess.run(["openssl", "dgst", "-sha256", "-sign", str(sign_with or self.key)],
+                             input=(p64 + "." + body64).encode(), check=True, capture_output=True).stdout
+        r, s = _der_ints(der)
+        sig = r.to_bytes(32, "big") + s.to_bytes(32, "big")
+        return self.client.post(path, content=json.dumps({"protected": p64, "payload": body64, "signature": _b64u(sig)}),
+                                headers={"Content-Type": "application/jose+json"})
+
+    def csr(self, cn):
+        return subprocess.run(["openssl", "req", "-new", "-key", str(self.device_key), "-subj", "/CN=" + cn, "-outform", "DER",
+                               "-addext", "keyUsage=critical,digitalSignature", "-addext", "extendedKeyUsage=clientAuth"],
+                              check=True, capture_output=True).stdout
+
+    def enrol(self, code, cn):
+        """The whole exchange; returns (final response, certificate chain PEM or None)."""
+        directory = self.client.get("/acme/directory").json()
+        assert directory["newOrder"] == ACME_BASE + "/acme/new-order"
+        response = self.post("/acme/new-account", {"termsOfServiceAgreed": True})
+        assert response.status_code == 201, response.text
+        self.kid = response.headers["location"]
+        response = self.post("/acme/new-order", {"identifiers": [{"type": "permanent-identifier", "value": code}]})
+        if response.status_code != 201:
+            return response, None
+        order_url, order = response.headers["location"], response.json()
+        authz = self.post(order["authorizations"][0].removeprefix(ACME_BASE), None).json()
+        challenge = authz["challenges"][0]
+        assert challenge["type"] == "device-attest-01"
+        response = self.post(challenge["url"].removeprefix(ACME_BASE), {})
+        assert response.json()["status"] == "valid", response.text
+        response = self.post(order["finalize"].removeprefix(ACME_BASE), {"csr": _b64u(self.csr(cn))})
+        if response.status_code != 200:
+            return response, None
+        assert self.post(order_url.removeprefix(ACME_BASE), None).json()["status"] == "valid"
+        chain = self.post(response.json()["certificate"].removeprefix(ACME_BASE), None)
+        assert chain.headers["content-type"].startswith("application/pem-certificate-chain")
+        return response, chain.text
+
+
+def fingerprint(chain):
+    leaf = chain.split("-----END CERTIFICATE-----")[0] + "-----END CERTIFICATE-----\n"
+    der = subprocess.run(["openssl", "x509", "-outform", "DER"], input=leaf.encode(), check=True, capture_output=True).stdout
+    return hashlib.sha256(der).hexdigest()
+
+
+@pytest.fixture
+def bound(client, configured, monkeypatch):
+    from app.settings import settings
+    monkeypatch.setattr(settings, "profile_base_url", ACME_BASE)
+    monkeypatch.setattr(relay, "device_self_test", lambda db, config: None)
+    response = client.put("/api/relay/settings", json={**configured, "devices": True, "device_limit": 2}, headers=H)
+    assert response.status_code == 200, response.text
+    yield response.json()
+    from app import relay_devices
+    relay_devices.forget(db, "alice")
+
+
+def bound_download(client):
+    response = client.post("/api/clients/alice/relay.mobileconfig", headers=H)
+    assert response.status_code == 200, response.text
+    profile = plistlib.loads(response.content)
+    identity, payload = profile["PayloadContent"]
+    entry = payload["Relays"][0]
+    assert identity["PayloadType"] == "com.apple.security.acme" and identity["HardwareBound"] is True
+    assert identity["DirectoryURL"] == ACME_BASE + "/acme/directory"
+    assert entry["PayloadCertificateUUID"] == identity["PayloadUUID"]
+    device = entry["AdditionalHTTPHeaderFields"]["Authorization"].removeprefix("Bearer device:")
+    return profile, identity["ClientIdentifier"], device
+
+
+def test_bound_profile_works_on_one_device_only(client, bound, tmp_path):
+    profile, code, device = bound_download(client)
+    # The same identifier as an unbound profile: installing it replaces that one on the phone.
+    assert profile["PayloadIdentifier"].startswith("org.openvpn.apple-relay.")
+    assert client.get("/api/clients/alice/relay-devices").json()["devices"][0]["state"] == "waiting"
+    token = "Bearer device:" + device
+    # Before the phone has its certificate, the file alone opens nothing.
+    assert relay.authorize(db, token, device="ab" * 32) is None
+    phone = Phone(client, tmp_path / "phone")
+    response, chain = phone.enrol(code, "relay-device-" + device)
+    assert response.status_code == 200, response.text
+    fp = fingerprint(chain)
+    policy = relay.authorize(db, token, device=fp)
+    assert policy["client"] == "alice" and policy["credential_id"] == "device:" + device
+    # The header lifted from the file, without that phone's certificate, is refused.
+    assert relay.authorize(db, token, device="") is None
+    assert relay.authorize(db, token, device="ab" * 32) is None
+    assert client.post("/api/relay/authorize", headers={"Authorization": token}).status_code == 403
+    # A copy of the file on a second phone: refused at the order, so iOS installs nothing.
+    other = Phone(client, tmp_path / "other")
+    response, chain2 = other.enrol(code, "relay-device-" + device)
+    assert response.status_code == 403 and chain2 is None
+    assert response.json()["type"] == "urn:ietf:params:acme:error:rejectedIdentifier"
+    assert response.headers["replay-nonce"]
+    # The same phone again (a dropped connection): the same certificate.
+    phone.kid = None
+    again, chain3 = phone.enrol(code, "relay-device-" + device)
+    assert again.status_code == 200 and fingerprint(chain3) == fp
+    listed = client.get("/api/clients/alice/relay-devices").json()
+    assert [d["state"] for d in listed["devices"]] == ["active"] and listed["bound"] is True
+    # Revoking the device closes it for good.
+    assert client.delete(f"/api/clients/alice/relay-devices/{device}", headers=H).status_code == 200
+    assert relay.authorize(db, token, device=fp) is None
+    assert client.get("/api/clients/alice/relay-devices").json()["devices"][0]["state"] == "revoked"
+
+
+def test_bound_profiles_stop_at_the_device_limit(client, bound, tmp_path):
+    for i in range(2):
+        _, code, device = bound_download(client)
+        response, _ = Phone(client, tmp_path / f"p{i}").enrol(code, "relay-device-" + device)
+        assert response.status_code == 200
+    response = client.post("/api/clients/alice/relay.mobileconfig", headers=H)
+    assert response.status_code == 409 and "remove one" in response.json()["detail"]
+    # A one-time link tells the person what to do, in their language.
+    link = client.post("/api/clients/alice/share", json={"kind": "relay", "hours": 1}, headers=H).json()["url"]
+    page = client.get(urlsplit_path(link) + "/download")
+    assert page.status_code == 409 and "Слишком много устройств" in page.text
+
+
+def urlsplit_path(url):
+    from urllib.parse import urlsplit
+    return urlsplit(url).path
+
+
+def test_acme_refuses_what_a_phone_would_not_send(client, bound, tmp_path):
+    _, code, device = bound_download(client)
+    phone = Phone(client, tmp_path / "phone")
+    assert phone.post("/acme/new-account", {}, nonce="made-up").json()["type"].endswith(":badNonce")
+    assert phone.post("/acme/new-account", {}, url="https://elsewhere.example/acme/new-account").status_code == 401
+    stranger = tmp_path / "stranger.pem"
+    ossl("ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", str(stranger))
+    assert phone.post("/acme/new-account", {}, sign_with=stranger).status_code == 400
+    response = phone.post("/acme/new-account", {})
+    phone.kid = response.headers["location"]
+    unknown = phone.post("/acme/new-order", {"identifiers": [{"type": "permanent-identifier", "value": "guess"}]})
+    assert unknown.status_code == 403
+    # Finalize before the challenge: not ready.
+    order = phone.post("/acme/new-order", {"identifiers": [{"type": "permanent-identifier", "value": code}]}).json()
+    early = phone.post(order["finalize"].removeprefix(ACME_BASE), {"csr": _b64u(phone.csr("x"))})
+    assert early.status_code == 403
+    assert client.get("/acme/new-nonce").status_code == 204
+
+
+def test_portal_only_requests_reach_acme(client, bound):
+    response = client.get("/acme/directory", headers={"X-OpenVPN-Portal-Only": "1"})
+    assert response.status_code == 200 and response.json()["newNonce"] == ACME_BASE + "/acme/new-nonce"
+    assert client.get("/api/clients", headers={"X-OpenVPN-Portal-Only": "1"}).status_code == 404
+
+
+def test_turning_binding_on_runs_the_self_test(client, configured, monkeypatch):
+    calls = []
+    monkeypatch.setattr(relay, "device_self_test", lambda db, config: calls.append(config) or (_ for _ in ()).throw(pki.PkiError("signer says no")))
+    response = client.put("/api/relay/settings", json={**configured, "devices": True}, headers=H)
+    assert response.status_code == 400 and "signer says no" in response.text and calls
+    assert client.get("/api/relay/settings").json()["devices"] is False
+    # Saving the other relay fields keeps binding as it was (the network form sends only these).
+    assert client.put("/api/relay/settings", json={"enabled": True, "url": configured["url"]}, headers=H).json()["devices"] is False

@@ -21,8 +21,11 @@ type policyEntry struct {
 
 // Coalesce simultaneous checks for one credential and reuse successful results
 // for at most one second. Never serve expired policy during an API outage.
+// token is the Authorization header, followed, when the connection presented a
+// client certificate, by NUL and its SHA-256 (withDevice): the cache key and the
+// policy check then cover the device as well.
 func (s *relayServer) authorize(ctx context.Context, token string) (policy, error) {
-	if !strings.HasPrefix(token, "Bearer ") || len(token) > 512 {
+	if header, _, _ := strings.Cut(token, "\x00"); !strings.HasPrefix(header, "Bearer ") || len(header) > 512 {
 		return policy{}, errAccessDenied
 	}
 	if s.policyTTL <= 0 {
@@ -93,7 +96,8 @@ func (s *relayServer) authorizeBackend(ctx context.Context, token string) (polic
 			return p, errAuthUnavailable
 		}
 	}
-	if !strings.HasPrefix(token, "Bearer ") || len(token) > 512 {
+	header, device, _ := strings.Cut(token, "\x00")
+	if !strings.HasPrefix(header, "Bearer ") || len(header) > 512 {
 		return p, errAccessDenied
 	}
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
@@ -103,7 +107,10 @@ func (s *relayServer) authorizeBackend(ctx context.Context, token string) (polic
 		if err != nil {
 			return p, errAuthUnavailable
 		}
-		req.Header.Set("Authorization", token)
+		req.Header.Set("Authorization", header)
+		if device != "" {
+			req.Header.Set("X-Relay-Device", device)
+		}
 		resp, err := s.client.Do(req)
 		if err == nil {
 			if resp.StatusCode == http.StatusOK {

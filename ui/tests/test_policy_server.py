@@ -23,8 +23,9 @@ def service(monkeypatch):
         return connection
     monkeypatch.setattr(policy_server.ReadOnlySettings, "_connect", classmethod(counted))
     monkeypatch.setattr(policy_server, "check_metadata", lambda: None)
-    monkeypatch.setattr(policy_server.relay, "authorize", lambda db, token, strict_state=False:
-                        {"client": "alice", "relay": db.get_setting("apple_relay", "{}")} if token == "Bearer alice:secret" else None)
+    monkeypatch.setattr(policy_server.relay, "authorize", lambda db, token, device="", strict_state=False:
+                        {"client": "alice", "relay": db.get_setting("apple_relay", "{}"), "device": device}
+                        if token == "Bearer alice:secret" else None)
     policy_server.ReadOnlySettings.discard_idle()
     server = policy_server.PolicyServer(("127.0.0.1", 0), policy_server.PolicyHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -84,3 +85,25 @@ def test_dropped_connection_is_not_logged_as_a_failed_request(service, caplog):
     raw.close()
     time.sleep(0.3)
     assert "Policy request failed" not in caplog.text
+
+
+def test_the_relays_device_header_reaches_the_policy(service):
+    port, _ = service
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    connection.request("POST", "/api/relay/authorize", headers={"Authorization": "Bearer alice:secret",
+                                                                 "X-Relay-Device": "ab" * 32})
+    response = connection.getresponse()
+    assert json.loads(response.read())["device"] == "ab" * 32
+
+
+def test_policy_login_reads_enrolled_devices_only(service):
+    db = Database(settings.database_url, schema=settings.database_schema)
+    db.execute("DELETE FROM relay_devices WHERE client_name = 'policy-test'")
+    db.execute("INSERT INTO relay_devices (id, client_name, code_hash, created_at, expires_at, enrolled_at, fingerprint) "
+               "VALUES ('policy-dev-1', 'policy-test', 'h1', 1, 2, 3, ?), ('policy-dev-2', 'policy-test', 'h2', 1, 2, NULL, NULL)",
+               ("cd" * 32,))
+    with policy_server.ReadOnlySettings.open() as ro:
+        assert ro.get_device("policy-dev-1") == {"id": "policy-dev-1", "client_name": "policy-test",
+                                                  "fingerprint": "cd" * 32, "revoked_at": None}
+        assert ro.get_device("policy-dev-2") is None      # not installed yet: unknown to the relay
+    db.execute("DELETE FROM relay_devices WHERE client_name = 'policy-test'")

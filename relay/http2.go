@@ -144,6 +144,7 @@ func serveHTTP2Context(ctx context.Context, listener net.Listener, handler http.
 			workers.Add(1)
 			go func() {
 				defer workers.Done()
+				opts := &http2.ServeConnOpts{Handler: handler, BaseConfig: base}
 				defer func() {
 					conn.Close()
 					mu.Lock()
@@ -160,8 +161,9 @@ func serveHTTP2Context(ctx context.Context, listener net.Listener, handler http.
 					_ = tc.SetDeadline(time.Time{})
 					state := tc.ConnectionState()
 					logClientCert("http2", conn.RemoteAddr().String(), &state)
+					opts.Context = withConnectionDevice(context.Background(), &state)
 				}
-				server.ServeConn(conn, &http2.ServeConnOpts{Handler: handler, BaseConfig: base})
+				server.ServeConn(conn, opts)
 			}()
 		default:
 			conn.Close()

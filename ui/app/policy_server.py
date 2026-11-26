@@ -36,6 +36,11 @@ class ReadOnlySettings:
         row = self.connection.execute("SELECT value FROM relay_policy_settings WHERE key = %s", (key,)).fetchone()
         return row[0] if row else default
 
+    def get_device(self, device_id):
+        row = self.connection.execute("SELECT id, client_name, fingerprint, revoked_at FROM relay_policy_devices "
+                                      "WHERE id = %s", (device_id,)).fetchone()
+        return dict(zip(("id", "client_name", "fingerprint", "revoked_at"), row)) if row else None
+
     @classmethod
     def _connect(cls):
         connection = psycopg.connect(**{"connect_timeout": 2, **connection_parameters(settings.database_url)},
@@ -129,10 +134,12 @@ class PolicyHandler(BaseHTTPRequestHandler):
         if self.headers.get("Content-Length", "0").strip() != "0" or self.headers.get("Transfer-Encoding"):
             self.close_connection = True
         authorization = self.headers.get("Authorization", "")
+        # Set by the relay from the TLS handshake (loopback only): the client certificate's SHA-256.
+        device = self.headers.get("X-Relay-Device", "")
 
         def check(db):
             check_metadata()
-            return relay.authorize(db, authorization, strict_state=True)
+            return relay.authorize(db, authorization, device=device, strict_state=True)
         try:
             policy = with_settings(check)
             self.reply(200 if policy is not None else 403, policy or {"detail": "Relay access denied"})

@@ -202,6 +202,24 @@ CREATE TABLE IF NOT EXISTS share_tokens (
     used_at     BIGINT,
     created_by  TEXT
 );
+-- Apple relay profiles bound to one device (2.10): one row per downloaded profile. The phone
+-- makes its key itself and fetches a certificate over ACME with the one-time code in the profile.
+CREATE TABLE IF NOT EXISTS relay_devices (
+    id           TEXT PRIMARY KEY,
+    client_name  TEXT NOT NULL,
+    code_hash    TEXT NOT NULL UNIQUE,
+    created_at   BIGINT NOT NULL,
+    expires_at   BIGINT NOT NULL,
+    validated_at BIGINT,
+    enrolled_at  BIGINT,
+    account      TEXT,
+    public_key   TEXT,
+    cert_pem     TEXT,
+    serial       TEXT,
+    fingerprint  TEXT UNIQUE,
+    revoked_at   BIGINT
+);
+CREATE INDEX IF NOT EXISTS relay_devices_client ON relay_devices (client_name);
 """
 
 # Columns added to vpn_sessions after 1.4: an existing database gets them on start.
@@ -319,10 +337,14 @@ class Database:
             conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_client ON users(client_name) WHERE client_name IS NOT NULL")
             conn.execute("CREATE OR REPLACE VIEW relay_policy_settings AS SELECT key, value FROM settings "
                          "WHERE key = 'apple_relay' OR starts_with(key, 'relay_client:')")
+            # What the policy service needs of a bound device: never its code, key or certificate.
+            conn.execute("CREATE OR REPLACE VIEW relay_policy_devices AS SELECT id, client_name, fingerprint, revoked_at "
+                         "FROM relay_devices WHERE enrolled_at IS NOT NULL")
             if conn.execute("SELECT 1 FROM pg_roles WHERE rolname = 'relay_policy'").fetchone():
                 if schema != "public":
                     conn.raw.execute(pgsql.SQL("GRANT USAGE ON SCHEMA {} TO relay_policy").format(pgsql.Identifier(schema)))
                 conn.execute("GRANT SELECT ON relay_policy_settings TO relay_policy")
+                conn.execute("GRANT SELECT ON relay_policy_devices TO relay_policy")
 
     def _traffic_source(self, conn: Connection, table: str) -> None:
         """Traffic tables written before 2.3 have no source column and a (ts, client_name) key."""

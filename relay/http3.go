@@ -27,7 +27,7 @@ import (
 // tlsConfig serves the relay's certificate for the given ALPN protocols.
 func (c *certificateFiles) tlsConfig(protocols ...string) *tls.Config {
 	return &tls.Config{MinVersion: tls.VersionTLS12, NextProtos: protocols, ClientAuth: clientCertMode(),
-		SessionTicketsDisabled: clientCertMode() != tls.NoClientCert,
+		SessionTicketsDisabled: clientCertLogging(),
 		GetCertificate:         func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return c.get() }}
 }
 
@@ -112,7 +112,7 @@ func (s *relayServer) http3Server(certificate func() (*tls.Certificate, error)) 
 	}
 	return &http3.Server{Handler: s, EnableDatagrams: true, MaxHeaderBytes: 8192,
 		TLSConfig: http3.ConfigureTLSConfig(&tls.Config{MinVersion: tls.VersionTLS13, ClientAuth: clientCertMode(),
-			SessionTicketsDisabled: clientCertMode() != tls.NoClientCert,
+			SessionTicketsDisabled: clientCertLogging(),
 			GetCertificate:         func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return certificate() }}),
 		QUICConfig: &quic.Config{KeepAlivePeriod: 20 * time.Second, MaxIdleTimeout: 90 * time.Second,
 			MaxIncomingStreams:         streams,

@@ -105,7 +105,7 @@ func (s *relayServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		reject(w, r, 503, "capacity_reached", "Relay busy", "connection_limit_reached")
 		return
 	}
-	token := r.Header.Get("Authorization")
+	token := withDevice(r.Header.Get("Authorization"), requestDevice(r))
 	p, err := s.authorize(r.Context(), token)
 	if err != nil {
 		if errors.Is(err, errAccessDenied) {

@@ -94,9 +94,9 @@ def record_flows(db, instance, events, default_transport=None, now=None):
 def flows(db, client, *, credential=None, q='', limit=100, offset=0):
     """(total, one page) of a client's saved connections, newest first."""
     where, args = ['f.client_name = ?'], [client]
-    if credential is not None:
-        where.append('EXISTS (SELECT 1 FROM relay_sessions s WHERE s.id = f.session_id AND s.credential_id = ?)')
-        args.append(credential)
+    if credential is not None:      # one credential id, or a list (a client's shared profile and devices)
+        where.append('EXISTS (SELECT 1 FROM relay_sessions s WHERE s.id = f.session_id AND s.credential_id = ANY(?))')
+        args.append([credential] if isinstance(credential, str) else list(credential))
     if q:
         where.append("f.target ILIKE ? ESCAPE '\\'")
         args.append('%' + q.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '%')
@@ -121,7 +121,7 @@ def sessions(db, *, client=None, credential=None, now=None):
     if client is not None:
         where.append('client_name = ?'); args.append(client)
     if credential is not None:
-        where.append('credential_id = ?'); args.append(credential)
+        where.append('credential_id = ANY(?)'); args.append([credential] if isinstance(credential, str) else list(credential))
     rows = db.query(_GROUPED + (' WHERE ' + ' AND '.join(where) if where else '') +
         ' GROUP BY grp, client_name ORDER BY MIN(started_at) DESC, grp DESC LIMIT 200', (now - 3 * POLL_SECONDS, *args))
     return _finish(rows, now)

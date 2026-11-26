@@ -4,7 +4,8 @@ from starlette.responses import JSONResponse, RedirectResponse
 
 def portal_path(path):
     # /p/ = one-time profile links: a guest may open a link sent to them while connected.
-    return path in ('/portal', '/api/portal') or path.startswith(('/api/portal/', '/static/', '/p/'))
+    # /acme/ = a device-bound relay profile fetches its certificate while it is being installed.
+    return path in ('/portal', '/api/portal') or path.startswith(('/api/portal/', '/static/', '/p/', '/acme/'))
 
 
 class PortalBoundary:

@@ -26,10 +26,12 @@ def openssl(*args, data=None):
 
 
 class Signer:
-    def __init__(self, acme, hostname, relay_url, token):
+    def __init__(self, acme, hostname, relay_url, token, acme_directory=""):
         if len(token) < 32:
             raise ValueError("PROFILE_SIGNER_TOKEN must contain at least 32 characters")
         self.acme, self.hostname, self.relay_url, self.token = Path(acme), hostname, relay_url.rstrip("/"), token
+        # Device-bound profiles (OpenVPN server 2.10) fetch their identity here; empty = not signed.
+        self.acme_directory = acme_directory
         self.lock = threading.Lock()
         self.cached = None
         self.slots = threading.BoundedSemaphore(4)
@@ -90,14 +92,27 @@ class Signer:
         if plistlib.dumps(profile, sort_keys=False) != content:
             raise ValueError("Expected a canonical XML relay profile")
         payloads = profile.get("PayloadContent", [])
-        if profile.get("PayloadType") != "Configuration" or len(payloads) != 1:
-            raise ValueError("Only single-payload relay profiles can be signed")
-        payload = payloads[0]
+        if profile.get("PayloadType") != "Configuration" or len(payloads) not in (1, 2):
+            raise ValueError("Only OpenVPN relay profiles can be signed")
+        payload = payloads[-1]
         if payload.get("PayloadType") != "com.apple.relay.managed" or not profile.get("PayloadIdentifier", "").startswith("org.openvpn.apple-relay."):
             raise ValueError("Only OpenVPN Apple relay profiles can be signed")
         relays = payload.get("Relays", [])
         if len(relays) != 1:
             raise ValueError("Expected one relay")
+        if len(payloads) == 2:
+            # A device-bound profile: the phone makes its key in the Secure Enclave and fetches
+            # its certificate from the OpenVPN server's ACME endpoint, nowhere else.
+            identity = payloads[0]
+            if (not self.acme_directory or identity.get("PayloadType") != "com.apple.security.acme"
+                    or identity.get("DirectoryURL") != self.acme_directory or identity.get("HardwareBound") is not True
+                    or identity.get("KeyType") != "ECSECPrimeRandom" or identity.get("KeySize") not in (256, 384)
+                    or not isinstance(identity.get("ClientIdentifier"), str)
+                    or relays[0].get("PayloadCertificateUUID") != identity.get("PayloadUUID")
+                    or not str(relays[0].get("AdditionalHTTPHeaderFields", {}).get("Authorization", "")).startswith("Bearer device:")):
+                raise ValueError("Unexpected device identity payload")
+        elif "PayloadCertificateUUID" in relays[0]:
+            raise ValueError("Unexpected identity reference")
         urls = [v for k, v in relays[0].items() if k in ("HTTP2RelayURL", "HTTP3RelayURL")]
         if not urls or any(not isinstance(u, str) or u != self.relay_url + "/.well-known/masque/udp/{target_host}/{target_port}/" for u in urls):
             raise ValueError("Unexpected relay URL")
@@ -196,7 +211,8 @@ def main():
     signer = Signer(os.environ.get("PROFILE_SIGNER_ACME", "/letsencrypt/acme.json"),
                     os.environ.get("PROFILE_SIGNER_HOSTNAME", ""),
                     os.environ.get("PROFILE_SIGNER_RELAY_URL", ""),
-                    os.environ.get("PROFILE_SIGNER_TOKEN", ""))
+                    os.environ.get("PROFILE_SIGNER_TOKEN", ""),
+                    os.environ.get("PROFILE_SIGNER_ACME_DIRECTORY", ""))
     server = SigningServer(("0.0.0.0", 8085), handler(signer))
     print("Relay profile signer listening on port 8085; certificate keys stay on this host", flush=True)
     server.serve_forever()

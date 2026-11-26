@@ -149,3 +149,34 @@ def test_environment_token_with_newline_is_rejected_without_exposure(monkeypatch
     with pytest.raises(relay_services.PkiError) as error:
         relay_services.signing_request(config=config)
     assert 'private-token-sentinel' not in str(error.value)
+
+
+def bound_profile(**changes):
+    """A device-bound profile as the UI builds it (relay.bound_profile)."""
+    identity = {"PayloadType": "com.apple.security.acme", "PayloadUUID": "A1B2", "DirectoryURL": "https://vpn.example.com/acme/directory",
+                "ClientIdentifier": "one-time", "KeyType": "ECSECPrimeRandom", "KeySize": 256, "HardwareBound": True}
+    relay_entry = {"HTTP2RelayURL": "https://relay.example.com:8443/.well-known/masque/udp/{target_host}/{target_port}/",
+                   "PayloadCertificateUUID": "A1B2", "AdditionalHTTPHeaderFields": {"Authorization": "Bearer device:abcdefgh12"}}
+    identity.update(changes.pop("identity", {}))
+    relay_entry.update(changes.pop("relay", {}))
+    return plistlib.dumps({"PayloadType": "Configuration", "PayloadVersion": 1, "PayloadIdentifier": "org.openvpn.apple-relay.test",
+                           "PayloadContent": [identity, {"PayloadType": "com.apple.relay.managed", "Relays": [relay_entry], "MatchDomains": []}]})
+
+
+def test_signer_signs_device_bound_profiles_for_its_acme_directory_only(signing):
+    signer, _, _ = signing
+    with pytest.raises(ValueError):          # no ACME directory configured: not signed
+        signer.sign(bound_profile())
+    signer.acme_directory = "https://vpn.example.com/acme/directory"
+    assert signer.sign(bound_profile())
+    for changes in [{"identity": {"DirectoryURL": "https://attacker.example/acme/directory"}},
+                    {"identity": {"HardwareBound": False}}, {"identity": {"PayloadType": "com.apple.security.pkcs12"}},
+                    {"identity": {"KeyType": "RSA"}}, {"relay": {"PayloadCertificateUUID": "OTHER"}},
+                    {"relay": {"AdditionalHTTPHeaderFields": {"Authorization": "Bearer alice:secret"}}}]:
+        with pytest.raises(ValueError):
+            signer.sign(bound_profile(**changes))
+    # An unbound profile may not point at an identity either.
+    document = plistlib.loads(profile())
+    document["PayloadContent"][0]["Relays"][0]["PayloadCertificateUUID"] = "A1B2"
+    with pytest.raises(ValueError):
+        signer.sign(plistlib.dumps(document))
