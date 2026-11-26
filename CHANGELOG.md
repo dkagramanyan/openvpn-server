@@ -1,6 +1,23 @@
 <!-- Network addresses in examples are synthetic; deployment-specific notes are omitted. -->
 # Changelog
 
+## 2.11.0 - 2026-11-27
+
+**One number of configs per client**, for device-bound Apple relay profiles and
+Xray keys together (README, *Configs per client*).
+
+* **Configs per client** (Settings → Apple relay, default 2) and the client's
+  own number on its page. With every place taken, downloads, keys and one-time
+  links are refused in the UI, the personal portal, the one-time page and the
+  bot. The default of 2.10 for relay devices alone was 5: a saved value stays.
+* **Xray: one key per issued link.** Each link from the bot, a share link or
+  the new **New Xray key** button makes its own key (a 3x-ui client
+  `<name>~<suffix>`); the client page lists the keys with **Show** and
+  **Remove**. The single key a client had before stays and counts as one.
+  Xray still gives internet only.
+* The client page shows relay devices and Xray keys in one list, with how
+  many places are in use.
+
 ## 2.10.0 - 2026-11-27
 
 **Apple relay profiles that work on one device only** (Settings → Apple relay,

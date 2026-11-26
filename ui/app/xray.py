@@ -1,5 +1,5 @@
-"""Xray through 3x-ui (the xui service): one 3x-ui client per OpenVPN client on the inbound chosen
-in Settings → Xray. Its email is the client name and its comment MARK, so clients made in the
+"""Xray through 3x-ui (the xui service): one 3x-ui client per issued key on the inbound chosen
+in Settings → Xray. Its email starts with the client name and its comment is MARK, so clients made in the
 3x-ui panel by hand are never touched. Xray gives internet access only: a routing rule of ours
 sends private ranges and the networks of this host to "blocked", for guests and everyone else.
 
@@ -10,13 +10,15 @@ from __future__ import annotations
 import ipaddress
 import json
 import logging
+import secrets
 import socket
 import struct
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
-from . import network, pki, relay
+from . import configs, network, pki, relay
 from .pki import PkiError
 from .settings import settings
 
@@ -119,52 +121,74 @@ def managed_clients() -> dict[str, dict]:
     return out
 
 
-# -- clients ------------------------------------------------------------------------
-def _fields(name: str, expiry_ms: int, target: dict) -> dict:
-    """What this UI decides about a client. Everything else stays as 3x-ui has it."""
-    return {"email": name, "enable": True, "expiryTime": expiry_ms, "comment": MARK,
+# -- keys ---------------------------------------------------------------------------
+# One 3x-ui client per issued key. Its email is the client name (the single key of 2.8-2.10)
+# or "<name>~<suffix>"; "~" cannot occur in a client name.
+def owner(email: str) -> str:
+    return email.split("~", 1)[0]
+
+
+def _fields(email: str, expiry_ms: int, target: dict) -> dict:
+    """What this UI decides about a 3x-ui client. Everything else stays as 3x-ui has it."""
+    return {"email": email, "enable": True, "expiryTime": expiry_ms, "comment": MARK,
             "flow": "xtls-rprx-vision" if target.get("tlsFlowCapable") else ""}
 
 
-def _update(name: str, expiry_ms: int, target: dict) -> None:
+def _update(email: str, expiry_ms: int, target: dict) -> None:
     # 3x-ui 3.11 clears omitted fields on update (comment, flow), so the stored settings go back
     # with it. Not the ids: the stored "id" is a row number, while "id" on writes is the credential,
     # which is kept when omitted. Not the protocol-specific fields, stored in other shapes than
     # they are written (allowedIPs).
-    stored = call("GET", f"panel/api/clients/get/{urllib.parse.quote(name)}")["client"]
+    stored = call("GET", f"panel/api/clients/get/{urllib.parse.quote(email)}")["client"]
     body = {k: stored[k] for k in KEPT if k in stored}
-    call("POST", f"panel/api/clients/update/{urllib.parse.quote(name)}", body={**body, **_fields(name, expiry_ms, target)})
+    call("POST", f"panel/api/clients/update/{urllib.parse.quote(email)}", body={**body, **_fields(email, expiry_ms, target)})
 
 
-def ensure_client(db, name: str) -> None:
-    """The client's 3x-ui client exists, is on our inbound and ends with its certificate."""
+def _target(db, name: str) -> tuple[dict, dict, int]:
+    """(settings, our inbound, the end of the client's certificate in ms)."""
     config = get_settings(db)
     if not config["enabled"]:
         raise PkiError("Xray is off (Settings → Xray)")
     cert = relay.eligible(name)
     if not cert:
         raise PkiError("Xray access requires a valid client certificate")
-    expiry = int(cert["not_after"]) * 1000
-    target = inbound(config["inbound_id"])
-    existing = managed_clients().get(name)
+    return config, inbound(config["inbound_id"]), int(cert["not_after"]) * 1000
+
+
+def sync(db, managed: dict[str, dict] | None = None) -> dict[str, dict]:
+    """The key list follows 3x-ui: keys made before 2.11 are listed, keys deleted in the panel are
+    dropped. Returns 3x-ui's managed clients."""
+    managed = managed_clients() if managed is None else managed
+    with db.tx() as conn:
+        known = {row["email"] for row in conn.execute("SELECT email FROM xray_keys").fetchall()}
+        for email in managed.keys() - known:
+            conn.execute("INSERT INTO xray_keys (email, client_name, created_at) VALUES (?, ?, ?) ON CONFLICT DO NOTHING",
+                         (email, owner(email), int(time.time())))
+        for email in known - managed.keys():
+            conn.execute("DELETE FROM xray_keys WHERE email = ?", (email,))
+    return managed
+
+
+def keys(db, name: str) -> list[dict]:
+    return db.query("SELECT email AS id, created_at FROM xray_keys WHERE client_name = ? ORDER BY created_at, email", (name,))
+
+
+def key_link(db, name: str, email: str) -> str:
+    """The share link (vless://… etc.) of one key on our inbound, with the public host in it."""
+    if owner(email) != name or not db.one("SELECT 1 AS x FROM xray_keys WHERE email = ? AND client_name = ?", (email, name)):
+        raise PkiError("No such Xray key")
+    config, target, expiry = _target(db, name)
+    existing = managed_clients().get(email)
     if existing is None:
-        client = {**_fields(name, expiry, target), "limitIp": 0, "totalGB": 0}
-        call("POST", "panel/api/clients/add", body={"client": client, "inboundIds": [config["inbound_id"]]})
-        return
+        raise PkiError("3x-ui no longer has this key: remove it and issue a new one")
     if config["inbound_id"] not in existing["inboundIds"]:
-        call("POST", f"panel/api/clients/{urllib.parse.quote(name)}/attach", body={"inboundIds": [config["inbound_id"]]})
+        call("POST", f"panel/api/clients/{urllib.parse.quote(email)}/attach", body={"inboundIds": [config["inbound_id"]]})
     if existing.get("expiryTime") != expiry or not existing.get("enable"):
-        _update(name, expiry, target)
-
-
-def link(db, name: str) -> str:
-    """The client's share link (vless://… etc.) for our inbound, with the public host in it."""
-    ensure_client(db, name)
+        _update(email, expiry, target)
     host = pki.get_remote()["host"] or settings.public_host
     if not host:
         raise PkiError("Set the public host of profiles in Settings first")
-    target = inbound(get_settings(db)["inbound_id"])
-    links = call("GET", f"panel/api/clients/links/{urllib.parse.quote(name)}", host=host) or []
+    links = call("GET", f"panel/api/clients/links/{urllib.parse.quote(email)}", host=host) or []
     port = f":{target['port']}"
     mine = [l for l in links if l.startswith(f"{target['protocol']}://") and port in l] or links
     if not mine:
@@ -172,14 +196,40 @@ def link(db, name: str) -> str:
     return mine[0]
 
 
+def link(db, name: str) -> str:
+    """A new key for the client (one slot of its configs) and its share link."""
+    config, target, expiry = _target(db, name)
+    sync(db)
+    configs.check(db, name)
+    email = f"{name}~{secrets.token_hex(3)}"
+    client = {**_fields(email, expiry, target), "limitIp": 0, "totalGB": 0}
+    call("POST", "panel/api/clients/add", body={"client": client, "inboundIds": [config["inbound_id"]]})
+    db.execute("INSERT INTO xray_keys (email, client_name, created_at) VALUES (?, ?, ?)", (email, name, int(time.time())))
+    try:
+        return key_link(db, name, email)
+    except PkiError:
+        remove_key(db, name, email)     # a key nobody received holds no slot
+        raise
+
+
+def remove_key(db, name: str, email: str) -> None:
+    if owner(email) != name:
+        raise PkiError("No such Xray key")
+    if email in managed_clients():
+        call("POST", f"panel/api/clients/del/{urllib.parse.quote(email)}")
+    db.execute("DELETE FROM xray_keys WHERE email = ? AND client_name = ?", (email, name))
+
+
 def forget(db, name: str) -> None:
-    """Remove the client's 3x-ui client (revocation, deletion, a reused name). Best effort: the
+    """Remove every key of the client (revocation, deletion, a reused name). Best effort: the
     hourly check removes what is left."""
+    db.execute("DELETE FROM xray_keys WHERE client_name = ?", (name,))
     if not enabled(db):
         return
     try:
-        if name in managed_clients():
-            call("POST", f"panel/api/clients/del/{urllib.parse.quote(name)}")
+        for email in managed_clients():
+            if owner(email) == name:
+                call("POST", f"panel/api/clients/del/{urllib.parse.quote(email)}")
     except PkiError as exc:
         log.warning("xray: could not remove %s now (%s); the next check removes it", name, exc)
 
@@ -242,12 +292,16 @@ def reconcile(db) -> None:
     try:
         target = inbound(config["inbound_id"])
         ensure_rule(target["tag"])
-        for name, client in managed_clients().items():
+        managed = managed_clients()
+        for email, client in list(managed.items()):
+            name = owner(email)
             cert = relay.eligible(name) if pki.NAME_RE.match(name) else None
             if not cert:
-                call("POST", f"panel/api/clients/del/{urllib.parse.quote(name)}")
-                log.info("xray: removed %s (certificate no longer valid)", name)
+                call("POST", f"panel/api/clients/del/{urllib.parse.quote(email)}")
+                del managed[email]
+                log.info("xray: removed %s (certificate no longer valid)", email)
             elif client.get("expiryTime") != int(cert["not_after"]) * 1000:
-                _update(name, int(cert["not_after"]) * 1000, target)
+                _update(email, int(cert["not_after"]) * 1000, target)
+        sync(db, managed)
     except PkiError as exc:
         log.warning("xray: check skipped: %s", exc)

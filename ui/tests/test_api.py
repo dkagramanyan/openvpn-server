@@ -1894,6 +1894,8 @@ def bound(client, configured, monkeypatch):
     yield response.json()
     from app import relay_devices
     relay_devices.forget(db, "alice")
+    db.execute("DELETE FROM xray_keys")
+    db.execute("UPDATE clients SET config_limit = NULL")
 
 
 def bound_download(client):
@@ -1946,14 +1948,15 @@ def test_bound_profile_works_on_one_device_only(client, bound, tmp_path):
 
 
 def test_bound_profiles_stop_at_the_device_limit(client, bound, tmp_path):
+    link = client.post("/api/clients/alice/share", json={"kind": "relay", "hours": 1}, headers=H).json()["url"]
     for i in range(2):
         _, code, device = bound_download(client)
         response, _ = Phone(client, tmp_path / f"p{i}").enrol(code, "relay-device-" + device)
         assert response.status_code == 200
     response = client.post("/api/clients/alice/relay.mobileconfig", headers=H)
     assert response.status_code == 409 and "remove one" in response.json()["detail"]
-    # A one-time link tells the person what to do, in their language.
-    link = client.post("/api/clients/alice/share", json={"kind": "relay", "hours": 1}, headers=H).json()["url"]
+    # No new link for a full client; one made earlier tells the person what to do, in their language.
+    assert client.post("/api/clients/alice/share", json={"kind": "relay", "hours": 1}, headers=H).status_code == 409
     page = client.get(urlsplit_path(link) + "/download")
     assert page.status_code == 409 and "Слишком много устройств" in page.text
 
@@ -1996,3 +1999,127 @@ def test_turning_binding_on_runs_the_self_test(client, configured, monkeypatch):
     assert client.get("/api/relay/settings").json()["devices"] is False
     # Saving the other relay fields keeps binding as it was (the network form sends only these).
     assert client.put("/api/relay/settings", json={"enabled": True, "url": configured["url"]}, headers=H).json()["devices"] is False
+
+
+# -- one number of configs per client: relay devices and Xray keys together (2.11) ------------
+class FakePanel:
+    """3x-ui's client API as xray.py uses it (shapes verified against 3x-ui 3.11)."""
+    def __init__(self):
+        self.clients = {}
+
+    def __call__(self, method, path, body=None, form=None, host=None):
+        from urllib.parse import unquote
+        if path == "panel/api/inbounds/options":
+            return [{"id": 1, "remark": "reality", "port": 8445, "protocol": "vless", "tag": "in-8445", "tlsFlowCapable": True}]
+        if path == "panel/api/clients/list":
+            return [{"client": dict(c), "inboundIds": [1]} for c in self.clients.values()]
+        if path == "panel/api/clients/add":
+            self.clients[body["client"]["email"]] = dict(body["client"])
+            return None
+        if path.startswith("panel/api/clients/del/"):
+            del self.clients[unquote(path.rsplit("/", 1)[1])]
+            return None
+        if path.startswith("panel/api/clients/links/"):
+            email = unquote(path.rsplit("/", 1)[1])
+            return [f"vless://uuid-{email}@{host}:8445?security=reality#{email}"]
+        if path.startswith("panel/api/clients/get/"):
+            return {"client": dict(self.clients[unquote(path.rsplit("/", 1)[1])])}
+        if path.startswith("panel/api/clients/update/"):
+            self.clients[unquote(path.rsplit("/", 1)[1])].update(body)
+            return None
+        raise AssertionError(path)
+
+
+@pytest.fixture
+def panel(client, bound, monkeypatch):
+    from app import xray
+    fake = FakePanel()
+    old = db.get_setting("xray")
+    db.set_setting("xray", json.dumps({"enabled": True, "inbound_id": 1}))
+    monkeypatch.setattr(xray, "call", fake)
+    monkeypatch.setattr(pki, "get_remote", lambda: {"host": "vpn.example.com", "remotes": []})
+    yield fake
+    if old is None:
+        db.execute("DELETE FROM settings WHERE key = 'xray'")
+    else:
+        db.set_setting("xray", old)
+
+
+def test_relay_devices_and_xray_keys_share_one_number(client, panel, tmp_path):
+    info = client.get("/api/clients/alice/relay-devices").json()
+    assert (info["used"], info["limit"], info["default_limit"], info["own_limit"]) == (0, 2, 2, None)
+    first = client.post("/api/clients/alice/xray-keys", json={}, headers=H)
+    assert first.status_code == 200 and first.json()["link"].startswith("vless://") and "<svg" in first.json()["qr_svg"]
+    bound_download(client)                           # a downloaded relay profile holds the second slot
+    assert client.get("/api/clients/alice/relay-devices").json()["used"] == 2
+    for refused in (client.post("/api/clients/alice/xray-keys", json={}, headers=H),
+                    client.post("/api/clients/alice/relay.mobileconfig", headers=H),
+                    client.post("/api/clients/alice/share", json={"kind": "xray"}, headers=H),
+                    client.post("/api/clients/alice/share", json={"kind": "relay"}, headers=H)):
+        assert refused.status_code == 409 and "remove one" in refused.json()["detail"], refused.text
+    assert len(panel.clients) == 1                   # a refused key is never made in 3x-ui
+    # The client's own number wins over the default; clearing it brings the default back.
+    assert client.put("/api/clients/alice/config-limit", json={"limit": 3}, headers=H).json() == {"limit": 3, "own_limit": 3}
+    second = client.post("/api/clients/alice/xray-keys", json={}, headers=H)
+    assert second.status_code == 200 and second.json()["link"] != first.json()["link"]
+    assert client.post("/api/clients/alice/xray-keys", json={}, headers=H).status_code == 409
+    listed = client.get("/api/clients/alice/relay-devices").json()
+    assert listed["used"] == 3 and len(listed["xray_keys"]) == 2 and all(k["id"].startswith("alice~") for k in listed["xray_keys"])
+    # A key can be shown again and removed; removing frees its slot.
+    shown = {k["id"]: client.get(f"/api/clients/alice/xray-keys/{k['id']}").json()["link"] for k in listed["xray_keys"]}
+    assert set(shown.values()) == {first.json()["link"], second.json()["link"]}
+    key = listed["xray_keys"][0]["id"]
+    assert client.delete(f"/api/clients/alice/xray-keys/{key}", headers=H).status_code == 200
+    assert key not in panel.clients and client.get("/api/clients/alice/relay-devices").json()["used"] == 2
+    assert client.get("/api/clients/alice/xray-keys/bob~123456").status_code == 400      # not this client's
+    assert client.put("/api/clients/alice/config-limit", json={"limit": None}, headers=H).json()["limit"] == 2
+    assert client.put("/api/clients/alice/config-limit", json={"limit": 3}).status_code == 403
+
+
+def test_a_full_client_cannot_install_a_waiting_profile(client, panel, tmp_path):
+    """Lowering the number, or filling it with keys, also stops profiles downloaded earlier."""
+    _, code, device = bound_download(client)
+    client.post("/api/clients/alice/xray-keys", json={}, headers=H)
+    assert client.put("/api/clients/alice/config-limit", json={"limit": 1}, headers=H).status_code == 200
+    response, _ = Phone(client, tmp_path / "phone").enrol(code, "relay-device-" + device)
+    assert response.status_code == 403 and "Too many devices" in response.json()["detail"]
+    client.put("/api/clients/alice/config-limit", json={"limit": 2}, headers=H)
+    response, _ = Phone(client, tmp_path / "phone2").enrol(code, "relay-device-" + device)
+    assert response.status_code == 200
+
+
+def test_keys_made_before_or_outside_follow_the_panel(client, panel):
+    from app import xray
+    # The single key of 2.8-2.10 (email = the client name) counts as one config after a check.
+    panel.clients["alice"] = {"email": "alice", "comment": xray.MARK, "enable": True, "expiryTime": 0}
+    panel.clients["by-hand"] = {"email": "by-hand", "comment": "", "enable": True}
+    xray.sync(db)
+    listed = client.get("/api/clients/alice/relay-devices").json()
+    assert [k["id"] for k in listed["xray_keys"]] == ["alice"] and listed["used"] == 1
+    assert client.get("/api/clients/alice/xray-keys/alice").json()["link"].startswith("vless://uuid-alice@vpn.example.com")
+    # Deleted in the panel: gone here, and its slot is free.
+    del panel.clients["alice"]
+    xray.sync(db)
+    assert client.get("/api/clients/alice/relay-devices").json()["used"] == 0
+    # Revoking the client removes every key of it, and only its own.
+    client.post("/api/clients/alice/xray-keys", json={}, headers=H)
+    xray.forget(db, "alice")
+    assert list(panel.clients) == ["by-hand"] and xray.keys(db, "alice") == []
+
+
+def test_one_time_xray_link_at_the_limit(client, panel):
+    link = client.post("/api/clients/alice/share", json={"kind": "xray"}, headers=H).json()["url"]
+    client.post("/api/clients/alice/xray-keys", json={}, headers=H)
+    client.post("/api/clients/alice/xray-keys", json={}, headers=H)     # used up after the link was made
+    page = client.get(urlsplit_path(link) + "/download")
+    assert page.status_code == 409 and "Слишком много устройств" in page.text
+    assert len(panel.clients) == 2
+
+
+def test_bot_says_when_the_number_is_used_up(client, panel, telegram):
+    bot, api = telegram
+    client.put("/api/clients/alice/telegram", json={"username": "@alice_tg"}, headers=H)
+    client.post("/api/clients/alice/xray-keys", json={}, headers=H)
+    client.post("/api/clients/alice/xray-keys", json={}, headers=H)
+    bot.handle(tg("/xray"))
+    assert "сколько разрешено" in api.text and "/p/" not in api.text

@@ -29,16 +29,14 @@ import time
 import uuid
 from pathlib import Path
 
+from . import configs
+from .configs import ConfigLimit as DeviceLimit    # the name 2.10 used
 from .pki import PkiError
 
 ENROL_SECONDS = 7 * 86400       # a downloaded profile can be installed within a week
 CERT_DAYS = 3650                # long-lived: iOS does not renew a hand-installed identity; revoke in the database
 CA_SETTING = "relay_device_ca"
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,32}$")
-
-
-class DeviceLimit(PkiError):
-    """The client has as many bound devices as allowed."""
 
 
 def now() -> int:
@@ -94,15 +92,14 @@ def active_count(db, client: str) -> int:
                   "AND revoked_at IS NULL", (client,))["n"]
 
 
-def create(db, client: str, limit: int) -> tuple[str, str]:
-    """(device id, one-time code) for a new bound profile of a client."""
-    if active_count(db, client) >= limit:
-        raise DeviceLimit(f"{client} already has {limit} relay devices: remove one first")
+def create(db, client: str) -> tuple[str, str]:
+    """(device id, one-time code) for a new bound profile of a client: one slot of its configs."""
     t = now()
     device, code = secrets.token_urlsafe(12), secrets.token_urlsafe(24)
     with db.tx() as conn:
         # Profiles that were never installed in time are of no use to anyone.
         conn.execute("DELETE FROM relay_devices WHERE enrolled_at IS NULL AND expires_at < ?", (t,))
+        configs.check(db, client, conn=conn)
         conn.execute("INSERT INTO relay_devices (id, client_name, code_hash, created_at, expires_at) VALUES (?, ?, ?, ?, ?)",
                      (device, client, code_hash(code), t, t + ENROL_SECONDS))
     return device, code
@@ -327,7 +324,11 @@ class Acme:
                 "challenges": [{"type": "device-attest-01", "url": self.url("chall/" + row["id"]),
                                 "status": state, "token": self.challenge_token(row)}]}
 
-    def new_order(self, payload, jwk, limit: int) -> dict:
+    def full(self, client: str, conn=None) -> bool:
+        """No room to install one more: the client's installed configs fill its number."""
+        return configs.used(self.db, client, installed_only=True, conn=conn) >= configs.limit(self.db, client)
+
+    def new_order(self, payload, jwk) -> dict:
         identifiers = payload.get("identifiers") if isinstance(payload, dict) else None
         codes = [i.get("value") for i in identifiers or [] if isinstance(i, dict) and isinstance(i.get("value"), str)]
         if len(codes) != 1:
@@ -341,7 +342,7 @@ class Acme:
                 raise AcmeError(403, "rejectedIdentifier", "This profile is already installed on another device")
         elif row["expires_at"] < now():
             raise AcmeError(403, "rejectedIdentifier", "This profile has expired: download a new one")
-        elif active_count(self.db, row["client_name"]) >= limit:
+        elif self.full(row["client_name"]):
             raise AcmeError(403, "rejectedIdentifier", "Too many devices: ask the administrator to remove one")
         return row
 
@@ -358,7 +359,7 @@ class Acme:
         token = self.challenge_token(row)
         return {"type": "device-attest-01", "url": self.url("chall/" + row["id"]), "status": "valid", "token": token}
 
-    def finalize(self, row: dict, payload, jwk: dict, limit: int) -> dict:
+    def finalize(self, row: dict, payload, jwk: dict) -> dict:
         self.owned(row, jwk)
         try:
             csr = b64d(payload["csr"])
@@ -377,9 +378,7 @@ class Acme:
         cert_pem, serial, fingerprint = issue(self.db, csr, row["id"])
         with self.db.tx() as conn:
             # Spend the code once, and only while the client is below its limit.
-            count = conn.execute("SELECT COUNT(*) AS n FROM relay_devices WHERE client_name = ? AND enrolled_at IS NOT NULL "
-                                 "AND revoked_at IS NULL", (row["client_name"],)).fetchone()["n"]
-            if count >= limit:
+            if self.full(row["client_name"], conn=conn):
                 raise AcmeError(403, "rejectedIdentifier", "Too many devices: ask the administrator to remove one")
             done = conn.execute("UPDATE relay_devices SET enrolled_at = ?, account = ?, public_key = ?, cert_pem = ?, "
                                 "serial = ?, fingerprint = ? WHERE id = ? AND enrolled_at IS NULL AND revoked_at IS NULL",

@@ -220,6 +220,13 @@ CREATE TABLE IF NOT EXISTS relay_devices (
     revoked_at   BIGINT
 );
 CREATE INDEX IF NOT EXISTS relay_devices_client ON relay_devices (client_name);
+-- Xray keys this UI issued (2.11): one 3x-ui client each, named by its email.
+CREATE TABLE IF NOT EXISTS xray_keys (
+    email       TEXT PRIMARY KEY,
+    client_name TEXT NOT NULL,
+    created_at  BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS xray_keys_client ON xray_keys (client_name);
 """
 
 # Columns added to vpn_sessions after 1.4: an existing database gets them on start.
@@ -326,6 +333,8 @@ class Database:
             # 2.7: the client's Telegram username (lower case, no "@"), and the account that claimed it.
             for column, kind in (("telegram", "TEXT"), ("telegram_id", "BIGINT"), ("telegram_name", "TEXT")):
                 conn.execute(f"ALTER TABLE clients ADD COLUMN IF NOT EXISTS {column} {kind}")
+            # 2.11: the client's own number of configs (relay devices + Xray keys); NULL = the default.
+            conn.execute("ALTER TABLE clients ADD COLUMN IF NOT EXISTS config_limit INTEGER")
             conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS clients_telegram ON clients(telegram) WHERE telegram IS NOT NULL")
             conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS clients_telegram_id ON clients(telegram_id) WHERE telegram_id IS NOT NULL")
             if not conn.execute("SELECT 1 FROM information_schema.columns WHERE table_schema = ? AND "

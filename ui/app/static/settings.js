@@ -28,7 +28,7 @@ function networkForm(saved, relay, general) {
   });
   const relayEnabled = h('input', { type: 'checkbox', checked: relay.enabled });
   const relayDevices = h('input', { type: 'checkbox', checked: !!relay.devices });
-  const relayLimit = text(relay.device_limit || 5, { type: 'number', min: 1, max: 100 });
+  const relayLimit = text(relay.device_limit || 2, { type: 'number', min: 1, max: 100 });
   const relayURL = text(relay.url || gw.relay_public_url);
   const backend = text(gw.openvpn_backend, { placeholder: 'http://192.0.2.20:8080' });
   const relayBackend = text(gw.relay_backend);
@@ -138,7 +138,7 @@ function networkForm(saved, relay, general) {
         portal_listener: portal.value.trim(), trusted_cidrs: parseList(trusted.value), guest_links: links.collect(),
         ...services.collect(),
       },
-      relay: { enabled: relayEnabled.checked, url: relayOrigin, devices: relayDevices.checked, device_limit: Number(relayLimit.value) || 5 },
+      relay: { enabled: relayEnabled.checked, url: relayOrigin, devices: relayDevices.checked, device_limit: Number(relayLimit.value) || 2 },
       remote: profileHost ? { host: profileHost, ports: Object.fromEntries(vpnPorts.map(p => [p.proto, Number(p.input.value)])) } : null,
     };
   };
@@ -243,7 +243,7 @@ function networkForm(saved, relay, general) {
           field('Apple relay URL', relayURL, 'The HTTPS address in relay profiles, e.g. https://example.com:8443.'),
           h('label', { class: 'check' }, relayEnabled, 'Offer Apple relay profiles'),
           h('label', { class: 'check' }, relayDevices, 'Each new profile works on one device only'),
-          field('Devices per client', relayLimit, 'Device-bound profiles a client can have installed at once.')),
+          field('Configs per client', relayLimit, 'Device-bound relay profiles and Xray keys a client can have, together. A client can get its own number on its page.')),
         more('How one-device profiles work',
           h('p', { class: 'small', style: 'margin:0' }, 'The device makes its own key while the profile installs and gets a certificate from this server at /acme/ on the website hostname; a copy of the file installs nowhere else. Switching this on checks that the gateway signs such profiles and routes /acme/ here (Traefik 1.4.0 or later). Profiles installed earlier keep working until you revoke them on the client’s page. Installing a new profile on the same phone takes a new device slot: remove the old device there.')))),
     guests: h('div', { class: 'stack' },

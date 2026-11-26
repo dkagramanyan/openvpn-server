@@ -16,6 +16,7 @@ import time
 import urllib.error
 import urllib.request
 from typing import Callable
+from .configs import ConfigLimit
 
 log = logging.getLogger("telegram")
 
@@ -271,7 +272,12 @@ class Bot:
         if not self.allowed(telegram_id):
             self.send(chat, "Слишком много запросов. Попробуйте через час.", menu)
             return
-        link = self.link(name, kind)
+        try:
+            link = self.link(name, kind)
+        except ConfigLimit:
+            self.send(chat, "У вас уже столько подключений (Apple Relay и Xray), сколько разрешено: каждый профиль "
+                      "и ключ работает на одном устройстве. Напишите администратору, чтобы он удалил старое.", menu)
+            return
         if not link["public"]:
             self.send(chat, "Ссылки пока не работают: администратор не указал адрес сайта.", menu)
             return

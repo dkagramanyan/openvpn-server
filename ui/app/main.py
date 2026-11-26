@@ -28,7 +28,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
-from . import __version__, auth, backup, guest_check, pki, relay, relay_devices, relay_services, relay_history, sections, telegram_bot, watchdog, xray, network, network_discovery
+from . import __version__, auth, backup, configs, guest_check, pki, relay, relay_devices, relay_services, relay_history, sections, telegram_bot, watchdog, xray, network, network_discovery
 from .collector import Collector, Maintenance
 from .db import Database, HOUR_RETENTION, MINUTE_RETENTION, RELAY_FLOW_RETENTION, _TRAFFIC_UNION, empty_point
 from .mgmt import Management, ManagementError
@@ -1270,8 +1270,50 @@ def relay_device_list(name: str, user: dict[str, Any] = Authed):
     """The client's device-bound relay profiles, and whether its unbound profiles still work."""
     find_client(name)
     config = relay.get_settings(db)
-    return {"bound": config["devices"], "limit": config["device_limit"], "shared": relay.has_shared(db, name),
-            "devices": relay_devices.listing(db, name)}
+    return {"bound": config["devices"], "limit": configs.limit(db, name), "default_limit": configs.default_limit(db),
+            "own_limit": configs.override(db, name), "used": configs.used(db, name),
+            "shared": relay.has_shared(db, name), "devices": relay_devices.listing(db, name),
+            "xray": xray.enabled(db), "xray_keys": xray.keys(db, name)}
+
+
+class ConfigLimitBody(BaseModel):
+    limit: int | None = Field(default=None, ge=0, le=100)     # None: the default of Settings
+
+
+@app.put("/api/clients/{name}/config-limit", dependencies=[Csrf])
+def set_config_limit(name: str, body: ConfigLimitBody, user: dict[str, Any] = Authed):
+    """How many configs (relay devices and Xray keys together) this client may have."""
+    find_client(name)
+    configs.set_override(db, name, body.limit)
+    event("config_limit_changed", user, name, "default" if body.limit is None else str(body.limit))
+    return {"limit": configs.limit(db, name), "own_limit": body.limit}
+
+
+@app.post("/api/clients/{name}/xray-keys", dependencies=[Csrf])
+def new_xray_key(name: str, user: dict[str, Any] = Authed):
+    """A new Xray key for the client, shown to the admin with its QR code."""
+    row = find_client(name)
+    if row["state"] != "valid":
+        raise HTTPException(400, "Only a client with a valid certificate gets Xray keys")
+    link = xray.link(db, name)
+    event("xray_key_issued", user, name)
+    return {"link": link, "qr_svg": pki.qr_svg(link)}
+
+
+@app.get("/api/clients/{name}/xray-keys/{key}")
+def show_xray_key(name: str, key: str, user: dict[str, Any] = Authed):
+    find_client(name)
+    link = xray.key_link(db, name, key)
+    event("xray_key_shown", user, name)
+    return {"link": link, "qr_svg": pki.qr_svg(link)}
+
+
+@app.delete("/api/clients/{name}/xray-keys/{key}", dependencies=[Csrf])
+def remove_xray_key(name: str, key: str, user: dict[str, Any] = Authed):
+    find_client(name)
+    xray.remove_key(db, name, key)
+    event("xray_key_removed", user, name)
+    return {"ok": True}
 
 
 @app.delete("/api/clients/{name}/relay-devices/{device}", dependencies=[Csrf])
@@ -1351,17 +1393,16 @@ async def acme_post(resource: str, request: Request):
 
 
 def acme_handle(resource: str, body: bytes):
-    limit = relay.get_settings(db)["device_limit"]
     if resource == "new-account":
         payload, jwk, account = acme.verify(body, resource, new_account=True)
         return acme_reply({"status": "valid"}, 201 if not (payload or {}).get("onlyReturnExisting") else 200, location=account)
     payload, jwk, _ = acme.verify(body, resource)
     if resource == "new-order":
-        row = acme.new_order(payload, jwk, limit)
+        row = acme.new_order(payload, jwk)
         return acme_reply(acme.order(row), 201, location=acme.url("order/" + row["id"]))
     kind, _, rest = resource.partition("/")
     if kind == "order" and rest.endswith("/finalize"):
-        row = acme.finalize(acme.device(rest[:-len("/finalize")]), payload, jwk, limit)
+        row = acme.finalize(acme.device(rest[:-len("/finalize")]), payload, jwk)
         return acme_reply(acme.order(row), location=acme.url("order/" + row["id"]))
     if kind in ("order", "authz", "chall", "cert") and "/" not in rest:
         row = acme.device(rest)
@@ -1519,6 +1560,8 @@ def create_share_link(name: str, kind: str, hours: int, created_by: str, request
         raise HTTPException(400, "Apple relay profiles are not offered (Settings → Apple relay)")
     if kind == "xray" and not xray.enabled(db):
         raise HTTPException(400, "Xray is off (Settings → Xray)")
+    if kind == "xray" or (kind == "relay" and relay.get_settings(db)["devices"]):
+        configs.check(db, name)     # no link to a config the client has no room for
     token = secrets.token_urlsafe(24)
     now = int(time.time())
     db.execute("INSERT INTO share_tokens (token_hash, client_name, created_at, expires_at, created_by, kind) "
@@ -1594,8 +1637,9 @@ SHARE_ERRORS = {
     404: ("Ссылка недействительна", "Она уже использована или прошёл час. Запросите новую ссылку в боте или у администратора."),
     429: ("Слишком много попыток", "Подождите немного и откройте ссылку снова."),
 }
-SHARE_LIMIT = ("Слишком много устройств", "Профиль Apple Relay работает только на одном устройстве, и у вас их уже "
-               "столько, сколько разрешено. Попросите администратора удалить старое устройство и откройте ссылку снова.")
+SHARE_LIMIT = ("Слишком много устройств", "У вас уже столько подключений (Apple Relay и Xray), сколько разрешено. "
+               "Каждый профиль и ключ работает на одном устройстве. Попросите администратора удалить старое "
+               "и откройте ссылку снова.")
 SHARE_FAILED = ("Профиль сейчас не готов", "Попробуйте ещё раз через минуту. Если не получится — напишите администратору.")
 
 
@@ -1641,7 +1685,7 @@ def shared_profile(token: str, request: Request):
     name, kind = shared_link(token, request)
     # Built before the link is spent: a failure here leaves it usable.
     if kind == "xray":
-        content = xray.link(db, name)
+        content = xray.link(db, name)       # a new key: one slot of the client's configs
     elif kind == "relay":
         try:
             content = relay.profile(db, name)

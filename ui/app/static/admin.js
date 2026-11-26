@@ -479,7 +479,7 @@ function clientDetailView(el) {
       c.rejections.length ? card('Rejected OpenVPN connection attempts · last 30 days', rejectionsTable(c.rejections, false)) : '',
       sectionsBox.card,
       card('Sessions · last 100', sessionsTable(c.sessions, false), h('a', { class: 'btn sm', href: '#/sessions/' + enc }, 'Every session')),
-      c.relay_available ? relayDevicesCard(name) : '',
+      c.relay_available || c.xray_available ? relayDevicesCard(name) : '',
       flowsCard);
     sectionsBox.load();
     const dailyOpts = () => ({ ts: c.daily.map(p => p.ts), series: [{ label: 'Download', cls: 's1', values: c.daily.map(p => trafficOf(p, 'out', src)) }, { label: 'Upload', cls: 's2', values: c.daily.map(p => trafficOf(p, 'in', src)) }], fmtY: v => fmtBytes(v, 0), fmtX: fmtDate, fmtXFull: fmtDate, height: 220, aria: 'Daily traffic' });
@@ -490,18 +490,27 @@ function clientDetailView(el) {
   load();
   return { onLive: live => { if (!c) return; const v = onlineClients(live).get(name), via = v ? ['vpn', 'relay'].filter(k => v[k]) : []; if (via.join() !== (c.online_via || []).join()) load(); } };
 }
-// The client's Apple relay profiles: each device-bound one (one device each) and the older
-// unbound profiles, which share one credential.
+// The client's configs: device-bound Apple relay profiles and Xray keys, which share one
+// number per client, and the older unbound relay profiles (one shared credential, not counted).
+function xrayKeyDialog(name, r) {
+  const box = h('div', { class: 'code' }, h('img', { src: 'data:image/svg+xml;base64,' + btoa(r.qr_svg), alt: 'QR code of the key' }));
+  dialog({ title: `Xray key · ${name}`, body: h('div', { class: 'stack', style: 'gap:10px' },
+    h('textarea', { class: 'input mono', readonly: true, rows: 5, 'aria-label': 'Xray key', onFocus: e => e.target.select() }, r.link),
+    h('div', { class: 'qr' }, box),
+    h('p', { class: 'small muted', style: 'margin:0' }, 'One key per device. Xray gives internet access only, not the LAN.')),
+    buttons: [{ label: 'Copy', onClick: async () => { await navigator.clipboard.writeText(r.link); toast('Key copied', 'ok'); return false; } }, { label: 'Done', cls: 'primary', value: true }] });
+}
 function relayDevicesCard(name) {
   const enc = encodeURIComponent(name);
   const body = h('div', null, h('div', { class: 'small muted' }, 'Loading…'));
   const STATE = { active: 'installed', waiting: 'downloaded, not installed yet', expired: 'never installed (expired)', revoked: 'revoked' };
+  const table = (heads, rows) => h('div', { class: 'table-wrap' }, h('table', { class: 'tbl' },
+    h('thead', null, h('tr', null, heads.map(t => h('th', null, t)))), h('tbody', null, rows)));
   async function load() {
     let r;
     try { r = await api(`/api/clients/${enc}/relay-devices`); } catch (e) { body.replaceChildren(h('div', { class: 'small muted' }, e.message)); return; }
-    const active = r.devices.filter(d => d.state === 'active').length;
-    const rows = r.devices.filter(d => d.state !== 'expired').map(d => h('tr', null,
-      h('td', { class: 'mono small' }, d.id),
+    const devices = r.devices.filter(d => d.state !== 'expired').map(d => h('tr', null,
+      h('td', null, 'Apple relay'), h('td', { class: 'mono small' }, d.id),
       h('td', null, h('span', { class: 'badge ' + (d.state === 'active' ? 'valid' : d.state === 'revoked' ? 'revoked' : 'plain') }, STATE[d.state])),
       h('td', null, fmtDateTime(d.enrolled_at || d.created_at)),
       h('td', null, d.last_seen ? fmtAgo(d.last_seen) : '—'),
@@ -509,21 +518,34 @@ function relayDevicesCard(name) {
         if (await confirmDialog('Remove device', `The relay stops working on this device of ${name} (${d.id}).`, 'Remove', true)) {
           await withToast(api(`/api/clients/${enc}/relay-devices/${encodeURIComponent(d.id)}`, { method: 'DELETE' }), 'Device removed'); load();
         } } }, 'Remove') : '')));
+    const keys = r.xray_keys.map(k => h('tr', null,
+      h('td', null, 'Xray'), h('td', { class: 'mono small' }, k.id), h('td', null, h('span', { class: 'badge valid' }, 'issued')),
+      h('td', null, fmtDateTime(k.created_at)), h('td', null, '—'),
+      h('td', null, h('div', { class: 'row', style: 'gap:6px' },
+        h('button', { class: 'btn sm', onClick: async () => { try { xrayKeyDialog(name, await api(`/api/clients/${enc}/xray-keys/${encodeURIComponent(k.id)}`)); } catch (e) { toast(e.message, 'err'); } } }, 'Show'),
+        h('button', { class: 'btn sm danger', onClick: async () => {
+          if (await confirmDialog('Remove Xray key', `The key ${k.id} stops working.`, 'Remove', true)) {
+            await withToast(api(`/api/clients/${enc}/xray-keys/${encodeURIComponent(k.id)}`, { method: 'DELETE' }), 'Key removed'); load();
+          } } }, 'Remove')))));
+    const own = h('input', { class: 'input', type: 'number', min: 0, max: 100, style: 'width:6rem', placeholder: String(r.default_limit), value: r.own_limit === null ? '' : r.own_limit, 'aria-label': 'Configs for this client' });
     body.replaceChildren(
-      h('p', { class: 'small muted', style: 'margin:0 0 10px' }, r.bound
-        ? `Each new profile works on one device: ${active} of ${r.limit} in use.`
-        : 'New profiles are not bound to a device (Settings → Apple relay).'),
-      rows.length ? h('div', { class: 'table-wrap' }, h('table', { class: 'tbl' },
-        h('thead', null, h('tr', null, ['Device', 'State', 'Since', 'Last seen', ''].map(t => h('th', null, t)))), h('tbody', null, rows))) : '',
+      h('div', { class: 'row', style: 'gap:10px;align-items:center;margin-bottom:10px;flex-wrap:wrap' },
+        h('span', null, `${r.used} of ${r.limit} configs in use`),
+        h('span', { class: 'small muted' }, 'Apple relay devices and Xray keys together. For this client:'),
+        own,
+        h('button', { class: 'btn sm', onClick: async () => { await withToast(api(`/api/clients/${enc}/config-limit`, { method: 'PUT', body: { limit: own.value === '' ? null : Number(own.value) } }), 'Saved'); load(); } }, 'Save'),
+        r.xray ? h('button', { class: 'btn sm primary', onClick: async () => { try { const k = await api(`/api/clients/${enc}/xray-keys`, { method: 'POST', body: {} }); load(); xrayKeyDialog(name, k); } catch (e) { toast(e.message, 'err'); } } }, 'New Xray key') : ''),
+      r.bound ? '' : h('p', { class: 'small muted', style: 'margin:0 0 10px' }, 'New Apple relay profiles are not bound to a device and are not counted (Settings → Apple relay).'),
+      devices.length || keys.length ? table(['Type', 'Config', 'State', 'Since', 'Last seen', ''], [...devices, ...keys]) : '',
       r.shared ? h('div', { class: 'row', style: 'margin-top:10px;gap:10px;align-items:center' },
-        h('span', { class: 'small' }, 'Profiles without device binding (one shared credential, works on any device): active.'),
+        h('span', { class: 'small' }, 'Apple relay profiles without device binding (one shared credential, works on any device): active.'),
         h('button', { class: 'btn sm danger', onClick: async () => {
           if (await confirmDialog('Revoke unbound profiles', `Every relay profile of ${name} without device binding stops working. Device-bound profiles keep working.`, 'Revoke', true)) {
             await withToast(api(`/api/clients/${enc}/relay-shared`, { method: 'DELETE' }), 'Unbound profiles revoked'); load();
           } } }, 'Revoke')) : '');
   }
   load();
-  return card('Apple relay devices', body);
+  return card('Configs · Apple relay devices and Xray keys', body);
 }
 // The client's Apple relay connections: the open ones, then the saved log with its destinations.
 function relayFlowsCard(name) {

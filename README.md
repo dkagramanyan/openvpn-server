@@ -313,9 +313,10 @@ bot) is a new *device*, and a copy of the file works nowhere else:
   certificate and gives its SHA-256 to the policy service, which accepts
   `device:<id>` only with that device's certificate: the header copied out of
   the file opens nothing.
-* **Devices per client** (5 by default) caps how many installed devices a
-  client may have; a further download or install is refused with a message to
-  ask the administrator. A profile that is not installed within 7 days expires.
+* Each device takes one of the client's configs (*Configs per client*, 2 by
+  default, shared with Xray keys); with none left, a download or an install is
+  refused with a message to ask the administrator. A profile that is not
+  installed within 7 days expires.
 * The client page lists the devices (installed, waiting, revoked) with when
   each was last seen; **Remove** stops one. Installing a new profile on the
   same phone takes a new slot: remove the old device. **Revoke relay access**
@@ -418,8 +419,8 @@ one-time link (from the bot or **Share link**).
 
 The `xui` service runs [3x-ui](https://github.com/MHSanaei/3x-ui) (Xray with a
 panel) next to OpenVPN and the relay, for networks where OpenVPN is blocked.
-The UI gives every client its own Xray key on one inbound and takes it away
-with the certificate.
+The UI gives clients their own Xray keys on one inbound, one key per issued
+link, and takes them away with the certificate.
 
 1. `sudo docker compose up -d xui`, then `sudo docker compose logs xui`: the
    first start prints the panel login and its random path once. Download the
@@ -436,9 +437,16 @@ with the certificate.
    Save.
 
 Clients then get a key from **Share link** (profile *Xray*) or the bot's
-**Xray** button. The one-time page shows the `vless://` key and its QR code
-once; it goes into v2RayTun, Streisand, v2rayNG or Hiddify. The key carries
-the public host of profiles (Settings) and the inbound's port.
+**Xray** button, and you from **New Xray key** on the client page. The one-time
+page shows the `vless://` key and its QR code once; it goes into v2RayTun,
+Streisand, v2rayNG or Hiddify. The key carries the public host of profiles
+(Settings) and the inbound's port.
+
+Every issued link is a new key (its own 3x-ui client, `<name>~<suffix>`), meant
+for one device, and takes one of the client's configs (below). The client page
+lists the keys: **Show** gives a key again, **Remove** ends it. A key is text
+and can be copied to another device; separate keys let you see and end each
+one in the panel.
 
 * Clients made by this UI have the comment `openvpn-ui` in 3x-ui; clients you
   add in the panel yourself are left alone.
@@ -454,6 +462,24 @@ the public host of profiles (Settings) and the inbound's port.
 * `xui/` holds 3x-ui's database and the UI's API token (`openvpn-ui.json`); it
   is in the backups. Delete `xui/openvpn-ui.json` to have a new panel login
   and token made at the next start.
+
+## Configs per client
+
+A client has one number of configs: device-bound Apple relay profiles and Xray
+keys together. **Configs per client** in Settings → Apple relay is the default
+(2); the client page has the client's own number (empty = the default) and
+lists what is in use. OpenVPN is not counted (`OVPN_MAX_DEVICES` caps its
+connections).
+
+* A relay profile holds its place from the download on, until it is installed,
+  removed, or expires unused after 7 days. An Xray key holds one from the moment
+  it is issued. Removing a device or a key frees the place.
+* With every place taken, a new download, key or one-time link is refused: the
+  UI says so, the bot and the one-time page tell the person to ask you. A
+  profile downloaded earlier does not install either.
+* Relay profiles without device binding (one shared credential) are not
+  counted: they are not tied to devices. Revoke them on the client page.
+* The single Xray key a client had before 2.11 stays valid and counts as one.
 
 ## Telegram bot
 

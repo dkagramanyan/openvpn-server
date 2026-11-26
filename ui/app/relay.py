@@ -30,10 +30,12 @@ class RelaySettings(BaseModel):
     # Kept so that settings saved by 2.3 still load; since 2.4.1 every profile carries HTTP/3
     # whenever the relay serves it (APPLE_RELAY_TRANSPORT), and this value is ignored.
     http3: bool = False
-    # 2.10: each new profile works on one device only (its key never leaves the phone), and a
-    # client may have at most device_limit such devices. Installed profiles are unaffected.
+    # 2.10: each new profile works on one device only (its key never leaves the phone).
+    # Installed profiles are unaffected.
     devices: bool = False
-    device_limit: int = Field(default=5, ge=1, le=100)
+    # 2.11: configs per client by default, device-bound relay profiles and Xray keys together
+    # (configs.py; a client can have its own number).
+    device_limit: int = Field(default=2, ge=1, le=100)
 
 
 def get_settings(db) -> dict:
@@ -241,7 +243,7 @@ def bound_profile(db, name: str, config: dict, *, device: str | None = None, cod
     if not base:
         raise PkiError("Device-bound relay profiles need the website hostname (Settings → Network)")
     if device is None:
-        device, code = relay_devices.create(db, name, config["device_limit"])
+        device, code = relay_devices.create(db, name)
     guest = is_guest(name)
     instance = instance_id(db)
     # The same identifier per client (as unbound profiles), so a new profile on the same phone
